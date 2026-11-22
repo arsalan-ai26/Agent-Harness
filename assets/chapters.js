@@ -18,7 +18,7 @@ window.IE_CHAPTERS = [
 "title": "The model and provider layer",
 "slug": "02-model-layer",
 "stage": 1,
-"ready": false
+"ready": true
 },
 {
 "n": "3",

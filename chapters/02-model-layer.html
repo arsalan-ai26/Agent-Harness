@@ -1,0 +1,317 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>2. The model and provider layer</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&family=JetBrains+Mono:wght@400;600&display=swap">
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-chapter="2" data-stage="1">
+<div class="topbar" style="padding-left:0;padding-right:0"><a href="../index.html">← Build an Agent Harness</a><span>Stage 1 · Chapter 2</span></div>
+<div class="shell">
+<nav class="toc" aria-label="Chapter contents"></nav>
+<main><article>
+<div class="kicker">Stage 1 · Foundations · Chapter 2</div>
+<h1>The model and provider layer</h1>
+<p class="lede">Every harness talks to models through a layer that hides wire formats, streams tokens, retries failures, counts cost and protects the prompt cache. Harnesses split on one question here: one neutral format for every model, or each model in the harness it was trained with? This chapter reads Pi's unified API, nanocode's per-vendor drivers, eve's retry and recovery code and fx's gateway, then builds a two-provider layer.</p>
+<div class="meta">
+  <span class="chip">Level: intermediate</span>
+  <span class="chip">Time: about 20 hours with the build</span>
+  <span class="chip">Needs: Chapter 1, API keys for two providers</span>
+  <span class="chip">Code read at: Pi fb248c7, eve 5c52fbf, fx cbe7daf, nanocode 015cbfa</span>
+</div>
+
+<div class="box skip">
+  <span class="lbl">Before you start: skip check</span>
+  <ol>
+    <li>Where do tool results go in the Anthropic Messages format, compared with OpenAI chat completions?</li>
+    <li>Why can adding a timestamp to the system prompt double your bill?</li>
+    <li>What is a hedged request?</li>
+  </ol>
+  <details><summary>Answers</summary><ol>
+    <li>Anthropic puts <code>tool_result</code> blocks inside a <em>user</em> message; OpenAI chat uses separate <code>role: "tool"</code> messages.</li>
+    <li>Prompt caching matches an exact prefix. A changing timestamp at the top makes every request a cache miss, and uncached input often costs about 10x cached input.</li>
+    <li>If the first byte is slow, send a second identical request and use whichever answers first. It trades extra cost for lower tail latency.</li>
+  </ol></details>
+</div>
+
+<h2 id="why">1. What this layer does</h2>
+<p>The loop from Chapter 1 called one SDK directly. Real harnesses need more:</p>
+<ul>
+  <li><strong>Translation.</strong> Each provider has its own message, tool and reasoning format. OpenAI chat completions, OpenAI Responses, Anthropic Messages, Google and Bedrock all differ.</li>
+  <li><strong>Streaming.</strong> Users must see text as it arrives. Tool-call arguments also stream in pieces that must be joined.</li>
+  <li><strong>Retries.</strong> Rate limits (429), overloads (529) and dropped connections are normal. Retry the transient ones, fail fast on the rest.</li>
+  <li><strong>Accounting.</strong> Input, cached input and output tokens, and dollars, per call and per session.</li>
+  <li><strong>Caching discipline.</strong> Requests built so each one shares the longest possible exact prefix with the last.</li>
+  <li><strong>Model choice.</strong> Switch model mid-session, or route cheap work to cheap models.</li>
+</ul>
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 250" width="760" style="max-width:100%;height:auto" role="img" aria-label="Provider layer: the harness speaks one internal format, adapters translate to each wire format">
+  <defs><marker id="c1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="24" y="90" width="150" height="70" rx="8" style="fill:var(--kv-s);stroke:var(--kv);stroke-width:1.6"/>
+  <text x="99" y="120" text-anchor="middle" style="fill:var(--ink);font-size:13px;font-weight:600">Harness</text>
+  <text x="99" y="138" text-anchor="middle" style="fill:var(--ink2);font-size:11px">one message format</text>
+  <rect x="230" y="40" width="190" height="170" rx="10" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="325" y="62" text-anchor="middle" style="fill:var(--ink);font-size:13px;font-weight:600">Provider layer</text>
+  <text x="246" y="88" style="fill:var(--ink2);font-size:11px">translate messages</text>
+  <text x="246" y="108" style="fill:var(--ink2);font-size:11px">join streamed tool args</text>
+  <text x="246" y="128" style="fill:var(--ink2);font-size:11px">retry transient errors</text>
+  <text x="246" y="148" style="fill:var(--ink2);font-size:11px">count tokens and cost</text>
+  <text x="246" y="168" style="fill:var(--ink2);font-size:11px">keep prefixes stable</text>
+  <text x="246" y="188" style="fill:var(--ink2);font-size:11px">hedge slow requests</text>
+  <g style="fill:none;stroke:var(--ink2);stroke-width:1.3">
+    <path d="M176 125H228" marker-start="url(#c1)" marker-end="url(#c1)"/>
+    <path d="M422 70H498" marker-end="url(#c1)"/><path d="M422 110H498" marker-end="url(#c1)"/><path d="M422 150H498" marker-end="url(#c1)"/><path d="M422 190H498" marker-end="url(#c1)"/>
+  </g>
+  <rect x="500" y="52" width="236" height="34" rx="6" style="fill:var(--pre-s);stroke:var(--pre)"/><text x="512" y="74" style="fill:var(--ink);font-size:12px">OpenAI chat completions</text>
+  <rect x="500" y="92" width="236" height="34" rx="6" style="fill:var(--pre-s);stroke:var(--pre)"/><text x="512" y="114" style="fill:var(--ink);font-size:12px">OpenAI Responses</text>
+  <rect x="500" y="132" width="236" height="34" rx="6" style="fill:var(--pre-s);stroke:var(--pre)"/><text x="512" y="154" style="fill:var(--ink);font-size:12px">Anthropic Messages</text>
+  <rect x="500" y="172" width="236" height="34" rx="6" style="fill:var(--pre-s);stroke:var(--pre)"/><text x="512" y="194" style="fill:var(--ink);font-size:12px">Google, Bedrock, others</text>
+</svg></div>
+<figcaption>The harness speaks one format. The provider layer owns everything that differs between vendors.</figcaption>
+</figure>
+
+<h2 id="formats">2. The wire formats differ in ways that matter</h2>
+<div class="tbl"><table>
+  <tr><th>Concept</th><th>OpenAI chat completions</th><th>Anthropic Messages</th></tr>
+  <tr><td>System prompt</td><td>A message with <code>role: "system"</code></td><td>A separate <code>system</code> field</td></tr>
+  <tr><td>Tool call</td><td><code>tool_calls</code> on the assistant message, arguments as a JSON <em>string</em></td><td><code>tool_use</code> content block, input as a JSON <em>object</em></td></tr>
+  <tr><td>Tool result</td><td>Its own message, <code>role: "tool"</code></td><td><code>tool_result</code> block inside a <em>user</em> message</td></tr>
+  <tr><td>Caching</td><td>Automatic on exact prefixes; report in <code>prompt_tokens_details.cached_tokens</code></td><td>Explicit <code>cache_control</code> breakpoints; report in <code>cache_read_input_tokens</code></td></tr>
+  <tr><td>Reasoning</td><td>Hidden or summarized, per model</td><td>Thinking blocks, which may carry a signature that must be sent back unchanged</td></tr>
+</table></div>
+<p>These are not cosmetic. Switching a conversation from one provider to another mid-session means converting thinking blocks, tool-call IDs and caching markers. Pi does this best-effort: Anthropic thinking becomes tagged text when the conversation moves to OpenAI.</p>
+
+<h2 id="tour">3. Code tour</h2>
+<h3>Pi: one API over everything</h3>
+<p><code>packages/ai/src</code> is a full multi-provider library. <code>types.ts</code> lists the wire APIs it speaks (<code>KnownApi</code>): <code>openai-completions</code>, <code>openai-responses</code>, <code>azure-openai-responses</code>, <code>openai-codex-responses</code>, <code>anthropic-messages</code>, <code>bedrock-converse-stream</code>, <code>google-generative-ai</code>, <code>google-vertex</code>, <code>mistral-conversations</code> and its own <code>pi-messages</code>. <code>providers/</code> holds about 49 providers (each a <code>.ts</code> plus a <code>.models.ts</code>, including DeepSeek and several Chinese hosts), and <code>models.generated.ts</code> is a generated catalog with context sizes and prices. Transports include SSE and WebSocket. <code>cache-warming.ts</code> pre-warms the provider cache.</p>
+<p>The design bet: model choice is a user right, so the harness must speak everything. The cost: provider-specific features that do not fit the common shape are harder to use well.</p>
+<h3>nanocode: each vendor in its own harness</h3>
+<p>nanocode goes the other way. <code>crates/backends/</code> has one tree per vendor (<code>codex</code>, <code>claude</code>, <code>antigravity</code> for Gemini). Each has a <code>client</code> crate for the wire protocol and authentication, and a driver crate that owns prompts, tools, compaction and the durability format. The Codex client pins prompts per model in <code>crates/backends/codex/client/prompts/</code> (<code>sol.md</code>, <code>luna.md</code>, <code>astra.md</code>, even <code>glm.md</code>) with an <code>upstream.json</code> recording where they came from. A layering script forbids one backend from depending on another.</p>
+<p>The bet: models are post-trained inside their vendor's harness, so the best result comes from giving each model its native prompts and tools. The cost: three drivers to maintain, and new vendors take real work.</p>
+<p>nanocode also hedges. <code>crates/core/hedge</code> defines <code>HedgePolicy::DEFAULT</code>: track first-byte latency over the last 100 requests, and if a request is slower than the 90th percentile (never less than 1.5 seconds), fire a second request; hedges are capped at 10% of traffic.</p>
+<h3>eve: retries and recovery as first-class code</h3>
+<p><code>packages/eve/src/harness/model-call/</code> separates <code>request.ts</code>, <code>response.ts</code>, <code>retry.ts</code>, <code>recovery.ts</code>, <code>errors.ts</code>, <code>credential.ts</code> and <code>usage.ts</code>. <code>retry.ts</code> allows 3 attempts per model call (2 for gateway stream timeouts). Models are named through Vercel AI Gateway ids such as <code>anthropic/claude-opus-5.5</code>, so switching is one line. <code>harness/prompt-cache.ts</code> handles cache markers and <code>harness/model-profile.ts</code> holds per-model behaviour.</p>
+<h3>fx: one provider at a time, classified errors</h3>
+<p>fx talks to one provider per session through <code>src/gateway/client.zig</code>: Vercel AI Gateway by default, a ChatGPT or Grok subscription, or any OpenAI-compatible endpoint. Its retry code classifies errors carefully: <code>isRetryableGatewayError</code> treats closed and reset connections as retryable, and a comment notes that some errors "carry delivery ambiguity": the request may have reached the model even though the reply was lost.</p>
+
+<h2 id="decisions">4. Design decisions compared</h2>
+<div class="tbl"><table>
+  <tr><th>Decision</th><th>Pi</th><th>nanocode</th><th>eve</th><th>fx</th></tr>
+  <tr><td>Abstraction</td><td>One neutral API, ~10 wire formats</td><td>One driver per vendor, native prompts</td><td>AI SDK plus AI Gateway ids</td><td>One gateway client, OpenAI-compatible</td></tr>
+  <tr><td>Model switching mid-session</td><td>Yes, with context conversion</td><td>Per session (harness, model, thinking, tier)</td><td>Yes, via config or redeploy</td><td>One provider at a time</td></tr>
+  <tr><td>Retries</td><td>In provider code</td><td>Per client, plus hedging</td><td>3 attempts, recovery path</td><td>Error classification</td></tr>
+  <tr><td>Prompts</td><td>Pi's own, short</td><td>Pinned upstream prompts per model</td><td>Authored instructions</td><td>fx's own, about 1,000 words</td></tr>
+  <tr><td>Pro</td><td>Maximum choice</td><td>Best native quality</td><td>Simplest ops on Vercel</td><td>Small, predictable</td></tr>
+  <tr><td>Con</td><td>Lowest common denominator</td><td>Maintenance per vendor</td><td>Tied to the AI SDK shape</td><td>Less flexible</td></tr>
+</table></div>
+<div class="box expert">
+  <span class="lbl">Harness-model coupling</span>
+  <p>LangChain notes that Claude Code and Codex models are post-trained with their harnesses in the loop, so changing a tool's logic, such as the <code>apply_patch</code> format, can hurt. VS Code's Copilot harness gives Claude models a string-replace edit tool and GPT models <code>apply_patch</code> for this reason. Keep this in mind when you compare models in your own harness: a weak score may be a format mismatch, not a weak model.</p>
+</div>
+
+<h2 id="research">5. Research and how Chinese teams approach it</h2>
+<ul>
+  <li><strong>Cache economics.</strong> Manus calls KV-cache hit rate its most important production metric: cached Claude Sonnet input cost $0.30 per million tokens against $3.00 uncached, a 10x difference, with a typical task near 100 input tokens per output token (<a href="https://manus.im/blog/Context-Engineering-for-AI-Agents-Lessons-from-Building-Manus">Manus</a>).</li>
+  <li><strong>Same model, different harness.</strong> 2026 papers measure how much scores move when only the harness changes, for example <a href="https://arxiv.org/abs/2608.26218">arXiv 2608.26218</a>.</li>
+  <li><strong>Chinese models through foreign harnesses.</strong> Qwen, Kimi, GLM and DeepSeek ship Anthropic-compatible endpoints, so the most common Chinese setup in 2026 is a Western harness (Claude Code, OpenCode) with a Chinese model behind it; a newsletter put it as "the harness standard is American; the price war is Chinese" (<a href="https://invenew.beehiiv.com/p/chinese-coding-agents-are-now-a-stack-design-question">Invenew</a>).</li>
+  <li><strong>Labs evaluate with named scaffolds.</strong> Alibaba's Qwen3-Coder-Next report gives SWE-bench results "with SWE-Agent" and Terminal-Bench results "with Terminus-2", which is an admission that the scaffold is part of the score (<a href="https://arxiv.org/pdf/2603.00729">Qwen</a>).</li>
+</ul>
+
+<h2 id="build">6. Build: a two-provider layer</h2>
+<p>We add a <code>models.py</code> with our own message format, two adapters (OpenAI-compatible and Anthropic), streaming, retries, token counts and cost. We still use the official SDKs for transport: writing raw SSE parsers teaches little and breaks often.</p>
+<pre>pip install openai anthropic</pre>
+<pre>&quot;&quot;&quot;One interface over two wire formats: OpenAI-compatible chat and Anthropic Messages.&quot;&quot;&quot;
+import json, os, random, time
+from dataclasses import dataclass, field
+
+@dataclass
+class ToolCall:
+    id: str
+    name: str
+    args: dict
+
+@dataclass
+class Reply:
+    text: str = &quot;&quot;
+    tool_calls: list = field(default_factory=list)
+    input_tokens: int = 0
+    cached_tokens: int = 0
+    output_tokens: int = 0
+    stop: str = &quot;&quot;
+
+# Our own message format, provider-neutral:
+#   {&quot;role&quot;: &quot;user&quot;|&quot;assistant&quot;|&quot;tool&quot;, &quot;content&quot;: str, &quot;tool_calls&quot;: [ToolCall], &quot;tool_call_id&quot;: str}
+
+RETRYABLE = {408, 409, 429, 500, 502, 503, 504, 529}
+
+def with_retries(fn, attempts=3, base=1.0):
+    &quot;&quot;&quot;Retry transient failures with jittered exponential backoff (eve uses 3 attempts).&quot;&quot;&quot;
+    for i in range(attempts):
+        try:
+            return fn()
+        except Exception as e:
+            status = getattr(e, &quot;status_code&quot;, None)
+            if i == attempts - 1 or (status is not None and status not in RETRYABLE):
+                raise
+            time.sleep(base * 2 ** i + random.random())
+
+class OpenAICompat:
+    def __init__(self, model, base_url=None, api_key=None):
+        from openai import OpenAI
+        self.model, self.client = model, OpenAI(base_url=base_url, api_key=api_key)
+
+    def _messages(self, system, messages):
+        out = [{&quot;role&quot;: &quot;system&quot;, &quot;content&quot;: system}]
+        for m in messages:
+            if m[&quot;role&quot;] == &quot;assistant&quot; and m.get(&quot;tool_calls&quot;):
+                out.append({&quot;role&quot;: &quot;assistant&quot;, &quot;content&quot;: m.get(&quot;content&quot;) or None, &quot;tool_calls&quot;: [
+                    {&quot;id&quot;: c.id, &quot;type&quot;: &quot;function&quot;, &quot;function&quot;: {&quot;name&quot;: c.name, &quot;arguments&quot;: json.dumps(c.args)}}
+                    for c in m[&quot;tool_calls&quot;]]})
+            elif m[&quot;role&quot;] == &quot;tool&quot;:
+                out.append({&quot;role&quot;: &quot;tool&quot;, &quot;tool_call_id&quot;: m[&quot;tool_call_id&quot;], &quot;content&quot;: m[&quot;content&quot;]})
+            else:
+                out.append({&quot;role&quot;: m[&quot;role&quot;], &quot;content&quot;: m[&quot;content&quot;]})
+        return out
+
+    def complete(self, system, messages, tools, on_text=None):
+        def call():
+            stream = self.client.chat.completions.create(
+                model=self.model, messages=self._messages(system, messages), stream=True,
+                stream_options={&quot;include_usage&quot;: True},
+                tools=[{&quot;type&quot;: &quot;function&quot;, &quot;function&quot;: t} for t in tools])
+            reply, partial = Reply(), {}
+            for chunk in stream:
+                if chunk.usage:
+                    reply.input_tokens = chunk.usage.prompt_tokens
+                    details = getattr(chunk.usage, &quot;prompt_tokens_details&quot;, None)
+                    reply.cached_tokens = getattr(details, &quot;cached_tokens&quot;, 0) or 0
+                    reply.output_tokens = chunk.usage.completion_tokens
+                if not chunk.choices:
+                    continue
+                choice = chunk.choices[0]
+                if choice.delta.content:
+                    reply.text += choice.delta.content
+                    if on_text: on_text(choice.delta.content)
+                for d in choice.delta.tool_calls or []:      # tool arguments arrive in pieces
+                    p = partial.setdefault(d.index, {&quot;id&quot;: &quot;&quot;, &quot;name&quot;: &quot;&quot;, &quot;args&quot;: &quot;&quot;})
+                    p[&quot;id&quot;] += d.id or &quot;&quot;
+                    p[&quot;name&quot;] += (d.function.name or &quot;&quot;) if d.function else &quot;&quot;
+                    p[&quot;args&quot;] += (d.function.arguments or &quot;&quot;) if d.function else &quot;&quot;
+                if choice.finish_reason:
+                    reply.stop = choice.finish_reason
+            reply.tool_calls = [ToolCall(p[&quot;id&quot;], p[&quot;name&quot;], json.loads(p[&quot;args&quot;] or &quot;{}&quot;)) for p in partial.values()]
+            return reply
+        return with_retries(call)
+
+class Anthropic:
+    def __init__(self, model, api_key=None):
+        import anthropic
+        self.model, self.client = model, anthropic.Anthropic(api_key=api_key)
+
+    def _messages(self, messages):
+        out = []
+        for m in messages:
+            if m[&quot;role&quot;] == &quot;assistant&quot;:
+                blocks = [{&quot;type&quot;: &quot;text&quot;, &quot;text&quot;: m[&quot;content&quot;]}] if m.get(&quot;content&quot;) else []
+                blocks += [{&quot;type&quot;: &quot;tool_use&quot;, &quot;id&quot;: c.id, &quot;name&quot;: c.name, &quot;input&quot;: c.args} for c in m.get(&quot;tool_calls&quot;, [])]
+                out.append({&quot;role&quot;: &quot;assistant&quot;, &quot;content&quot;: blocks})
+            elif m[&quot;role&quot;] == &quot;tool&quot;:                         # tool results travel inside a user message
+                block = {&quot;type&quot;: &quot;tool_result&quot;, &quot;tool_use_id&quot;: m[&quot;tool_call_id&quot;], &quot;content&quot;: m[&quot;content&quot;]}
+                if out and out[-1][&quot;role&quot;] == &quot;user&quot; and isinstance(out[-1][&quot;content&quot;], list):
+                    out[-1][&quot;content&quot;].append(block)
+                else:
+                    out.append({&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: [block]})
+            else:
+                out.append({&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: m[&quot;content&quot;]})
+        return out
+
+    def complete(self, system, messages, tools, on_text=None):
+        def call():
+            with self.client.messages.stream(
+                model=self.model, max_tokens=8192, messages=self._messages(messages),
+                system=[{&quot;type&quot;: &quot;text&quot;, &quot;text&quot;: system, &quot;cache_control&quot;: {&quot;type&quot;: &quot;ephemeral&quot;}}],  # cache the prefix
+                tools=[{&quot;name&quot;: t[&quot;name&quot;], &quot;description&quot;: t[&quot;description&quot;], &quot;input_schema&quot;: t[&quot;parameters&quot;]} for t in tools],
+            ) as stream:
+                for text in stream.text_stream:
+                    if on_text: on_text(text)
+                msg = stream.get_final_message()
+            u = msg.usage
+            return Reply(
+                text=&quot;&quot;.join(b.text for b in msg.content if b.type == &quot;text&quot;),
+                tool_calls=[ToolCall(b.id, b.name, b.input) for b in msg.content if b.type == &quot;tool_use&quot;],
+                input_tokens=u.input_tokens + (u.cache_read_input_tokens or 0) + (u.cache_creation_input_tokens or 0),
+                cached_tokens=u.cache_read_input_tokens or 0, output_tokens=u.output_tokens, stop=msg.stop_reason)
+        return with_retries(call)
+
+PRICES = {  # USD per million tokens: (input, cached input, output). Fill in from your provider&#x27;s price page.
+    &quot;example-model&quot;: (1.00, 0.10, 4.00),
+}
+
+def cost(model, r: Reply):
+    p_in, p_cache, p_out = PRICES.get(model, (0, 0, 0))
+    return ((r.input_tokens - r.cached_tokens) * p_in + r.cached_tokens * p_cache + r.output_tokens * p_out) / 1e6
+
+def make(spec: str):
+    &quot;&quot;&quot;&#x27;openai:gpt-5-mini&#x27;, &#x27;anthropic:claude-sonnet-5-5&#x27;, or &#x27;compat:&lt;model&gt;@&lt;base_url&gt;&#x27;&quot;&quot;&quot;
+    kind, _, rest = spec.partition(&quot;:&quot;)
+    if kind == &quot;anthropic&quot;:
+        return Anthropic(rest)
+    if kind == &quot;compat&quot;:
+        model, _, url = rest.partition(&quot;@&quot;)
+        return OpenAICompat(model, base_url=url, api_key=os.getenv(&quot;API_KEY&quot;))
+    return OpenAICompat(rest)</pre>
+<p>How the code maps to the chapter:</p>
+<ul>
+  <li><strong>Our own message format</strong> (<code>ToolCall</code> objects, <code>role: "tool"</code>) is translated in each adapter's <code>_messages()</code>. Note how the Anthropic adapter groups consecutive tool results into one user message.</li>
+  <li><strong>Streaming joins tool arguments</strong> by index in the OpenAI adapter, because arguments arrive as string fragments.</li>
+  <li><strong><code>with_retries</code></strong> retries only status codes that are transient, with jittered backoff, 3 attempts as eve does.</li>
+  <li><strong>The system prompt carries a cache breakpoint</strong> for Anthropic; OpenAI-compatible endpoints cache exact prefixes automatically. Both report cached tokens, which we store.</li>
+</ul>
+<h3>Wire it into the loop</h3>
+<p>In Chapter 1's <code>step()</code>, replace the SDK call with <code>reply = llm.complete(SYSTEM, state.messages, TOOL_SPECS, on_text=print_stream)</code>, append <code>{"role": "assistant", "content": reply.text, "tool_calls": reply.tool_calls}</code>, and add <code>reply</code>'s tokens and <code>cost()</code> to the state. Tool definitions become plain dicts with <code>name</code>, <code>description</code> and <code>parameters</code>; each adapter wraps them as its provider expects.</p>
+<h3>Measure</h3>
+<ol>
+  <li>Run your 10 test tasks with one cheap and one strong model. Record pass rate, steps, tokens, cached share and dollars per task.</li>
+  <li>Print the cached share per step. After the second step it should be high. If it is not, find what changes at the top of your prompt.</li>
+  <li>Put the current time into the system prompt and rerun one task. Watch the cached share fall. Remove it.</li>
+</ol>
+
+<h2 id="exercises">7. Exercises</h2>
+<ol>
+  <li>Add a hedge: if no first token arrives within the 90th percentile of your last 50 calls (minimum 1.5 s), start a second request and keep the first to answer. Cap hedges at 10% of calls, as nanocode does.</li>
+  <li>Switch provider mid-session: run three steps on one model, convert the history, and continue on the other. What did you lose?</li>
+  <li>Read one prompt in <code>nanocode/crates/backends/codex/client/prompts/</code> and list three instructions you would not have thought to write.</li>
+</ol>
+
+<h2 id="quiz">8. Check yourself</h2>
+<div class="widget quiz" data-quiz="qz2"></div>
+<script type="application/json" id="qz2">[
+{"q":"Why does nanocode keep one driver per vendor instead of one neutral API?","o":["Rust requires it","Models are post-trained inside their vendor's harness, so native prompts and tools work best","Neutral APIs are slower","To support WASM"],"a":1,"e":"Native prompts and tool formats match what the model saw in training. The cost is maintaining several drivers."},
+{"q":"In a streamed OpenAI-compatible response, tool-call arguments:","o":["Arrive complete in the first chunk","Arrive as string fragments that must be joined by index","Are never streamed","Arrive as parsed objects"],"a":1,"e":"Join fragments per tool-call index, then parse the JSON once the stream ends."},
+{"q":"Which errors should a harness retry?","o":["All errors","Transient ones such as 429, 503, 529 and dropped connections","Only 400","None; let the model handle it"],"a":1,"e":"Retry transient failures with backoff. A 400 means the request is wrong; retrying it wastes money."},
+{"q":"What does nanocode's default hedge policy do?","o":["Retries every request twice","Sends a second request when the first byte is slower than the recent 90th percentile (minimum 1.5 s), capped at 10% of requests","Switches provider on error","Caches responses"],"a":1,"e":"Hedging cuts tail latency at a bounded extra cost."},
+{"q":"Why does a timestamp at the top of the system prompt raise cost?","o":["It adds many tokens","It changes the prefix every call, so prompt caching never hits","Providers charge for dates","It slows streaming"],"a":1,"e":"Caching needs an exact prefix match; anything that changes early in the prompt invalidates everything after it."}
+]</script>
+
+<h2 id="refs">9. References</h2>
+<ul>
+  <li>Pi: <code>packages/ai/src/types.ts</code>, <code>providers/</code>, <code>models.generated.ts</code> (<a href="https://github.com/earendil-works/pi">earendil-works/pi</a>).</li>
+  <li>nanocode: <code>crates/backends/</code>, <code>crates/core/hedge/src/lib.rs</code>, <code>crates/README.md</code> (<a href="https://github.com/gakonst/nanocode">gakonst/nanocode</a>).</li>
+  <li>eve: <code>packages/eve/src/harness/model-call/retry.ts</code>, <code>prompt-cache.ts</code> (<a href="https://github.com/vercel/eve">vercel/eve</a>).</li>
+  <li>fx: <code>src/gateway/client.zig</code> (<a href="https://github.com/vercel-labs/fx">vercel-labs/fx</a>).</li>
+  <li><a href="https://manus.im/blog/Context-Engineering-for-AI-Agents-Lessons-from-Building-Manus">Context Engineering for AI Agents: Lessons from Building Manus</a>, Jul 2025.</li>
+  <li><a href="https://code.visualstudio.com/blogs/2026/05/15/agent-harnesses-github-copilot-vscode">The Coding Harness Behind GitHub Copilot in VS Code</a>, May 2026.</li>
+  <li><a href="https://www.mariozechner.at/posts/2025-11-30-pi-coding-agent/">Building Pi</a> (cross-provider context handoff), Mario Zechner, Nov 2025.</li>
+</ul>
+
+<div class="navfoot"></div>
+</article></main>
+</div>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/book.js"></script>
+
+</body>
+</html>
