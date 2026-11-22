@@ -67,7 +67,7 @@ window.IE_CHAPTERS = [
 "title": "Subagents and Code Mode",
 "slug": "09-subagents",
 "stage": 3,
-"ready": false
+"ready": true
 },
 {
 "n": "10",

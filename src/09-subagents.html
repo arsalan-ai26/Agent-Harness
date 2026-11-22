@@ -1,0 +1,176 @@
+<div class="kicker">Stage 3 · Control · Chapter 9</div>
+<h1>Subagents and Code Mode</h1>
+<p class="lede">Two ideas attack the same cost from different sides. Subagents move work into a separate context and bring back only a report. Code Mode lets the model write one program that calls many tools and returns only the result. Both keep intermediate noise out of the main context. Pi rejects subagents, nanocode makes each one a durable session, and both Pi and nanocode ship Code Mode. You build a subagent tool and a Python Code Mode cell runner, and measure what each saves.</p>
+<div class="meta">
+  <span class="chip">Level: advanced</span>
+  <span class="chip">Time: about 20 hours with the build</span>
+  <span class="chip">Needs: Chapters 3, 6 and 7</span>
+  <span class="chip">Code read at: Pi fb248c7, eve 5c52fbf, fx cbe7daf, nanocode 015cbfa</span>
+</div>
+
+<div class="box skip">
+  <span class="lbl">Before you start: skip check</span>
+  <ol>
+    <li>What does a parent agent see of a subagent's work?</li>
+    <li>Reading 30 files to find one function: how many model round trips with normal tools, and with Code Mode?</li>
+    <li>What is Pi's main objection to subagents?</li>
+  </ol>
+  <details><summary>Answers</summary><ol>
+    <li>Usually only its final report. The parent chose the subagent's context and cannot see its full conversation unless the harness keeps a transcript.</li>
+    <li>Normal tools: up to 30 tool results in context, often many steps. Code Mode: one program reads all 30 in a loop and returns one line, one round trip.</li>
+    <li>They are a black box: the orchestrator decides what context the child gets and the user cannot see what it did. Zechner prefers gathering context in a separate session and saving it as a file.</li>
+  </ol></details>
+</div>
+
+<h2 id="why">1. Two ways to keep the context clean</h2>
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 250" width="760" style="max-width:100%;height:auto" role="img" aria-label="Subagent and Code Mode compared">
+  <defs><marker id="f1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <text x="24" y="22" style="fill:var(--ink);font-size:13px;font-weight:600">Subagent: a second context</text>
+  <rect x="24" y="36" width="140" height="60" rx="8" style="fill:var(--kv-s);stroke:var(--kv)"/><text x="94" y="62" text-anchor="middle" style="fill:var(--ink);font-size:12px">parent</text><text x="94" y="80" text-anchor="middle" style="fill:var(--ink2);font-size:10px">sees one report</text>
+  <rect x="220" y="36" width="160" height="150" rx="8" style="fill:var(--panel2);stroke:var(--line)"/><text x="300" y="58" text-anchor="middle" style="fill:var(--ink);font-size:12px">child session</text>
+  <text x="236" y="84" style="fill:var(--ink2);font-size:10px">model call</text><text x="236" y="102" style="fill:var(--ink2);font-size:10px">20 tool results</text><text x="236" y="120" style="fill:var(--ink2);font-size:10px">model call</text><text x="236" y="138" style="fill:var(--ink2);font-size:10px">...</text><text x="236" y="168" style="fill:var(--ink2);font-size:10px">own transcript, budget</text>
+  <g style="fill:none;stroke:var(--ink2);stroke-width:1.3"><path d="M164 56H218" marker-end="url(#f1)"/><path d="M218 82H166" marker-end="url(#f1)"/></g>
+  <text x="170" y="50" style="fill:var(--ink2);font-size:9px">task</text><text x="170" y="96" style="fill:var(--ink2);font-size:9px">report</text>
+  <text x="420" y="22" style="fill:var(--ink);font-size:13px;font-weight:600">Code Mode: one program</text>
+  <rect x="420" y="36" width="140" height="60" rx="8" style="fill:var(--pre-s);stroke:var(--pre)"/><text x="490" y="62" text-anchor="middle" style="fill:var(--ink);font-size:12px">model</text><text x="490" y="80" text-anchor="middle" style="fill:var(--ink2);font-size:10px">writes code once</text>
+  <rect x="600" y="36" width="136" height="150" rx="8" style="fill:var(--dec-s);stroke:var(--dec)"/><text x="668" y="58" text-anchor="middle" style="fill:var(--ink);font-size:12px">sandboxed cell</text>
+  <text x="612" y="84" style="fill:var(--ink2);font-size:10px">for f in files:</text><text x="612" y="102" style="fill:var(--ink2);font-size:10px">  tools.read(f)</text><text x="612" y="120" style="fill:var(--ink2);font-size:10px">  ...filter...</text><text x="612" y="138" style="fill:var(--ink2);font-size:10px">result(hits)</text>
+  <g style="fill:none;stroke:var(--ink2);stroke-width:1.3"><path d="M560 56H598" marker-end="url(#f1)"/><path d="M598 82H562" marker-end="url(#f1)"/></g>
+  <text x="24" y="224" style="fill:var(--ink2);font-size:11px">Both keep intermediate results out of the main context. A subagent still reasons at every step; a cell runs plain code with no model in the loop.</text>
+</svg></div>
+<figcaption>Subagents isolate reasoning; Code Mode removes round trips.</figcaption>
+</figure>
+
+<h2 id="tour">2. Code tour</h2>
+<h3>nanocode: a durable task tree</h3>
+<p><code>crates/runtime/subagents</code> owns spawning, waiting, messages, residency, completions, budgets and a journal. Constants in <code>lib.rs</code>: <code>DEFAULT_MAX_RESIDENT_SUBAGENTS = 16</code>, and only 2 resident when durable; a completion request has its own prefix so the parent can tell a child's report from a user message. There is a spawn policy and router (<code>SpawnPolicy</code>, <code>SpawnRouter</code>) and a roster. The README's design point: a Code Mode cell can spawn children, and each child is a durable session of its own, so nothing is a black box.</p>
+<h3>nanocode and Pi: Code Mode</h3>
+<p>nanocode's Claude Code Mode prompt (<code>crates/backends/claude/prompts/code_mode.md</code>) is a short course in when to use it: orchestrate related calls whose next step needs no model judgement; keep the whole lifecycle in one cell; use <code>Promise.all</code> for independent calls and <code>Promise.allSettled</code> when one may fail; await long commands instead of polling; return only what the next reasoning step needs; use separate calls when a result needs judgement, user input or a progress update. The QuickJS worker gives each cell a fresh context. Pi ships the same idea as <code>packages/codemode</code> and in Pi Durable (<code>src/codemode/</code>).</p>
+<h3>eve: subagents are agents</h3>
+<p>A subagent is a folder under <code>agent/subagents/</code> that reuses <code>defineAgent</code>, with its own instructions, tools, model and sandbox. The main agent delegates and combines results. The Foreman software factory (Chapter 13) is four subagents with separate sandboxes; its Reviewer never sees the Implementer's reasoning, on purpose.</p>
+<h3>fx: subagents with a smaller step limit</h3>
+<p><code>src/core/subagent/</code> (<code>tool_host.zig</code>, <code>execution.zig</code>, <code>agent_adapter.zig</code>) runs subagents with their own step limit, which the adapter sets lower than the parent's.</p>
+<h3>Pi: no subagents in core</h3>
+<p>Pi's README lists no subagents as a deliberate choice. For code review, a slash command runs <code>pi --print</code> as a separate process; for research, gather context in a separate session and save it as a file the next session reads.</p>
+
+<h2 id="decisions">3. Design decisions compared</h2>
+<div class="tbl"><table>
+  <tr><th>Choice</th><th>Pro</th><th>Con</th><th>Who</th></tr>
+  <tr><td>No subagents; files carry context</td><td>Fully visible; nothing hidden</td><td>Manual; no parallelism</td><td>Pi</td></tr>
+  <tr><td>Subagents as durable sessions</td><td>Inspectable, resumable, budgeted</td><td>Complex runtime</td><td>nanocode</td></tr>
+  <tr><td>Subagents as agents in folders</td><td>Each has its own tools and sandbox</td><td>More configuration</td><td>eve</td></tr>
+  <tr><td>Code Mode</td><td>Fewer round trips and tokens; parallel calls</td><td>Needs a sandboxed interpreter; model must write correct code</td><td>nanocode, Pi</td></tr>
+</table></div>
+<div class="box expert">
+  <span class="lbl">When to use which</span>
+  <p>Use a subagent when the work needs judgement at each step but its details are not needed afterwards (explore a codebase, review a diff). Use Code Mode when the steps are mechanical (read many files, filter, aggregate, run a command per item). Use neither when the user needs to watch and steer the work.</p>
+</div>
+
+<h2 id="research">4. Research and the Chinese view</h2>
+<ul>
+  <li><strong>Planner, generator, evaluator.</strong> Anthropic's 2026 long-running harness splits work across three agents and keeps the evaluator separate so the generator does not grade itself.</li>
+  <li><strong>Manus moved planning out.</strong> Updating a <code>todo.md</code> in the main agent used about a third of all actions, so Manus moved to a planner agent that calls executor sub-agents (<a href="https://scour.ing/@emschwartz/p/https://rlancemartin.github.io/2025/10/15/manus">Lance Martin's notes</a>).</li>
+  <li><strong>Programmatic tool calling.</strong> Anthropic's API feature and open-source versions run model-written code that calls tools, keeping data-heavy intermediate results out of context.</li>
+  <li><strong>Chinese practice.</strong> Kimi's K2.x releases emphasize long agent runs and agent swarms; Chinese analyses of Claude Code's leaked source describe its subagents, task graph and team mailboxes as the parallel layer of the harness.</li>
+</ul>
+
+<h2 id="build">5. Build: a subagent tool and Code Mode cells</h2>
+<pre>&quot;&quot;&quot;Subagents (child sessions with their own context and budget) and Code Mode (one program calls many tools).&quot;&quot;&quot;
+import json, subprocess, sys
+
+# ---- subagents --------------------------------------------------------------------------------
+def make_task_tool(run_agent, max_depth=1):
+    &quot;&quot;&quot;run_agent(system, task, tools, max_steps, transcript_path) -&gt; final text. The parent sees only that text.&quot;&quot;&quot;
+    def task(description: str, prompt: str, tools: list[str] | None = None, depth: int = 0, max_steps: int = 30):
+        if depth &gt;= max_depth:
+            return &quot;error: subagents may not spawn subagents&quot;
+        path = f&quot;subagent-{abs(hash((description, prompt))) % 10**8}.jsonl&quot;   # a real, inspectable transcript
+        system = (&quot;You are a subagent. Do only this task, then reply with a short report: what you found or &quot;
+                  &quot;changed, with file paths and line numbers. Your report is all the parent will see.&quot;)
+        result = run_agent(system, prompt, tools or [&quot;read&quot;, &quot;bash&quot;], max_steps, path)
+        return f&quot;{result}\n[subagent transcript: {path}]&quot;
+    return task
+
+# ---- Code Mode ----------------------------------------------------------------------------------
+PRELUDE = r&#x27;&#x27;&#x27;
+import json, sys
+class _Tools:
+    def __getattr__(self, name):
+        def call(**args):
+            sys.__stdout__.write(&quot;\x00CALL&quot; + json.dumps({&quot;name&quot;: name, &quot;args&quot;: args}) + &quot;\n&quot;); sys.__stdout__.flush()
+            reply = json.loads(sys.stdin.readline())
+            if reply.get(&quot;error&quot;): raise RuntimeError(reply[&quot;error&quot;])
+            return reply[&quot;result&quot;]
+        return call
+tools = _Tools()
+_out = []
+def result(value): _out.append(value if isinstance(value, str) else json.dumps(value, default=str))
+&#x27;&#x27;&#x27;
+EPILOGUE = &#x27;\nsys.__stdout__.write(&quot;\\x00DONE&quot; + json.dumps(&quot;\\n&quot;.join(_out)) + &quot;\\n&quot;)\n&#x27;
+
+CODE_MODE_DESCRIPTION = &quot;&quot;&quot;Run a Python program that calls tools as functions: tools.read(path=...), tools.bash(command=...),
+tools.edit(path=..., edits=[...]). Each returns the tool&#x27;s text. Use loops and conditionals for steps that need no
+judgement, and call result(value) with only what you need for your next decision; nothing else returns to you.
+Use separate calls when an intermediate result needs your judgement.&quot;&quot;&quot;
+
+def exec_cell(code: str, call_tool, timeout=300, python=(sys.executable, &quot;-I&quot;)):
+    &quot;&quot;&quot;Run one cell in a fresh interpreter. Tool calls come back over stdout and are answered on stdin.
+    In production, run `python` inside the Chapter 7 sandbox container.&quot;&quot;&quot;
+    proc = subprocess.Popen([*python, &quot;-c&quot;, PRELUDE + code + EPILOGUE], stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    calls, printed = 0, []
+    try:
+        for line in proc.stdout:
+            if line.startswith(&quot;\x00CALL&quot;):
+                req = json.loads(line[5:])
+                calls += 1
+                out = call_tool(req[&quot;name&quot;], req[&quot;args&quot;])
+                reply = {&quot;error&quot;: out[7:]} if out.startswith(&quot;error: &quot;) else {&quot;result&quot;: out}
+                proc.stdin.write(json.dumps(reply) + &quot;\n&quot;); proc.stdin.flush()
+            elif line.startswith(&quot;\x00DONE&quot;):
+                proc.wait(timeout=5)
+                return f&quot;{json.loads(line[5:])}\n[cell made {calls} tool calls]&quot;
+            else:
+                printed.append(line)          # stray prints are kept short; result() is the real channel
+        proc.wait(timeout=timeout)
+        err = proc.stderr.read()[-3000:]
+        return f&quot;error: cell failed after {calls} tool calls\n{err}\n{&#x27;&#x27;.join(printed)[-1000:]}&quot;
+    finally:
+        if proc.poll() is None:
+            proc.kill()</pre>
+<p>Wiring:</p>
+<ul>
+  <li><code>run_agent</code> is your Chapter 1 to 8 loop with a different system prompt, tool subset, step limit and its own session file. Register <code>task</code> as a tool.</li>
+  <li>Register <code>exec_cell</code> as a tool named <code>python</code> with <code>CODE_MODE_DESCRIPTION</code>. Its <code>call_tool</code> is your registry's <code>call</code> from Chapter 3, so every nested call still passes the Chapter 7 gate.</li>
+  <li>Run the cell interpreter inside the Docker sandbox in production: replace <code>python=</code> with a <code>docker run -i ...</code> command.</li>
+</ul>
+<h3>Measure</h3>
+<p>Pick 5 of your tasks that read many files. Run each three ways: plain tools, with the <code>task</code> tool, with Code Mode. Record main-context tokens, total tokens, wall time and pass rate. Expect Code Mode to win on tokens and time for mechanical searches, and subagents to win when judgement is needed.</p>
+
+<h2 id="exercises">6. Exercises</h2>
+<ol>
+  <li>Run two subagents in parallel with a thread pool. Give each a budget in tokens and stop it when spent.</li>
+  <li>Let a Code Mode cell call <code>task</code> to spawn a child, as nanocode allows. What guard do you need to avoid runaway recursion?</li>
+  <li>Implement Pi's alternative: a <code>research</code> command that runs a separate session and writes <code>notes/research.md</code> for the next session.</li>
+</ol>
+
+<h2 id="quiz">7. Check yourself</h2>
+<div class="widget quiz" data-quiz="qz9"></div>
+<script type="application/json" id="qz9">[
+{"q":"In nanocode's Code Mode, which tools are top level?","o":["All tools","exec and wait","Only Bash","task and wait"],"a":1,"e":"Every other tool is called from inside the program."},
+{"q":"When should a Code Mode cell be split into separate calls?","o":["Never","When an intermediate result needs model judgement, user input or a progress update","When it makes more than two tool calls","When a call fails"],"a":1,"e":"Mechanical steps belong in one cell; judgement belongs to the model."},
+{"q":"How many subagents can be resident in nanocode by default, and when durable?","o":["Unlimited and 16","16 and 2","2 and 16","1 and 1"],"a":1,"e":"DEFAULT_MAX_RESIDENT_SUBAGENTS = 16, DURABLE_MAX_RESIDENT_SUBAGENTS = 2."},
+{"q":"What is Pi's alternative to subagents for research?","o":["Bigger context windows","Gather context in a separate session and save it as a file for later sessions","Code Mode only","Ask the user"],"a":1,"e":"Files are visible, versionable and shareable; subagent context is not."},
+{"q":"Why does Foreman's Reviewer never see the Implementer's reasoning?","o":["To save tokens","So it judges the real diff independently instead of being persuaded by the generator","Because of API limits","It is a bug"],"a":1,"e":"Separating generator and evaluator is a recurring 2026 pattern."}
+]</script>
+
+<h2 id="refs">8. References</h2>
+<ul>
+  <li>nanocode: <code>crates/runtime/subagents/src/lib.rs</code>, <code>crates/runtime/code-mode</code>, <code>crates/backends/claude/prompts/code_mode.md</code>.</li>
+  <li>Pi: <code>packages/codemode/README.md</code>; <code>packages/durable/src/codemode/</code>.</li>
+  <li>eve: <code>docs/subagents/</code>; <code>apps/templates/eve-software-factory-template</code>.</li>
+  <li>fx: <code>src/core/subagent/</code>.</li>
+  <li><a href="https://www.mariozechner.at/posts/2025-11-30-pi-coding-agent/">Why no sub-agents</a>, Mario Zechner, Nov 2025.</li>
+  <li><a href="https://manus.im/blog/Context-Engineering-for-AI-Agents-Lessons-from-Building-Manus">Context Engineering for AI Agents: Lessons from Building Manus</a>, Jul 2025.</li>
+</ul>
