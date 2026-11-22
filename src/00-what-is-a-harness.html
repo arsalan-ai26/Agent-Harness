@@ -1,0 +1,337 @@
+<div class="kicker">Stage 1 · Foundations · Chapter 0</div>
+<h1>What an agent harness is</h1>
+<p class="lede">A language model only writes text. Everything that turns that text into work, such as reading files, running commands, remembering, asking permission and checking results, is the harness. This chapter defines the harness from first principles, splits it into eleven components, shows why it matters as much as the model, and introduces the four open-source harnesses we read through the whole book.</p>
+<div class="meta">
+  <span class="chip">Level: beginner to intermediate</span>
+  <span class="chip">Time: 4 to 5 hours with the reading lab</span>
+  <span class="chip">Needs: basic Python, git</span>
+  <span class="chip">Facts checked: 22 Nov 2026</span>
+</div>
+
+<div class="box skip">
+  <span class="lbl">Before you start: skip check</span>
+  <p>If you can answer all three, skim this chapter and go to the <a href="#lab">reading lab</a>:</p>
+  <ol>
+    <li>An agent is running a test suite. Which part decides that the test output goes back to the model: the model or the harness?</li>
+    <li>Name three harness components that exist only because the context window is finite.</li>
+    <li>Why can the same model get very different scores on the same benchmark?</li>
+  </ol>
+  <details><summary>Answers</summary>
+    <ol>
+      <li>The harness. The model only asks for a tool call. The harness runs it, decides how much output to keep, and appends the result to the next request.</li>
+      <li>Any three of: compaction, tool-output truncation, subagents (isolated context), skills loaded on demand, file-based memory, prompt caching discipline.</li>
+      <li>Because the score measures model plus harness. Tools, prompts, context management and verification change the result even when the weights do not change.</li>
+    </ol>
+  </details>
+</div>
+
+<h2 id="why">1. Why a model is not an agent</h2>
+<p>Call a model API with a question and you get text back. That text cannot read your repository, run your tests or open a pull request. It cannot remember yesterday's conversation. It cannot stop itself from deleting a folder. It does not know whether its answer is correct.</p>
+<p>Something must sit between the model and the world. That something sends the model a prompt, reads its reply, runs the actions it asks for, feeds back the results, and repeats. It also decides what the model may do, what it remembers, and when the work is finished. This is the <strong>harness</strong>.</p>
+<p>The word comes from horse tack: the straps that connect a strong animal to the cart and let a driver steer it. The model provides the power. The harness turns that power into controlled, useful work. Chinese writers use exactly this picture: <em>马具</em>, horse tack, and translate harness engineering as <em>驾驭工程</em>, the engineering of driving and controlling.</p>
+<p>In 2026 this layer got its own name and its own discipline. Mitchell Hashimoto described the habit that defines it: every time an agent makes a mistake, engineer a permanent fix into its environment so that mistake cannot happen again. OpenAI, Anthropic, LangChain, Cursor and GitHub then published how their own harnesses work. This book builds one.</p>
+
+<h2 id="loop">2. From one call to a loop</h2>
+<p>Start with the smallest possible agent. It has one tool, <code>bash</code>, and one rule: keep going while the model asks for tools.</p>
+<pre><span class="k">def</span> run(task):
+    messages = [{<span class="s">"role"</span>: <span class="s">"user"</span>, <span class="s">"content"</span>: task}]
+    <span class="k">while</span> <span class="k">True</span>:
+        reply = model(messages, tools=[BASH])        <span class="c"># 1. ask the model</span>
+        messages.append(reply)
+        <span class="k">if not</span> reply.tool_calls:                       <span class="c"># 2. no tool call: done</span>
+            <span class="k">return</span> reply.text
+        <span class="k">for</span> call <span class="k">in</span> reply.tool_calls:                    <span class="c"># 3. run each tool</span>
+            output = run_bash(call.args[<span class="s">"command"</span>])
+            messages.append(tool_result(call.id, output))  <span class="c"># 4. feed the result back</span></pre>
+<p>This is the <strong>agent loop</strong>. It is the ReAct pattern from 2022: reason, act, observe, repeat. Every harness in this book runs a version of it. Thorsten Ball built a working coding agent in 315 lines of Go on this idea, and Chinese analyses note that the innermost loop can be about 200 lines.</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 300" width="760" style="max-width:100%;height:auto" role="img" aria-label="The agent loop: the harness builds a prompt, the model replies, the harness runs tools in the environment and appends results until the model stops calling tools">
+  <defs><marker id="a0" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <g style="fill:none;stroke:var(--ink2);stroke-width:1.4">
+    <path d="M150 70H218" marker-end="url(#a0)"/>
+    <path d="M388 70H456" marker-end="url(#a0)"/>
+    <path d="M540 100V150" marker-end="url(#a0)"/>
+    <path d="M456 190H388" marker-end="url(#a0)"/>
+    <path d="M303 160V102" marker-end="url(#a0)"/>
+    <path d="M626 70H690V246" marker-end="url(#a0)"/>
+  </g>
+  <rect x="24" y="44" width="126" height="52" rx="8" style="fill:var(--panel2);stroke:var(--line)"/>
+  <text x="87" y="75" text-anchor="middle" style="fill:var(--ink);font-size:13px">Task</text>
+  <rect x="220" y="40" width="168" height="60" rx="8" style="fill:var(--kv-s);stroke:var(--kv);stroke-width:1.6"/>
+  <text x="304" y="66" text-anchor="middle" style="fill:var(--ink);font-size:13px;font-weight:600">Harness</text>
+  <text x="304" y="84" text-anchor="middle" style="fill:var(--ink2);font-size:11px">builds the prompt</text>
+  <rect x="458" y="40" width="168" height="60" rx="8" style="fill:var(--pre-s);stroke:var(--pre);stroke-width:1.6"/>
+  <text x="542" y="66" text-anchor="middle" style="fill:var(--ink);font-size:13px;font-weight:600">Model</text>
+  <text x="542" y="84" text-anchor="middle" style="fill:var(--ink2);font-size:11px">text or tool calls</text>
+  <rect x="458" y="160" width="168" height="60" rx="8" style="fill:var(--dec-s);stroke:var(--dec);stroke-width:1.6"/>
+  <text x="542" y="186" text-anchor="middle" style="fill:var(--ink);font-size:13px;font-weight:600">Environment</text>
+  <text x="542" y="204" text-anchor="middle" style="fill:var(--ink2);font-size:11px">files, shell, web</text>
+  <rect x="220" y="160" width="168" height="60" rx="8" style="fill:var(--kv-s);stroke:var(--kv);stroke-width:1.6"/>
+  <text x="304" y="186" text-anchor="middle" style="fill:var(--ink);font-size:13px;font-weight:600">Harness</text>
+  <text x="304" y="204" text-anchor="middle" style="fill:var(--ink2);font-size:11px">appends the results</text>
+  <rect x="628" y="248" width="124" height="40" rx="8" style="fill:var(--panel2);stroke:var(--line)"/>
+  <text x="690" y="273" text-anchor="middle" style="fill:var(--ink);font-size:12px">Final answer</text>
+  <text x="550" y="132" style="fill:var(--ink2);font-size:11px">tool calls</text>
+  <text x="640" y="62" style="fill:var(--ink2);font-size:11px">no calls</text>
+  <text x="392" y="182" style="fill:var(--ink2);font-size:11px">output</text>
+  <text x="312" y="136" style="fill:var(--ink2);font-size:11px">next round</text>
+</svg></div>
+<figcaption>The agent loop. The model (indigo) only decides. The harness (teal) builds every request and runs every action in the environment (amber). The loop ends when the model replies without a tool call.</figcaption>
+</figure>
+
+<p>The loop is easy. The hard questions start the moment you use it on real work:</p>
+<ul>
+  <li>The test suite prints 40,000 lines. How much goes back to the model?</li>
+  <li>After two hours the conversation no longer fits the context window. What do you drop?</li>
+  <li>The model asks to run <code>rm -rf build/</code>. Do you run it? Who decides?</li>
+  <li>Your laptop sleeps in the middle of a task. Can the agent continue?</li>
+  <li>The model says "done". How do you know it is true?</li>
+</ul>
+<p>Every answer is harness code. Community analysis of Claude Code's leaked source estimated that only about 1.6% of it is AI decision logic and 98.4% is operational infrastructure around the loop (<a href="https://arxiv.org/html/2604.14228v1">Dive into Claude Code</a>). The rest of this book is about that 98%.</p>
+
+<h2 id="definitions">3. Definitions we use in every chapter</h2>
+<div class="box def">
+  <span class="lbl">Definitions</span>
+  <p><strong>Model:</strong> the language model behind an API. Input: a list of messages and tool definitions. Output: text, tool calls, or both.</p>
+  <p><strong>Harness:</strong> all the code, configuration and execution logic that is not the model. LangChain's short version: Agent = Model + Harness, and if you are not the model, you are the harness.</p>
+  <p><strong>Environment:</strong> the world the agent acts on: a file system, a shell, a browser, APIs, a sandbox.</p>
+  <p><strong>Tool:</strong> a named action the harness offers the model, with a description and an input schema, for example <code>read_file(path)</code>.</p>
+  <p><strong>Turn:</strong> one user message and all the work it triggers until the agent replies. <strong>Step:</strong> one model call and the tool calls that follow it. <strong>Session:</strong> the whole conversation, possibly many turns over days.</p>
+  <p><strong>Context window:</strong> the maximum number of tokens the model can read in one request. Every token in it costs money and attention.</p>
+</div>
+<p>Two neighbouring terms. <strong>Prompt engineering</strong> asks how to phrase one request. <strong>Context engineering</strong> asks what the model should see in one window. <strong>Harness engineering</strong> asks what the whole system should allow, measure and correct across many windows over time. Each layer contains the one before it.</p>
+
+<h2 id="anatomy">4. Anatomy: eleven components</h2>
+<p>Every harness we read splits into the same eleven parts. Each chapter of this book takes one or two of them. Academic surveys reached similar lists: one formalizes a harness as a six-part tuple (execution loop, tool registry, context manager, state store, lifecycle hooks, evaluation interface); another uses a seven-layer taxonomy.</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 420" width="760" style="max-width:100%;height:auto" role="img" aria-label="Eleven harness components around the agent loop">
+  <defs><marker id="a1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="24" y="16" width="712" height="52" rx="8" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="40" y="38" style="fill:var(--ink);font-size:13px;font-weight:600">C. Instructions and context assembly</text>
+  <text x="40" y="56" style="fill:var(--ink2);font-size:11px">system prompt, AGENTS.md, environment facts, skill names</text>
+  <g style="fill:none;stroke:var(--ink2);stroke-width:1.4">
+    <path d="M287 68V98" marker-end="url(#a1)"/>
+    <path d="M180 134H208" marker-start="url(#a1)" marker-end="url(#a1)"/>
+    <path d="M366 134H394" marker-end="url(#a1)"/>
+    <path d="M552 134H580" marker-end="url(#a1)"/>
+    <path d="M659 170V188H327V172" marker-end="url(#a1)"/>
+    <path d="M247 170V206" marker-end="url(#a1)"/>
+    <path d="M380 364V330" marker-end="url(#a1)"/>
+  </g>
+  <rect x="24" y="100" width="154" height="70" rx="8" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="38" y="124" style="fill:var(--ink);font-size:13px;font-weight:600">K. Model layer</text>
+  <text x="38" y="142" style="fill:var(--ink2);font-size:11px">providers, retries,</text>
+  <text x="38" y="158" style="fill:var(--ink2);font-size:11px">per-model prompts</text>
+  <rect x="210" y="100" width="154" height="70" rx="8" style="fill:var(--kv-s);stroke:var(--kv);stroke-width:2"/>
+  <text x="224" y="124" style="fill:var(--ink);font-size:13px;font-weight:600">A. Agent loop</text>
+  <text x="224" y="142" style="fill:var(--ink2);font-size:11px">call, run tools,</text>
+  <text x="224" y="158" style="fill:var(--ink2);font-size:11px">append, repeat</text>
+  <rect x="396" y="100" width="154" height="70" rx="8" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="410" y="124" style="fill:var(--ink);font-size:13px;font-weight:600">H. Safety gate</text>
+  <text x="410" y="142" style="fill:var(--ink2);font-size:11px">approvals, rules,</text>
+  <text x="410" y="158" style="fill:var(--ink2);font-size:11px">classifier, sandbox</text>
+  <rect x="582" y="100" width="154" height="70" rx="8" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="596" y="124" style="fill:var(--ink);font-size:13px;font-weight:600">B. Tools</text>
+  <text x="596" y="142" style="fill:var(--ink2);font-size:11px">read, edit, bash,</text>
+  <text x="596" y="158" style="fill:var(--ink2);font-size:11px">search, MCP</text>
+  <text x="420" y="184" style="fill:var(--ink2);font-size:11px">results appended</text>
+  <rect x="24" y="208" width="712" height="122" rx="8" style="fill:var(--panel2);stroke:var(--line)"/>
+  <text x="40" y="228" style="fill:var(--ink2);font-size:11px">What the loop sees and keeps</text>
+  <rect x="40" y="240" width="158" height="74" rx="8" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="54" y="262" style="fill:var(--ink);font-size:13px;font-weight:600">D. Context mgmt</text>
+  <text x="54" y="280" style="fill:var(--ink2);font-size:11px">compaction,</text>
+  <text x="54" y="296" style="fill:var(--ink2);font-size:11px">truncation, caching</text>
+  <rect x="214" y="240" width="158" height="74" rx="8" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="228" y="262" style="fill:var(--ink);font-size:13px;font-weight:600">E. State, memory</text>
+  <text x="228" y="280" style="fill:var(--ink2);font-size:11px">sessions, resume,</text>
+  <text x="228" y="296" style="fill:var(--ink2);font-size:11px">durability</text>
+  <rect x="388" y="240" width="158" height="74" rx="8" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="402" y="262" style="fill:var(--ink);font-size:13px;font-weight:600">F. Planning</text>
+  <text x="402" y="280" style="fill:var(--ink2);font-size:11px">plan mode, todos,</text>
+  <text x="402" y="296" style="fill:var(--ink2);font-size:11px">PLAN.md</text>
+  <rect x="562" y="240" width="158" height="74" rx="8" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="576" y="262" style="fill:var(--ink);font-size:13px;font-weight:600">G. Subagents</text>
+  <text x="576" y="280" style="fill:var(--ink2);font-size:11px">isolated context,</text>
+  <text x="576" y="296" style="fill:var(--ink2);font-size:11px">parallel work</text>
+  <text x="392" y="354" style="fill:var(--ink2);font-size:11px">plug in at every step</text>
+  <rect x="24" y="366" width="348" height="46" rx="8" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="40" y="386" style="fill:var(--ink);font-size:13px;font-weight:600">I. Extensibility</text>
+  <text x="40" y="403" style="fill:var(--ink2);font-size:11px">hooks, skills, MCP, plugins, extensions</text>
+  <rect x="388" y="366" width="348" height="46" rx="8" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="404" y="386" style="fill:var(--ink);font-size:13px;font-weight:600">J. Verification and feedback</text>
+  <text x="404" y="403" style="fill:var(--ink2);font-size:11px">tests, linters, evals, traces, cost</text>
+</svg></div>
+<figcaption>The eleven components. The loop (A) is small. The ten parts around it do most of the work.</figcaption>
+</figure>
+
+<div class="tbl"><table>
+  <tr><th>ID</th><th>Component</th><th>The question it answers</th><th>Chapter</th></tr>
+  <tr><td>A</td><td>Agent loop</td><td>When does a turn end, and who drives the loop?</td><td>1</td></tr>
+  <tr><td>K</td><td>Model and provider layer</td><td>How do we talk to many models, stream, retry and cache?</td><td>2</td></tr>
+  <tr><td>B</td><td>Tools</td><td>Which actions, how many, what output size, what edit format?</td><td>3</td></tr>
+  <tr><td>C</td><td>Instructions and context assembly</td><td>What does the model see before it acts?</td><td>4</td></tr>
+  <tr><td>D</td><td>Context management</td><td>What happens when the window is full?</td><td>5</td></tr>
+  <tr><td>E</td><td>State, sessions, memory</td><td>What survives a turn, a restart, a week?</td><td>6, 11</td></tr>
+  <tr><td>H</td><td>Safety</td><td>What may the agent do without asking?</td><td>7</td></tr>
+  <tr><td>I</td><td>Extensibility</td><td>How do others change the harness without forking it?</td><td>8</td></tr>
+  <tr><td>G, F</td><td>Subagents and planning</td><td>How is work split, and how does the agent stay on goal?</td><td>9</td></tr>
+  <tr><td>J</td><td>Verification and observability</td><td>How do we know the work is correct and the harness improved?</td><td>10, 14</td></tr>
+</table></div>
+
+<h2 id="history">5. A short history</h2>
+<p>The harness grew in four eras. Each era solved the biggest failure of the one before.</p>
+<div class="tbl"><table>
+  <tr><th>When</th><th>What happened</th><th>What it taught</th></tr>
+  <tr><td>Oct 2022</td><td>ReAct interleaves reasoning and actions</td><td>The thought, action, observation loop</td></tr>
+  <tr><td>2023</td><td>AutoGPT, BabyAGI and early agent frameworks</td><td>Free-running loops fail without control and state</td></tr>
+  <tr><td>2024</td><td>SWE-agent introduces the agent-computer interface (ACI)</td><td>A tool interface designed for models beat a raw shell on the same model</td></tr>
+  <tr><td>2025</td><td>Claude Code, Codex CLI, Gemini CLI, OpenCode; Manus publishes its context lessons; Pi appears</td><td>Harnesses are co-trained with models; context and cache economics dominate</td></tr>
+  <tr><td>Early 2026</td><td>"Harness engineering" is named; OpenAI ships a 1M-line product with no hand-written code; Claude Code's source leaks</td><td>The harness becomes a first-class engineering artifact</td></tr>
+  <tr><td>Mid to late 2026</td><td>Durable harnesses (eve, Pi Durable, nanocode); software factories (Stripe Minions, StrongDM); embeddable harnesses (fx)</td><td>Agents leave the terminal: they survive crashes and run unattended</td></tr>
+</table></div>
+
+<h2 id="evidence">6. Why the harness matters as much as the model</h2>
+<p>If the harness were plumbing, changing it would not change results. The evidence says otherwise.</p>
+<ul>
+  <li><strong>Same model, better harness.</strong> LangChain moved its coding agent from about Top 30 to Top 5 on Terminal Bench 2.0 by changing only the harness; self-verification and tracing helped most (<a href="https://langchain.com/blog/improving-deep-agents-with-harness-engineering">LangChain</a>).</li>
+  <li><strong>Interfaces matter.</strong> SWE-agent's custom interface reached 12.5% on SWE-bench at a time when non-interactive approaches were far lower, with the same kind of model (<a href="https://arxiv.org/abs/2405.15793v2">SWE-agent</a>).</li>
+  <li><strong>Harnesses can be searched.</strong> Meta-Harness (Stanford, MIT, KRAFTON, 2026) let a coding agent rewrite harness code from raw execution traces, and the discovered harnesses beat hand-built ones while the model weights stayed frozen.</li>
+  <li><strong>Coupling cuts both ways.</strong> Claude Code and Codex models are post-trained with their own harness in the loop. A model can underperform in a harness it was not trained with, and changing a tool format such as <code>apply_patch</code> can hurt.</li>
+  <li><strong>Industry scale.</strong> Stripe merges over 1,300 pull requests a week written entirely by its unattended agents, with humans reviewing (<a href="https://stripe.dev/blog/minions-stripes-one-shot-end-to-end-coding-agents-part-2">Stripe</a>). The model is the same one anyone can buy; the harness and environment are Stripe's.</li>
+</ul>
+<div class="box expert">
+  <span class="lbl">Careful reading</span>
+  <p>A benchmark score is a property of model, harness, environment and grader together. When you read "model X scores Y", ask which harness produced it. Several 2026 papers make this point directly, for example "Same model, different harness: different coding-agent results" and "What does a harness buy? Tokens, mostly".</p>
+</div>
+
+<h2 id="references">7. The four harnesses we read</h2>
+<p>We read real source code, not marketing pages. The four projects below sit at four corners of the design space. Claude Code and Codex appear as comparison points, because almost every design decision is made in reaction to them.</p>
+<div class="grid2">
+  <div class="box real"><span class="lbl">eve · Vercel · TypeScript</span>
+    <p>An agent is a directory of files: <code>instructions.md</code>, <code>tools/</code>, <code>skills/</code>, <code>hooks/</code>, <code>channels/</code>, <code>subagents/</code>. The harness kernel does one step and returns <code>{ session, next }</code>, and a workflow engine checkpoints every step, so sessions survive crashes and redeploys. Vercel builds its own agents on it. It ships a full software-factory template.</p>
+    <p class="note">Read: <code>packages/eve/src/harness/kernel.ts</code></p></div>
+  <div class="box real"><span class="lbl">fx · Vercel Labs · Zig</span>
+    <p>A tiny native coding agent (one binary of about 6 MB) that you script with <code>fx ask</code>, connect to editors over ACP, or embed in apps through libfx. CI fails a change if a benchmarked command takes over 2 ms. Its compaction verifies its own summaries and its safety classifier must quote evidence.</p>
+    <p class="note">Read: <code>src/core/agent/runtime/orchestrator.zig</code></p></div>
+  <div class="box real"><span class="lbl">Pi and Pi Durable · Earendil · TypeScript</span>
+    <p>Pi is the minimalist: four core tools, a short system prompt, everything else as extensions, sessions stored as trees. Pi Durable, released with Pi 1.0 in Oct 2026, is a separate library that commits every turn and tool call to storage before anything is shown, so an agent resumes after a crash.</p>
+    <p class="note">Read: <code>packages/agent/src/agent-loop.ts</code>, <code>packages/durable/docs/spec.md</code></p></div>
+  <div class="box real"><span class="lbl">nanocode · gakonst · Rust</span>
+    <p>An SDK for embedded agents: one durable runtime that runs the Codex and Claude harnesses with their own pinned prompts and tools. Every model and tool call is journaled. In Code Mode the model writes one program that calls the tools, and only the result enters the context.</p>
+    <p class="note">Read: <code>crates/README.md</code>, <code>docs/memory-invariant.md</code></p></div>
+</div>
+<p class="note">Commits read for this edition: eve <code>5c52fbf</code> (21 Nov 2026), fx <code>cbe7daf</code>, Pi <code>fb248c7</code>, nanocode <code>015cbfa</code> (all 22 Nov 2026). All four change weekly; each chapter states the commit it quotes.</p>
+
+<h2 id="space">8. The design space</h2>
+<p>Two questions separate most harnesses. How much is built into the core? And does the agent live inside one process, or as a durable service that outlives any process?</p>
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 380" width="760" style="max-width:100%;height:auto" role="img" aria-label="Harnesses placed by core size and by durability">
+  <rect x="120" y="20" width="300" height="150" style="fill:var(--panel);stroke:var(--line)"/>
+  <rect x="420" y="20" width="300" height="150" style="fill:var(--kv-s);stroke:var(--line)"/>
+  <rect x="120" y="170" width="300" height="150" style="fill:var(--panel2);stroke:var(--line)"/>
+  <rect x="420" y="170" width="300" height="150" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="132" y="40" style="fill:var(--ink2);font-size:11px">Small core, durable service</text>
+  <text x="432" y="40" style="fill:var(--ink2);font-size:11px">Batteries included, durable service</text>
+  <text x="132" y="190" style="fill:var(--ink2);font-size:11px">Small core, one process</text>
+  <text x="432" y="190" style="fill:var(--ink2);font-size:11px">Batteries included, one process</text>
+  <circle cx="220" cy="100" r="7" style="fill:var(--kv)"/><text x="232" y="104" style="fill:var(--ink);font-size:13px">Pi Durable</text>
+  <circle cx="320" cy="60" r="7" style="fill:var(--kv)"/><text x="332" y="64" style="fill:var(--ink);font-size:13px">nanocode</text>
+  <circle cx="620" cy="80" r="7" style="fill:var(--kv)"/><text x="632" y="84" style="fill:var(--ink);font-size:13px">eve</text>
+  <circle cx="200" cy="270" r="7" style="fill:var(--kv)"/><text x="212" y="274" style="fill:var(--ink);font-size:13px">Pi</text>
+  <circle cx="380" cy="230" r="7" style="fill:var(--kv)"/><text x="350" y="234" style="fill:var(--ink);font-size:13px">fx</text>
+  <circle cx="600" cy="250" r="7" style="fill:var(--mute)"/><text x="612" y="254" style="fill:var(--ink2);font-size:13px">Claude Code</text>
+  <circle cx="560" cy="290" r="7" style="fill:var(--mute)"/><text x="572" y="294" style="fill:var(--ink2);font-size:13px">Codex CLI</text>
+  <text x="420" y="346" text-anchor="middle" style="fill:var(--ink2);font-size:12px">core size: small → batteries included</text>
+  <text x="104" y="170" text-anchor="middle" transform="rotate(-90 104 170)" style="fill:var(--ink2);font-size:12px">lifetime: one process → durable</text>
+</svg></div>
+<figcaption>The author's placement, based on each project's code and docs. fx sits near the middle on core size: small binary, but web search, subagents, skills and MCP built in. Claude Code and Codex (grey) are the reference points. Our harness starts bottom left and moves up and right through the book.</figcaption>
+</figure>
+<p>Neither corner is correct. A small core is easy to read, cheap in tokens and easy to bend, but you build safety and planning yourself. Batteries included is safer for most users but hides context you cannot see. A durable service survives crashes and waits days for a human, but every step must be serializable and replay-safe. You will feel each trade-off when you build it.</p>
+
+<h2 id="china">9. How Chinese teams see the harness</h2>
+<p>In China the harness became a strategy topic, not just an engineering one. Tencent Cloud's CEO Tang Daosheng wrote that AI has entered "the Harness era", and Alibaba, ByteDance and Tencent each paired a coding tool (Qoder, Trae, CodeBuddy) with a desktop agent and a skills marketplace (<a href="https://www.36kr.com/p/3777620397691911">36Kr</a>). Three ideas from Chinese writing are worth keeping:</p>
+<ul>
+  <li><strong>Coding builds tools, skills store experience, the harness runs the whole.</strong> The harness governs workflow, context, memory, permissions and cost (same source).</li>
+  <li><strong>No model covers every agent scenario.</strong> As open Chinese models close the gap with closed ones, harness design becomes the differentiator (<a href="https://m.bjnews.com.cn/detail/1775178643129477.html">Beijing News</a>).</li>
+  <li><strong>Zero-tolerance AGENTS.md.</strong> Every rule in your agent instructions must trace back to a real failure; if you cannot name the failure, delete the rule (<a href="https://adg.csdn.net/6a5822cf10ee7a33f28df343.html">CSDN</a>). We adopt this rule for our own harness.</li>
+</ul>
+<p>Chinese labs also tie model releases to their own harnesses: Alibaba's Qwen Code is a fork of Gemini CLI, Moonshot ships Kimi CLI, and ByteDance ships Trae Agent. Chinese research includes Tsinghua's Natural-Language Agent Harnesses, which writes harness logic as editable natural-language contracts run by a shared runtime. Chapters 4 and 10 return to it.</p>
+
+<h2 id="plan">10. What we build, and how</h2>
+<p>We build one harness in Python and grow it through five stages. Each stage ends with a gate the harness must pass.</p>
+<div class="tbl"><table>
+  <tr><th>Stage</th><th>Chapters</th><th>Gate</th></tr>
+  <tr><td>1. Foundations</td><td>0 to 3: loop, models, tools</td><td>A working terminal coding agent</td></tr>
+  <tr><td>2. Context</td><td>4 to 6: instructions, compaction, sessions</td><td>Sessions that last hours and resume</td></tr>
+  <tr><td>3. Control</td><td>7 to 10: safety, extensions, subagents, evals</td><td>A governable agent</td></tr>
+  <tr><td>4. Durability and surfaces</td><td>11 to 12</td><td>Survives <code>kill -9</code> mid-task</td></tr>
+  <tr><td>5. Software factory</td><td>13 to 15</td><td>Issue in, draft pull request out</td></tr>
+</table></div>
+<p>Every chapter has the same five parts: the concept from first principles; a code tour of eve, fx, Pi and nanocode; a design-decision table with reasons and trade-offs; what research and Chinese teams say; and the build. Three rules guide the build:</p>
+<ol>
+  <li><strong>Shape the loop for durability from day one.</strong> In Chapter 1 the loop body becomes a function <code>step(state) → (state, next)</code>, the shape eve uses, so Chapter 11 can make it durable without a rewrite.</li>
+  <li><strong>Measure every change.</strong> From Chapter 1, a small set of test tasks runs every week. A change that does not move a number is a guess.</li>
+  <li><strong>Every rule traces to a failure.</strong> We add harness features when the agent fails without them, not because another product has them.</li>
+</ol>
+
+<h2 id="lab">11. Reading lab: find the loop in four codebases</h2>
+<p>No code to write this week. You learn to navigate the four repositories, because every later chapter sends you into them.</p>
+<div class="lab-step"><h3>Step 1. Clone at the pinned commits</h3>
+<pre>git clone https://github.com/vercel/eve && git -C eve checkout 5c52fbf
+git clone https://github.com/vercel-labs/fx && git -C fx checkout cbe7daf
+git clone https://github.com/earendil-works/pi && git -C pi checkout fb248c7
+git clone https://github.com/gakonst/nanocode && git -C nanocode checkout 015cbfa</pre>
+<p class="note">Together about 700 MB. If a commit is no longer reachable, use the latest <code>main</code> and note the difference.</p></div>
+<div class="lab-step"><h3>Step 2. Read the top level of each</h3>
+<p>For each repo read <code>README.md</code> and <code>AGENTS.md</code>, then list the top folders. Write one sentence per repo: what is its unit of extension (a file, an extension, a crate, a channel)?</p></div>
+<div class="lab-step"><h3>Step 3. Find the loop</h3>
+<p>Open the file named below and find where the model is called and where tool results go back. Write down the line numbers.</p>
+<div class="tbl"><table>
+  <tr><th>Repo</th><th>File</th><th>Look for</th></tr>
+  <tr><td>Pi</td><td><code>packages/agent/src/agent-loop.ts</code></td><td><code>runLoop()</code>: the outer and inner <code>while</code> loops</td></tr>
+  <tr><td>eve</td><td><code>packages/eve/src/harness/kernel.ts</code></td><td><code>runStages()</code> and what it returns</td></tr>
+  <tr><td>fx</td><td><code>src/core/agent/runtime/orchestrator.zig</code></td><td>where a model step and a tool batch alternate</td></tr>
+  <tr><td>nanocode</td><td><code>crates/runtime/agent</code></td><td><code>AgentRuntime</code> and <code>TurnInbox</code></td></tr>
+</table></div></div>
+<div class="lab-step"><h3>Step 4. Answer three questions</h3>
+<ol>
+  <li>Which of the four loops would lose the current turn if the process crashed? Why?</li>
+  <li>In Pi, what are the two reasons the inner loop continues?</li>
+  <li>In eve, what does the kernel return instead of looping?</li>
+</ol>
+<details><summary>Answers</summary>
+<ol>
+  <li>Pi's CLI loop and fx keep the turn in memory, so a crash loses it (Pi Durable and nanocode exist to fix exactly this). eve checkpoints each step in a workflow; nanocode journals every call.</li>
+  <li>More tool calls to run, or pending steering messages that the user typed while the agent worked.</li>
+  <li><code>{ session, next }</code>: the updated session and the next step function, or <code>next: null</code> when the turn ends. The workflow engine calls <code>next</code>, which is what makes each step a checkpoint.</li>
+</ol></details></div>
+
+<h2 id="quiz">12. Check yourself</h2>
+<div class="widget quiz" data-quiz="qz0"></div>
+<script type="application/json" id="qz0">[
+{"q":"Which statement best defines a harness?","o":["The system prompt","Everything around the model that turns its output into controlled work","The agent framework you install","The sandbox the agent runs in"],"a":1,"e":"The prompt and the sandbox are parts of the harness. The harness is all non-model code, configuration and execution logic."},
+{"q":"The agent loop ends when:","o":["The context window is full","The model replies without a tool call","The user presses Enter","A fixed number of steps has run"],"a":1,"e":"In the basic loop, no tool call means the model has given its answer. Limits on steps or tokens are extra safety the harness adds."},
+{"q":"Why do compaction, subagents and on-demand skills exist?","o":["To make the harness faster","Because the context window is finite and costs money and attention","Because models cannot call tools","For security"],"a":1,"e":"All three protect the context window: compaction summarizes old turns, subagents keep exploration in a separate window, skills load detail only when needed."},
+{"q":"LangChain moved from about Top 30 to Top 5 on Terminal Bench 2.0. What did it change?","o":["The model","Only the harness","The benchmark","The hardware"],"a":1,"e":"Same model, new harness. Self-verification and tracing gave the largest gains."},
+{"q":"What makes eve's kernel durable?","o":["It is written in Rust","Each call does one step and returns the next step, so a workflow engine can checkpoint between steps","It uses a large context window","It runs in the browser"],"a":1,"e":"Returning { session, next } instead of looping turns every step into a saved checkpoint."},
+{"q":"The zero-tolerance AGENTS.md rule says:","o":["Never write an AGENTS.md","Every rule must trace back to a real agent failure","Rules must be under 100 lines","Only humans may edit it"],"a":1,"e":"If you cannot name the failure that caused a rule, delete it. This keeps instructions short and justified."}
+]</script>
+
+<h2 id="refs">13. References</h2>
+<ul>
+  <li><a href="https://www.langchain.com/blog/the-anatomy-of-an-agent-harness">The Anatomy of an Agent Harness</a>, LangChain, Mar 2026.</li>
+  <li><a href="https://langchain.com/blog/improving-deep-agents-with-harness-engineering">Improving Deep Agents with harness engineering</a>, LangChain, Feb 2026.</li>
+  <li><a href="https://openai.com/index/harness-engineering/">Harness engineering: leveraging Codex in an agent-first world</a>, OpenAI, Feb 2026.</li>
+  <li><a href="https://openai.com/index/unrolling-the-codex-agent-loop">Unrolling the Codex agent loop</a>, OpenAI, Jan 2026.</li>
+  <li><a href="https://anthropic.com/engineering/effective-harnesses-for-long-running-agents">Effective harnesses for long-running agents</a>, Anthropic, Nov 2025.</li>
+  <li><a href="https://arxiv.org/abs/2405.15793v2">SWE-agent: Agent-Computer Interfaces Enable Automated Software Engineering</a>, 2024.</li>
+  <li><a href="https://arxiv.org/html/2604.14228v1">Dive into Claude Code: The Design Space of Today's and Future AI Agent Systems</a>, 2026.</li>
+  <li><a href="https://arxiv.org/html/2603.28052v1">Meta-Harness: End-to-End Optimization of Model Harnesses</a>, 2026.</li>
+  <li><a href="https://arxiv.org/html/2603.25723v1">Natural-Language Agent Harnesses</a>, Tsinghua University, 2026.</li>
+  <li><a href="https://arxiv.org/pdf/2609.00006">Harness Engineering: a source-code study of eleven coding-agent systems</a>, 2026.</li>
+  <li><a href="https://www.mariozechner.at/posts/2025-11-30-pi-coding-agent/">What I learned building an opinionated and minimal coding agent</a>, Mario Zechner, Nov 2025.</li>
+  <li><a href="https://vercel.com/blog/introducing-eve">Introducing eve</a>, Vercel, 2026. <a href="https://github.com/vercel-labs/fx">fx</a> and <a href="https://github.com/gakonst/nanocode">nanocode</a> repositories.</li>
+  <li><a href="https://www.36kr.com/p/3777620397691911">阿里字节腾讯,开始新一轮AI大基建</a>, 36Kr, Apr 2026; <a href="https://m.bjnews.com.cn/detail/1775178643129477.html">火爆AI圈的Harness是什么</a>, Beijing News, Apr 2026.</li>
+</ul>

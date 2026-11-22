@@ -1,0 +1,60 @@
+{
+ "stages": [
+  {
+   "n": 1,
+   "title": "Foundations",
+   "weeks": "Weeks 1 to 4",
+   "gate": "A working terminal coding agent",
+   "chapters": [
+    ["0", "What an agent harness is", "00-what-is-a-harness"],
+    ["1", "The agent loop", "01-agent-loop"],
+    ["2", "The model and provider layer", "02-model-layer"],
+    ["3", "Tools and the action interface", "03-tools"]
+   ]
+  },
+  {
+   "n": 2,
+   "title": "Context",
+   "weeks": "Weeks 5 to 7",
+   "gate": "Sessions that last hours and resume",
+   "chapters": [
+    ["4", "Instructions and context assembly", "04-instructions"],
+    ["5", "Context management and compaction", "05-compaction"],
+    ["6", "Sessions, state and memory", "06-sessions"]
+   ]
+  },
+  {
+   "n": 3,
+   "title": "Control",
+   "weeks": "Weeks 8 to 11",
+   "gate": "A governable agent",
+   "chapters": [
+    ["7", "Permissions, approvals and sandboxing", "07-safety"],
+    ["8", "Extensibility: skills, MCP and hooks", "08-extensibility"],
+    ["9", "Subagents and Code Mode", "09-subagents"],
+    ["10", "Verification, evals and observability", "10-evals"]
+   ]
+  },
+  {
+   "n": 4,
+   "title": "Durability and surfaces",
+   "weeks": "Weeks 12 to 13",
+   "gate": "Survives kill -9 mid-task",
+   "chapters": [
+    ["11", "Durable execution", "11-durability"],
+    ["12", "Surfaces: embedding, protocols and channels", "12-surfaces"]
+   ]
+  },
+  {
+   "n": 5,
+   "title": "Software factory",
+   "weeks": "Weeks 14 to 16",
+   "gate": "Issue in, draft pull request out",
+   "chapters": [
+    ["13", "Software factory I: stations", "13-factory-stations"],
+    ["14", "Software factory II: verification gates and self-improvement", "14-factory-verification"],
+    ["15", "Capstone: benchmark and retrospective", "15-capstone"]
+   ]
+  }
+ ]
+}
