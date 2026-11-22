@@ -1,0 +1,203 @@
+<div class="kicker">Stage 2 · Context · Chapter 4</div>
+<h1>Instructions and context assembly</h1>
+<p class="lede">Before the model acts, the harness decides what it sees: a system prompt, project instructions, environment facts and the names of available skills. This chapter compares how fx, Pi, eve and nanocode assemble that context, and shows the one rule all of them respect: never change the prefix mid-session. You build a context assembler that keeps the prefix stable and appends every change at the end.</p>
+<div class="meta">
+  <span class="chip">Level: intermediate</span>
+  <span class="chip">Time: about 20 hours with the build</span>
+  <span class="chip">Needs: Stage 1</span>
+  <span class="chip">Code read at: Pi fb248c7, eve 5c52fbf, fx cbe7daf, nanocode 015cbfa</span>
+</div>
+
+<div class="box skip">
+  <span class="lbl">Before you start: skip check</span>
+  <ol>
+    <li>The agent changes git branch mid-session. Where should the harness tell the model?</li>
+    <li>A repo has AGENTS.md at the root and another in <code>packages/api/</code>. When should the second one load?</li>
+    <li>What is the "zero tolerance" rule for AGENTS.md?</li>
+  </ol>
+  <details><summary>Answers</summary><ol>
+    <li>Append a small update block to the end of the latest message (user message or tool result). Rewriting the system prompt would break the prompt cache.</li>
+    <li>Either at start if the session begins inside that folder, or the first time a tool touches that folder (fx attaches it to that tool result).</li>
+    <li>Every line must trace back to a real agent failure; if you cannot name the failure, delete the line.</li>
+  </ol></details>
+</div>
+
+<h2 id="layers">1. The layers of context</h2>
+<p>A request is a stack. The top changes rarely, the bottom changes every step. Put things in the right layer and caching works for free.</p>
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 300" width="760" style="max-width:100%;height:auto" role="img" aria-label="Context layers from stable prefix to changing tail">
+  <rect x="24" y="16" width="520" height="40" rx="6" style="fill:var(--kv-s);stroke:var(--kv)"/><text x="36" y="41" style="fill:var(--ink);font-size:12px">1. Base system prompt: who the agent is, how it works</text>
+  <rect x="24" y="62" width="520" height="40" rx="6" style="fill:var(--kv-s);stroke:var(--kv)"/><text x="36" y="87" style="fill:var(--ink);font-size:12px">2. Tool definitions (and skill names and descriptions)</text>
+  <rect x="24" y="108" width="520" height="40" rx="6" style="fill:var(--kv-s);stroke:var(--kv)"/><text x="36" y="133" style="fill:var(--ink);font-size:12px">3. Project instructions: AGENTS.md, global, then root to cwd</text>
+  <rect x="24" y="154" width="520" height="40" rx="6" style="fill:var(--kv-s);stroke:var(--kv)"/><text x="36" y="179" style="fill:var(--ink);font-size:12px">4. Environment at session start: cwd, OS, shell, git branch</text>
+  <rect x="24" y="200" width="520" height="40" rx="6" style="fill:var(--panel2);stroke:var(--line)"/><text x="36" y="225" style="fill:var(--ink);font-size:12px">5. Conversation: messages, tool calls, tool results (append only)</text>
+  <rect x="24" y="246" width="520" height="40" rx="6" style="fill:var(--dec-s);stroke:var(--dec)"/><text x="36" y="271" style="fill:var(--ink);font-size:12px">6. Tail: context updates, folder rules, reminders</text>
+  <path d="M570 20V280" style="stroke:var(--ink2);stroke-width:1.4" marker-end="url(#d1)"/>
+  <defs><marker id="d1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <text x="584" y="40" style="fill:var(--kv);font-size:12px;font-weight:600">cached prefix</text>
+  <text x="584" y="58" style="fill:var(--ink2);font-size:11px">never edited</text>
+  <text x="584" y="58" style="fill:var(--ink2);font-size:11px"></text>
+  <text x="584" y="230" style="fill:var(--ink2);font-size:11px">grows each step</text>
+  <text x="584" y="270" style="fill:var(--dec);font-size:12px;font-weight:600">changes go here</text>
+</svg></div>
+<figcaption>Layers 1 to 4 form the cached prefix, built once per session. Changes are appended at the tail, where the model also pays the most attention.</figcaption>
+</figure>
+
+<h2 id="tour">2. Code tour</h2>
+<h3>fx: an operating manual plus appended updates</h3>
+<p><code>src/builtins/system_prompt.md</code> is about 1,000 words in sections: identity and context, workspace behaviour, source routing, interaction, safety. It tells the model to inspect before answering, to load named skills completely, to tell the user what failed before retrying, and to send one short update before the first tool call.</p>
+<p>Two mechanisms keep it cache-stable. First, when cwd, git state or permission mode change, fx appends an <code>&lt;fx-context-update&gt;</code> block to the end of the message where it noticed the change; the prompt says its values replace the runtime context, and fx escapes the tag in tool output so a file cannot forge one. Second, <code>src/builtins/context.zig</code> notes that folder rules are not added to the session-start instructions when a later tool call reaches a new folder; they ride on that step's last tool result instead. A later turn that reaches the folder again gets a short reminder line, because "without it some models stop applying them after the turn they arrived in." fx also has per-model prompt overlays (<code>modelPromptOverlay</code>).</p>
+<h3>Pi: short prompt, ancestor files</h3>
+<p><code>packages/coding-agent/src/core/system-prompt.ts</code> builds a short prompt from tool snippets and guidelines; users can replace it entirely. <code>resource-loader.ts</code> looks in each directory for <code>AGENTS.override.md</code>, <code>AGENTS.md</code>, <code>AGENTS.MD</code>, <code>CLAUDE.md</code>, <code>CLAUDE.MD</code> and takes the first match, so Pi reads Claude Code projects unchanged. It also handles git worktrees: a nested worktree's own AGENTS.md shadows the main repo's copy so the same rules are not loaded twice.</p>
+<h3>nanocode: deduplicated, size-capped sources</h3>
+<p><code>crates/core/home/src/instructions.rs</code> loads <code>AGENTS.override.md</code> before <code>AGENTS.md</code> at each scope, caps each file at <code>MAX_INSTRUCTION_FILE_BYTES</code>, and skips a file whose content is identical to one already loaded with the diagnostic "included once". The pinned vendor prompts (Chapter 2) stay byte-identical across rounds and reloads; <code>docs/memory-invariant.md</code> lists prefix stability as an invariant.</p>
+<h3>eve: markdown plus code-computed instructions</h3>
+<p>eve's <code>agent/instructions.md</code> is the always-on prompt. Dynamic instructions (<code>defineDynamic</code>) are TypeScript functions that return text per session and can be memoized, for example to load a replaced session's transcript. After a redeploy, system-role instructions update on the next turn, while a changed user-role instruction joins the history again and an unchanged one is not re-added. That is cache-aware by design.</p>
+
+<h2 id="decisions">3. Design decisions compared</h2>
+<div class="tbl"><table>
+  <tr><th>Decision</th><th>fx</th><th>Pi</th><th>nanocode</th><th>eve</th></tr>
+  <tr><td>Base prompt</td><td>~1,000 words, sectioned</td><td>Short, replaceable</td><td>Pinned upstream vendor prompts</td><td>Authored <code>instructions.md</code></td></tr>
+  <tr><td>Project files</td><td>Instruction files, folder rules on first touch</td><td>AGENTS or CLAUDE files, root to cwd, worktree-aware</td><td>AGENTS.override then AGENTS, dedup, size cap</td><td>Directory is the contract</td></tr>
+  <tr><td>Mid-session changes</td><td>Appended <code>fx-context-update</code></td><td>No hidden injection</td><td>Prefix-stable rebuilds</td><td>Next turn, cache-aware</td></tr>
+  <tr><td>Per-model text</td><td>Prompt overlays</td><td>Same prompt</td><td>Different prompt per model</td><td>Model profiles</td></tr>
+</table></div>
+<div class="grid2">
+  <div class="box ex"><span class="lbl">Short prompt (Pi)</span><p><strong>Pro:</strong> cheap, transparent, trusts RL-trained models. <strong>Con:</strong> weaker or unfamiliar models drift; every lesson must live in AGENTS.md.</p></div>
+  <div class="box ex"><span class="lbl">Operating manual (fx, Claude Code)</span><p><strong>Pro:</strong> consistent behaviour across models, encodes hard-won lessons. <strong>Con:</strong> thousands of tokens per request and rules the user cannot see.</p></div>
+</div>
+
+<h2 id="research">4. Research and the Chinese view</h2>
+<ul>
+  <li><strong>Natural-Language Agent Harnesses</strong> (Tsinghua, Mar 2026) goes furthest: harness logic itself (contracts, roles, stages, failure taxonomy, state) is written as editable natural language and executed by a shared runtime (<a href="https://arxiv.org/html/2603.25723v1">arXiv 2603.25723</a>). AGENTS.md is the everyday version of this idea.</li>
+  <li><strong>Attention recitation.</strong> Manus rewrote a <code>todo.md</code> at the end of the context so the goal stays in the model's recent attention; fx's folder-rule reminder line is the same idea applied to rules.</li>
+  <li><strong>Zero-tolerance AGENTS.md.</strong> Chinese practitioners popularized the rule that every line must trace to a real failure (<a href="https://adg.csdn.net/6a5822cf10ee7a33f28df343.html">CSDN</a>). We adopt it: each line in our AGENTS.md gets a comment naming the failure that created it.</li>
+  <li><strong>OpenAI's practice.</strong> The Codex harness-engineering team kept AGENTS.md short and used it as a map into a structured docs folder, rather than one giant file.</li>
+</ul>
+
+<h2 id="build">5. Build: a cache-stable context assembler</h2>
+<pre>&quot;&quot;&quot;Context assembly: a stable prefix, project instructions, and changes appended at the end, never in the prefix.&quot;&quot;&quot;
+import os, platform, subprocess
+from pathlib import Path
+
+MAX_INSTRUCTION_BYTES = 32 * 1024            # Codex caps each source at 32 KiB
+CANDIDATES = [&quot;AGENTS.override.md&quot;, &quot;AGENTS.md&quot;, &quot;CLAUDE.md&quot;]   # first match per directory wins (Pi, nanocode)
+
+BASE_PROMPT = &quot;&quot;&quot;You are a coding agent working in the user&#x27;s repository.
+- Inspect before you answer: read files and run commands instead of guessing.
+- Read a file before editing it. Keep edits small and inside the requested scope.
+- After changing code, run the relevant tests and report the result.
+- If a tool fails, read the error before retrying. Do not repeat an action without new evidence.
+- Ask the user only for decisions you cannot make from the repository.
+Runtime facts may change during the session. When they do, a &lt;context-update&gt; block is appended to the
+latest message; its values replace earlier ones.&quot;&quot;&quot;
+
+def git_root(start: Path) -&gt; Path:
+    try:
+        out = subprocess.run([&quot;git&quot;, &quot;rev-parse&quot;, &quot;--show-toplevel&quot;], cwd=start, capture_output=True, text=True)
+        return Path(out.stdout.strip()) if out.returncode == 0 else start
+    except FileNotFoundError:
+        return start
+
+def instruction_file(directory: Path):
+    for name in CANDIDATES:
+        p = directory / name
+        if p.is_file():
+            return p
+    return None
+
+def discover(cwd: Path, home: Path = Path.home() / &quot;.harness&quot;):
+    &quot;&quot;&quot;Global file first, then every directory from the repo root down to cwd. Identical files load once.&quot;&quot;&quot;
+    root, files, seen = git_root(cwd), [], set()
+    dirs = [home] + [root] + [root / Path(*cwd.relative_to(root).parts[:i + 1]) for i in range(len(cwd.relative_to(root).parts))]
+    for d in dirs:
+        f = instruction_file(d)
+        if f is None:
+            continue
+        text = f.read_text(encoding=&quot;utf-8-sig&quot;)[:MAX_INSTRUCTION_BYTES]
+        if text in seen:                     # nanocode: &quot;identical to X; included once&quot;
+            continue
+        seen.add(text)
+        files.append((f, text))
+    return files
+
+def environment(cwd: Path) -&gt; dict:
+    def git(*a):
+        r = subprocess.run([&quot;git&quot;, *a], cwd=cwd, capture_output=True, text=True)
+        return r.stdout.strip() if r.returncode == 0 else &quot;&quot;
+    return {&quot;cwd&quot;: str(cwd), &quot;os&quot;: platform.system(), &quot;shell&quot;: os.environ.get(&quot;SHELL&quot;, &quot;sh&quot;),
+            &quot;git_branch&quot;: git(&quot;branch&quot;, &quot;--show-current&quot;) or &quot;none&quot;}
+
+def system_prompt(cwd: Path) -&gt; str:
+    &quot;&quot;&quot;Built once per session. Nothing in here may change mid-session, or the prompt cache misses.&quot;&quot;&quot;
+    parts = [BASE_PROMPT]
+    for path, text in discover(cwd):
+        parts.append(f&#x27;&lt;instructions source=&quot;{path}&quot;&gt;\n{text}\n&lt;/instructions&gt;&#x27;)
+    env = environment(cwd)
+    parts.append(&quot;&lt;environment&gt;\n&quot; + &quot;\n&quot;.join(f&quot;{k}: {v}&quot; for k, v in env.items()) + &quot;\n&lt;/environment&gt;&quot;)
+    return &quot;\n\n&quot;.join(parts)
+
+class ContextTracker:
+    &quot;&quot;&quot;Appends changes to the end of the latest message (fx&#x27;s &lt;fx-context-update&gt; pattern).&quot;&quot;&quot;
+    def __init__(self, cwd: Path):
+        self.env = environment(cwd)
+        self.loaded = {str(p.parent) for p, _ in discover(cwd)}   # folders whose rules are already in context
+
+    def update(self, cwd: Path) -&gt; str:
+        &quot;&quot;&quot;Call after each tool batch; returns text to append to the last tool result, or &#x27;&#x27;.&quot;&quot;&quot;
+        now, notes = environment(cwd), []
+        changed = {k: v for k, v in now.items() if self.env.get(k) != v}
+        if changed:
+            notes.append(&quot;&lt;context-update&gt;\n&quot; + &quot;\n&quot;.join(f&quot;{k}: {v}&quot; for k, v in changed.items()) + &quot;\n&lt;/context-update&gt;&quot;)
+            self.env = now
+        return &quot;\n&quot;.join(notes)
+
+    def folder_rules(self, touched_path: str) -&gt; str:
+        &quot;&quot;&quot;When a tool first touches a folder with its own AGENTS.md, attach those rules to that tool result.&quot;&quot;&quot;
+        d = Path(touched_path).resolve()
+        d = d if d.is_dir() else d.parent
+        f = instruction_file(d)
+        if f is None or str(d) in self.loaded:
+            return &quot;&quot;
+        self.loaded.add(str(d))
+        return f&#x27;\n&lt;instructions source=&quot;{f}&quot; scope=&quot;{d}&quot;&gt;\n{f.read_text(encoding=&quot;utf-8-sig&quot;)[:MAX_INSTRUCTION_BYTES]}\n&lt;/instructions&gt;&#x27;</pre>
+<p>How to use it:</p>
+<ul>
+  <li>Call <code>system_prompt(cwd)</code> <strong>once</strong> at session start and store it in the state.</li>
+  <li>After each tool batch, call <code>tracker.update(cwd)</code> and append any result to the last tool result. If a tool touched a path, also append <code>tracker.folder_rules(path)</code>.</li>
+  <li>Log <code>cached_tokens / input_tokens</code> per step (from Chapter 2). After the second step it should stay high.</li>
+</ul>
+<h3>Measure</h3>
+<ol>
+  <li>Write an AGENTS.md for your test repo with three rules, each tied to a failure you saw in Stage 1. Rerun the 10 tasks.</li>
+  <li>Add a rule that is not tied to any failure (for example "write clean code"). Does it change anything you can measure? If not, delete it.</li>
+  <li>Compare cache hit share with and without the tracker: in the "without" version, rebuild the system prompt every step.</li>
+</ol>
+
+<h2 id="exercises">6. Exercises</h2>
+<ol>
+  <li>Escape the update tag in tool output (as fx does) so a file containing <code>&lt;context-update&gt;</code> cannot forge one. Write a test.</li>
+  <li>Add a per-model overlay: a few lines appended to the base prompt only for one model family.</li>
+  <li>Read fx's <code>system_prompt.md</code> in full and list the three rules you would copy into your own base prompt, and why.</li>
+</ol>
+
+<h2 id="quiz">7. Check yourself</h2>
+<div class="widget quiz" data-quiz="qz4"></div>
+<script type="application/json" id="qz4">[
+{"q":"Where does fx put runtime changes such as a new cwd?","o":["It rewrites the system prompt","An fx-context-update block appended to the latest message","A new system message at the top","Nowhere; the model must ask"],"a":1,"e":"Appending keeps the cached prefix intact and puts the change where the model attends most."},
+{"q":"When fx first touches a folder with its own rules, where do those rules go?","o":["Into the session-start instructions","Onto that step's last tool result","Into a separate system message","They are ignored"],"a":1,"e":"Adding them to the start would change the prefix; attaching them to the tool result does not."},
+{"q":"Which files does Pi check in each directory, in order?","o":["Only AGENTS.md","AGENTS.override.md, AGENTS.md, AGENTS.MD, CLAUDE.md, CLAUDE.MD","README.md and AGENTS.md","CLAUDE.md only"],"a":1,"e":"First match wins, so Pi reads projects written for Claude Code without changes."},
+{"q":"Why does nanocode skip an instruction file identical to one already loaded?","o":["To save disk space","Loading the same rules twice wastes tokens and can over-weight them","Rust requires unique strings","For security"],"a":1,"e":"Duplicates appear with worktrees and copied files; including them once keeps context lean."},
+{"q":"A rule in AGENTS.md cannot be traced to any agent failure. The zero-tolerance rule says:","o":["Keep it as a precaution","Delete it","Move it to the system prompt","Make it bold"],"a":1,"e":"Rules without evidence cost tokens and attention without a measurable benefit."}
+]</script>
+
+<h2 id="refs">8. References</h2>
+<ul>
+  <li>fx: <code>src/builtins/system_prompt.md</code>, <code>src/builtins/context.zig</code>.</li>
+  <li>Pi: <code>packages/coding-agent/src/core/system-prompt.ts</code>, <code>resource-loader.ts</code>.</li>
+  <li>nanocode: <code>crates/core/home/src/instructions.rs</code>, <code>docs/memory-invariant.md</code>.</li>
+  <li>eve: <code>docs/instructions.mdx</code>, <code>docs/concepts/execution-model-and-durability.mdx</code>.</li>
+  <li><a href="https://arxiv.org/html/2603.25723v1">Natural-Language Agent Harnesses</a>, Tsinghua University, 2026.</li>
+  <li><a href="https://openai.com/index/unrolling-the-codex-agent-loop">Unrolling the Codex agent loop</a> (prompt order and caching), OpenAI, Jan 2026.</li>
+  <li><a href="https://manus.im/blog/Context-Engineering-for-AI-Agents-Lessons-from-Building-Manus">Context Engineering for AI Agents: Lessons from Building Manus</a>, Jul 2025.</li>
+</ul>

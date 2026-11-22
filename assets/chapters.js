@@ -32,7 +32,7 @@ window.IE_CHAPTERS = [
 "title": "Instructions and context assembly",
 "slug": "04-instructions",
 "stage": 2,
-"ready": false
+"ready": true
 },
 {
 "n": "5",
