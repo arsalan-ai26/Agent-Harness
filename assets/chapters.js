@@ -53,7 +53,7 @@ window.IE_CHAPTERS = [
 "title": "Permissions, approvals and sandboxing",
 "slug": "07-safety",
 "stage": 3,
-"ready": false
+"ready": true
 },
 {
 "n": "8",
