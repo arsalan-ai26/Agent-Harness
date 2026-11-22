@@ -9,7 +9,7 @@
 </div>
 
 <h2 id="why">1. Why compare against real harnesses</h2>
-<p>Your weekly eval tells you whether your harness improved. It does not tell you whether it is good. Running Pi and fx on the same tasks, with the same model where they allow it, separates three things: the model, the harness and the task. Several 2026 papers make the same point: benchmark scores mix model and harness, so honest comparisons hold one fixed while changing the other (<a href="https://arxiv.org/abs/2608.26218">Same model, different harness</a>; <a href="https://arxiv.org/pdf/2610.04433">What does a harness buy?</a>).</p>
+<p>Your weekly eval tells you whether your harness improved. It does not tell you whether it is good. Running Pi and fx on the same tasks, with the same model where they allow it, separates three things: the model, the harness and the task. Several 2026 papers make the same point: benchmark scores mix model and harness, so honest comparisons hold one fixed while changing the other (<a href="https://arxiv.org/abs/2608.26218">Same model, different harness</a>).</p>
 <div class="box watch">
   <span class="lbl">Safety</span>
   <p>Pi has no permission gate and <code>fx ask --full-access</code> turns fx's checks off. Run every harness in this chapter inside a container with only the task's copy of the repository mounted.</p>
@@ -118,11 +118,22 @@ if __name__ == &quot;__main__&quot;:
   <li>Run your factory on a real project for a month and publish the merge-unchanged rate.</li>
 </ul>
 
+
+<h2 id="quiz">Check yourself</h2>
+<div class="widget quiz" data-quiz="qz15"></div>
+<script type="application/json" id="qz15">[
+{"q":"Why run Pi and fx on the same tasks as your harness?","o":["To copy their prompts","To separate the effect of the harness from the model and the task","Because your evals are wrong","To get a higher score"],"a":1,"e":"Holding the model and tasks fixed while changing the harness shows what the harness itself contributes."},
+{"q":"Your harness wins on training tasks but loses on the holdout. What does that most likely mean?","o":["The holdout is broken","You overfit the harness to tasks you tuned against","The model got worse","Pi cheated"],"a":1,"e":"Tuning against a fixed set of tasks can produce gains that do not generalize. Publishing this is the honest result."},
+{"q":"Why run every harness in a container for this chapter?","o":["Containers are faster","Pi has no permission gate and fx can run with full access, so isolation is the safety boundary","fx only runs in Docker","To share a cache"],"a":1,"e":"Without a gate, the container and the mounted copy of the repo are what limit damage."},
+{"q":"How many runs per task per harness does the method ask for at minimum?","o":["1","3","10","100"],"a":1,"e":"Agent runs vary. At least three repeats give a rough pass rate instead of a single coin flip."},
+{"q":"What should every rule in your v1.0 AGENTS.md name?","o":["The author","The model it was tested on","The failure that created it","Its token cost"],"a":2,"e":"Tying each rule to the failure behind it keeps the file short and lets you delete rules that no longer matter."}
+]</script>
+
 <h2 id="refs">9. References</h2>
 <ul>
   <li>Pi: <code>pi --print</code> (non-interactive mode), <a href="https://github.com/earendil-works/pi">earendil-works/pi</a>.</li>
   <li>fx: <code>fx ask --json</code>, <a href="https://github.com/vercel-labs/fx">vercel-labs/fx</a>.</li>
   <li><a href="https://arxiv.org/pdf/2609.00006">Harness Engineering: a source-code study of eleven coding-agent systems</a>, 2026.</li>
   <li><a href="https://www.preprints.org/manuscript/202609.2140">Harness-aware evaluation of LLM agents</a>, 2026.</li>
-  <li>Terminal-Bench: Merrill et al., <a href="https://arxiv.org/abs/2601.11868">arXiv 2601.11868</a>, 2026.</li>
+  <li><a href="https://arxiv.org/abs/2608.26218">Same model, different harness</a>, 2026.</li>
 </ul>
