@@ -102,7 +102,7 @@ window.IE_CHAPTERS = [
 "title": "Software factory II: verification gates and self-improvement",
 "slug": "14-factory-verification",
 "stage": 5,
-"ready": false
+"ready": true
 },
 {
 "n": "15",

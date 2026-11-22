@@ -1,0 +1,163 @@
+<div class="kicker">Stage 5 · Software factory · Chapter 14</div>
+<h1>Software factory II: verification gates and self-improvement</h1>
+<p class="lede">When agents write code faster than people can read it, verification becomes the bottleneck. This chapter covers the gates that let a factory ship safely: holdout scenarios the generator never sees, digital twins of outside services, review depth that grows with risk, and the light-versus-dark factory debate. Then it closes the loop: a harness that reads its own failed traces, proposes one change, and keeps it only if the eval says it helped.</p>
+<div class="meta">
+  <span class="chip">Level: advanced</span>
+  <span class="chip">Time: about 20 hours with the build</span>
+  <span class="chip">Needs: Chapters 10 and 13</span>
+  <span class="chip">Facts checked: 22 Nov 2026</span>
+</div>
+
+<div class="box skip">
+  <span class="lbl">Before you start: skip check</span>
+  <ol>
+    <li>Why must some test scenarios be hidden from the implementing agent?</li>
+    <li>What is a digital twin in StrongDM's factory?</li>
+    <li>A self-improvement loop proposes a new AGENTS.md rule. What must be true before you keep it?</li>
+  </ol>
+  <details><summary>Answers</summary><ol>
+    <li>An agent that can see the tests can satisfy them without solving the problem (special-casing, weakening asserts). Holdouts measure the real behaviour.</li>
+    <li>A behavioural clone of a third-party service (Okta, Slack, Jira) that tests can hit at high volume without rate limits or cost.</li>
+    <li>It must improve the paired eval by a meaningful margin without a large cost increase, and it must name the failure it prevents.</li>
+  </ol></details>
+</div>
+
+<h2 id="bottleneck">1. The bottleneck moved</h2>
+<p>In 2026 generation got cheap and review did not. One industry report found that with high AI adoption, PRs received 25% more review comments and 31.3% of PRs skipped review entirely (cited at AI Engineer World's Fair 2026). Qodo puts the conclusion plainly: a factory that builds fast without checking its own output only produces problems faster, and the quality layer that works is one the generator does not control (<a href="https://www.qodo.ai/?p=23009">Qodo</a>).</p>
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 210" width="760" style="max-width:100%;height:auto" role="img" aria-label="Verification gates in order of cost">
+  <defs><marker id="j1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="24" y="40" width="130" height="70" rx="8" style="fill:var(--kv-s);stroke:var(--kv)"/><text x="89" y="66" text-anchor="middle" style="fill:var(--ink);font-size:11px;font-weight:600">Repo checks</text><text x="89" y="84" text-anchor="middle" style="fill:var(--ink2);font-size:9px">tests, lint, types</text>
+  <rect x="174" y="40" width="130" height="70" rx="8" style="fill:var(--kv-s);stroke:var(--kv)"/><text x="239" y="66" text-anchor="middle" style="fill:var(--ink);font-size:11px;font-weight:600">Holdout scenarios</text><text x="239" y="84" text-anchor="middle" style="fill:var(--ink2);font-size:9px">hidden from the agent</text>
+  <rect x="324" y="40" width="130" height="70" rx="8" style="fill:var(--kv-s);stroke:var(--kv)"/><text x="389" y="66" text-anchor="middle" style="fill:var(--ink);font-size:11px;font-weight:600">Digital twins</text><text x="389" y="84" text-anchor="middle" style="fill:var(--ink2);font-size:9px">fake Okta, Slack, ...</text>
+  <rect x="474" y="40" width="130" height="70" rx="8" style="fill:var(--pre-s);stroke:var(--pre)"/><text x="539" y="66" text-anchor="middle" style="fill:var(--ink);font-size:11px;font-weight:600">Agent review</text><text x="539" y="84" text-anchor="middle" style="fill:var(--ink2);font-size:9px">other vendor, evidence</text>
+  <rect x="624" y="40" width="112" height="70" rx="8" style="fill:var(--dec-s);stroke:var(--dec)"/><text x="680" y="66" text-anchor="middle" style="fill:var(--ink);font-size:11px;font-weight:600">Human review</text><text x="680" y="84" text-anchor="middle" style="fill:var(--ink2);font-size:9px">only if risky</text>
+  <g style="fill:none;stroke:var(--ink2);stroke-width:1.3"><path d="M154 75H172" marker-end="url(#j1)"/><path d="M304 75H322" marker-end="url(#j1)"/><path d="M454 75H472" marker-end="url(#j1)"/><path d="M604 75H622" marker-end="url(#j1)"/></g>
+  <path d="M24 140H736" style="stroke:var(--line)"/><text x="24" y="160" style="fill:var(--ink2);font-size:11px">cheap, automatic, every change</text><text x="736" y="160" text-anchor="end" style="fill:var(--ink2);font-size:11px">expensive, rare, by risk</text>
+  <text x="24" y="196" style="fill:var(--ink2);font-size:11px">Each gate stops what the earlier ones cannot. Human attention is spent last, and only where the blast radius is large.</text>
+</svg></div>
+</figure>
+
+<h2 id="practice">2. How leading teams verify</h2>
+<div class="tbl"><table>
+  <tr><th>Team</th><th>Verification</th><th>Human role</th></tr>
+  <tr><td><a href="https://simonwillison.net/2026/feb/7/software-factory/">StrongDM</a></td><td>Specs plus scenarios drive agents that write code and run harnesses until they converge; scenario-based validation; a Digital Twin Universe of services like Okta and Slack (<a href="https://www.strongdm.com/blog/the-strongdm-software-factory-building-software-with-ai">StrongDM</a>)</td><td>Design specs, curate scenarios, watch scores; no code review</td></tr>
+  <tr><td>Stripe</td><td>Unattended agents in isolated cloud dev environments, linters and CI before a PR</td><td>Review every PR</td></tr>
+  <tr><td>Vercel Foreman</td><td>Repo checks in the implementer's sandbox; reviewer from another vendor with evidence per criterion; CI-failure classification</td><td>Mark ready, merge</td></tr>
+  <tr><td>OpenAI Codex team</td><td>Codex reviews its own PR, requests more agent reviews locally and in the cloud, iterates until reviewers are satisfied; app logs and metrics exposed to the agent</td><td>Steer through prompts</td></tr>
+  <tr><td>CodeRabbit's proposal</td><td>A review gate whose depth increases with risk and blast radius (<a href="https://www.coderabbit.ai/blog/software-factory-review-gate">CodeRabbit</a>)</td><td>Deep review only on consequential changes</td></tr>
+</table></div>
+<p>The light versus dark factory question is open. Dan Shapiro's five levels place the dark factory (no human reads the code) at the top. Critics answer that the hard part of software is judgement, so the better metaphor is a software company, not a factory (<a href="https://every.to/thesis-statements/noah-brier">Every</a>). StrongDM is a security company, which made its choice to drop human review the most debated decision of the year.</p>
+
+<h2 id="self">3. Harnesses that improve themselves</h2>
+<ul>
+  <li><strong>Meta-Harness</strong> (Stanford, MIT, KRAFTON, 2026): a coding agent reads a folder of every earlier harness's code, scores and raw traces, proposes a new harness, and the result is evaluated and added to the folder. The model weights never change. Discovered harnesses beat hand-built ones; the key design choice is raw traces, not compressed summaries (<a href="https://arxiv.org/html/2603.28052v1">arXiv 2603.28052</a>).</li>
+  <li><strong>OpenAI's improvement loop</strong>: traces become feedback, feedback becomes evals, eval results rank harness changes, and Codex implements them, in one repeatable workflow (OpenAI cookbook, May 2026).</li>
+  <li><strong>eve</strong> ships <code>eve-self-improvement</code> and <code>eve-self-modification</code> extensions; <strong>Pi</strong>'s agents write their own extensions.</li>
+  <li><strong>Test-time harness evolution</strong> and <strong>JIT-Agent</strong> adapt the harness during a task (<a href="https://arxiv.org/pdf/2608.25593">arXiv 2608.25593</a>).</li>
+</ul>
+<div class="box watch">
+  <span class="lbl">The trap</span>
+  <p>A loop that optimizes against your eval will overfit to your eval. Keep a holdout set the proposer never sees, cap changes to one per round, require every rule to name the failure it fixes, and read every accepted change yourself.</p>
+</div>
+
+<h2 id="china">4. The Chinese view</h2>
+<ul>
+  <li>Chinese practitioners describe harness feedback as "semantic gradient descent": natural-language feedback improves outputs the way gradients improve weights, and insist it stays constructive rather than hostile (<a href="https://adg.csdn.net/6a5822cf10ee7a33f28df343.html">CSDN</a>).</li>
+  <li>Woshipm's essay "Harness is the new dataset" argues that harness design is now the main lever for agent intelligence gains, organized into information, execution and feedback layers (<a href="https://www.woshipm.com/ai/6365944.html">Woshipm</a>).</li>
+  <li>A Baidu Cloud lead told Beijing News that the biggest obstacle to agentic training is reproducing real environments, not the model (<a href="https://m.bjnews.com.cn/detail/1775178643129477.html">Beijing News</a>): the same insight behind StrongDM's digital twins.</li>
+</ul>
+
+<h2 id="build">5. Build: gates and an improvement loop</h2>
+<pre>&quot;&quot;&quot;Verification gates the generator cannot see, review depth by risk, and a harness that improves from its traces.&quot;&quot;&quot;
+import fnmatch, json, subprocess
+from pathlib import Path
+
+# ---- gate 1: holdout scenarios ----------------------------------------------------------------
+def holdout_gate(workdir, scenarios_dir):
+    &quot;&quot;&quot;Run scenario checks stored outside the implementer&#x27;s sandbox (StrongDM keeps holdouts the agent never sees).&quot;&quot;&quot;
+    results = {}
+    for s in sorted(Path(scenarios_dir).resolve().glob(&quot;*.sh&quot;)):
+        p = subprocess.run([&quot;bash&quot;, str(s)], cwd=workdir, capture_output=True, text=True, timeout=600)
+        results[s.stem] = p.returncode == 0
+    return all(results.values()), results
+
+# ---- gate 2: review depth by risk -----------------------------------------------------------------
+RISKY_PATHS = [&quot;*auth*&quot;, &quot;*payment*&quot;, &quot;*migrations/*&quot;, &quot;.github/workflows/*&quot;, &quot;*secrets*&quot;, &quot;Dockerfile&quot;]
+
+def risk(diff_files: list[str], lines_changed: int) -&gt; str:
+    &quot;&quot;&quot;&#x27;low&#x27; -&gt; agent review is enough; &#x27;high&#x27; -&gt; a human must read the code (review depth grows with blast radius).&quot;&quot;&quot;
+    if any(fnmatch.fnmatch(f, pat) for f in diff_files for pat in RISKY_PATHS):
+        return &quot;high&quot;
+    return &quot;high&quot; if lines_changed &gt; 400 else &quot;low&quot;
+
+# ---- the improvement loop -----------------------------------------------------------------------
+PROPOSER_PROMPT = &quot;&quot;&quot;You improve an AI agent harness. Below are failing eval runs with their raw traces and the
+current harness configuration. Find ONE root cause that appears in several failures and propose ONE change to
+the configuration (AGENTS.md rules, tool descriptions, limits or hooks). Every rule you add must name the failure
+it prevents. Reply JSON only: {&quot;diagnosis&quot;: &quot;...&quot;, &quot;evidence&quot;: [&quot;trace ids&quot;], &quot;file&quot;: &quot;...&quot;, &quot;new_content&quot;: &quot;...&quot;}&quot;&quot;&quot;
+
+def failing_runs(results, traces_dir, limit=5):
+    &quot;&quot;&quot;Raw traces of failed runs, not summaries: Meta-Harness found raw traces are what make diagnosis work.&quot;&quot;&quot;
+    out = []
+    for r in results:
+        if not r[&quot;pass&quot;] and r.get(&quot;trace&quot;):
+            out.append({&quot;task&quot;: r[&quot;task&quot;], &quot;trace&quot;: Path(traces_dir, r[&quot;trace&quot;]).read_text()[-20_000:]})
+    return out[:limit]
+
+def improve_once(config_dir, propose, evaluate, min_lift=0.05, max_cost_increase=0.2):
+    &quot;&quot;&quot;propose(prompt, material) -&gt; dict; evaluate(config_dir) -&gt; {&#x27;pass_rate&#x27;, &#x27;mean_usd&#x27;, &#x27;runs&#x27;}.
+    Accept a change only if it beats the current harness on the eval without a large cost increase.&quot;&quot;&quot;
+    base = evaluate(config_dir)
+    material = json.dumps({&quot;failures&quot;: failing_runs(base[&quot;runs&quot;], config_dir),
+                           &quot;config&quot;: {p.name: p.read_text() for p in Path(config_dir).glob(&quot;*.md&quot;)}})
+    change = propose(PROPOSER_PROMPT, material)
+    target = Path(config_dir, Path(change[&quot;file&quot;]).name)       # stay inside the config folder
+    old = target.read_text() if target.exists() else None
+    target.write_text(change[&quot;new_content&quot;])
+    new = evaluate(config_dir)
+    lift = new[&quot;pass_rate&quot;] - base[&quot;pass_rate&quot;]
+    cost_ok = new[&quot;mean_usd&quot;] &lt;= base[&quot;mean_usd&quot;] * (1 + max_cost_increase) or base[&quot;mean_usd&quot;] == 0
+    if lift &gt;= min_lift and cost_ok:
+        return {&quot;accepted&quot;: True, &quot;lift&quot;: round(lift, 3), &quot;diagnosis&quot;: change[&quot;diagnosis&quot;]}
+    if old is None:                                              # revert: the change did not earn its place
+        target.unlink()
+    else:
+        target.write_text(old)
+    return {&quot;accepted&quot;: False, &quot;lift&quot;: round(lift, 3), &quot;diagnosis&quot;: change[&quot;diagnosis&quot;]}</pre>
+<p>Wiring:</p>
+<ul>
+  <li>Keep holdout scenarios in a folder outside the implementer's sandbox. Run <code>holdout_gate</code> after the reviewer approves; a failure sends feedback without the scenario text.</li>
+  <li>Call <code>risk()</code> on the PR's files; for <code>high</code>, label the PR <code>needs-human-review</code> and do not auto-merge anything.</li>
+  <li>Store a trace file per eval run (Chapter 10) and its path in the run record. <code>evaluate</code> runs your paired eval on a training set of tasks; keep 5 tasks back as a holdout and check them only after an accepted change.</li>
+  <li>Run <code>improve_once</code> weekly. Commit each accepted change with its diagnosis in the message.</li>
+</ul>
+<h3>Measure</h3>
+<p>Run four improvement rounds. For each, report the diagnosis, train lift, holdout lift and whether you agree with the change. A change with train lift but no holdout lift is overfitting; record it.</p>
+
+<h2 id="exercises">6. Exercises</h2>
+<ol>
+  <li>Build a digital twin: a 50-line fake of one API your project calls, and make scenarios hit it instead of the real service.</li>
+  <li>Let the proposer change Python code instead of Markdown. What new guards do you need?</li>
+  <li>Write the case for and against a dark factory for your own work, with one scenario where each fails.</li>
+</ol>
+
+<h2 id="quiz">7. Check yourself</h2>
+<div class="widget quiz" data-quiz="qz14"></div>
+<script type="application/json" id="qz14">[
+{"q":"What makes holdout scenarios useful?","o":["They run faster","The implementing agent never sees them, so it cannot satisfy them without solving the task","They replace unit tests","They need no maintenance"],"a":1,"e":"Visible tests can be gamed; hidden ones measure behaviour."},
+{"q":"What is StrongDM's Digital Twin Universe?","o":["A model ensemble","Behavioural clones of third-party services used for high-volume testing","A staging cluster","A UI"],"a":1,"e":"Twins of Okta, Slack, Jira and others remove rate limits and cost from testing."},
+{"q":"Meta-Harness's proposer reads:","o":["Only scores","Summaries of failures","The code, scores and raw execution traces of earlier harnesses","Human feedback only"],"a":2,"e":"Raw traces allow selective diagnosis of long-horizon failures."},
+{"q":"A proposed rule improves the training eval but not the holdout. What is it?","o":["A great rule","Probably overfitting; do not trust it","A bug in the eval","A model problem"],"a":1,"e":"Keep a holdout precisely to catch this."},
+{"q":"In a risk-based review gate, human review is required when:","o":["Always","The change touches sensitive areas or is large","Never","The agent asks"],"a":1,"e":"Human attention is the scarcest resource; spend it where blast radius is large."}
+]</script>
+
+<h2 id="refs">8. References</h2>
+<ul>
+  <li><a href="https://simonwillison.net/2026/feb/7/software-factory/">StrongDM's software factory</a>, Simon Willison, Feb 2026; <a href="https://law.stanford.edu/2026/02/08/built-by-agents-tested-by-agents-trusted-by-whom/">Built by Agents, Tested by Agents, Trusted by Whom?</a>, Stanford CodeX.</li>
+  <li><a href="https://arxiv.org/html/2603.28052v1">Meta-Harness: End-to-End Optimization of Model Harnesses</a>, 2026.</li>
+  <li><a href="https://openai.com/index/harness-engineering/">Harness engineering</a>, OpenAI, Feb 2026.</li>
+  <li><a href="https://www.coderabbit.ai/blog/software-factory-review-gate">A software factory needs a review gate it can trust</a>, CodeRabbit, Sep 2026.</li>
+  <li><a href="https://www.qodo.ai/?p=23009">What is a software factory?</a>, Qodo, 2026.</li>
+  <li><a href="https://www.woshipm.com/ai/6365944.html">Harness is the New Dataset</a>, Woshipm, 2026.</li>
+</ul>
