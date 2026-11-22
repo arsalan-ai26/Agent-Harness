@@ -95,7 +95,7 @@ window.IE_CHAPTERS = [
 "title": "Software factory I: stations",
 "slug": "13-factory-stations",
 "stage": 5,
-"ready": false
+"ready": true
 },
 {
 "n": "14",

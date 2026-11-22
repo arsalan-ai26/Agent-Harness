@@ -1,0 +1,196 @@
+<div class="kicker">Stage 5 · Software factory · Chapter 13</div>
+<h1>Software factory I: stations</h1>
+<p class="lede">A software factory is the harness scaled from one session to the whole delivery loop: an issue goes in, a reviewed draft pull request comes out, and people make the judgement calls. This chapter reads the real code of eve's Foreman template and compares it with Stripe's Minions, Ramp, Coinbase and StrongDM. You build a four-station factory that works on your own book repository.</p>
+<div class="meta">
+  <span class="chip">Level: advanced</span>
+  <span class="chip">Time: about 20 hours with the build</span>
+  <span class="chip">Needs: Stages 1 to 4</span>
+  <span class="chip">Code read at: eve 5c52fbf (apps/templates/eve-software-factory-template)</span>
+</div>
+
+<div class="box skip">
+  <span class="lbl">Before you start: skip check</span>
+  <ol>
+    <li>Why does Foreman's Reviewer never see the Implementer's reasoning?</li>
+    <li>Why might a factory use different model vendors for different stations?</li>
+    <li>What is the difference between a light factory and a dark factory?</li>
+  </ol>
+  <details><summary>Answers</summary><ol>
+    <li>So it judges the real diff against the criteria instead of being persuaded by the author's explanation.</li>
+    <li>Cost (cheap models for triage and planning) and independence: a reviewer from another vendor is less likely to share the implementer's blind spots.</li>
+    <li>In a light factory humans review every pull request (Stripe). In a dark factory humans write specs and scenarios but review outcomes, not code (StrongDM).</li>
+  </ol></details>
+</div>
+
+<h2 id="what">1. What a factory adds to a harness</h2>
+<p>Everything in Stages 1 to 4 still applies inside each station. The factory adds structure around them: intake from where work is filed, triage, a plan with checkable acceptance criteria, isolated implementation, independent review, a bounded revision loop, safe delivery and memory across runs.</p>
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 240" width="760" style="max-width:100%;height:auto" role="img" aria-label="Factory pipeline: intake, triage, analyst, implementer, reviewer, draft PR, with a revision loop and a shared factory brain">
+  <defs><marker id="i1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="24" y="60" width="96" height="56" rx="8" style="fill:var(--panel2);stroke:var(--line)"/><text x="72" y="84" text-anchor="middle" style="fill:var(--ink);font-size:11px;font-weight:600">Intake</text><text x="72" y="102" text-anchor="middle" style="fill:var(--ink2);font-size:9px">label, @mention</text>
+  <rect x="144" y="60" width="96" height="56" rx="8" style="fill:var(--kv-s);stroke:var(--kv)"/><text x="192" y="84" text-anchor="middle" style="fill:var(--ink);font-size:11px;font-weight:600">Triage</text><text x="192" y="102" text-anchor="middle" style="fill:var(--ink2);font-size:9px">lane, duplicates</text>
+  <rect x="264" y="60" width="96" height="56" rx="8" style="fill:var(--kv-s);stroke:var(--kv)"/><text x="312" y="84" text-anchor="middle" style="fill:var(--ink);font-size:11px;font-weight:600">Analyst</text><text x="312" y="102" text-anchor="middle" style="fill:var(--ink2);font-size:9px">plan, criteria</text>
+  <rect x="384" y="60" width="110" height="56" rx="8" style="fill:var(--dec-s);stroke:var(--dec)"/><text x="439" y="84" text-anchor="middle" style="fill:var(--ink);font-size:11px;font-weight:600">Implementer</text><text x="439" y="102" text-anchor="middle" style="fill:var(--ink2);font-size:9px">own sandbox, checks</text>
+  <rect x="518" y="60" width="96" height="56" rx="8" style="fill:var(--pre-s);stroke:var(--pre)"/><text x="566" y="84" text-anchor="middle" style="fill:var(--ink);font-size:11px;font-weight:600">Reviewer</text><text x="566" y="102" text-anchor="middle" style="fill:var(--ink2);font-size:9px">diff only</text>
+  <rect x="638" y="60" width="98" height="56" rx="8" style="fill:var(--panel2);stroke:var(--good);stroke-width:2"/><text x="687" y="84" text-anchor="middle" style="fill:var(--ink);font-size:11px;font-weight:600">Draft PR</text><text x="687" y="102" text-anchor="middle" style="fill:var(--ink2);font-size:9px">human merges</text>
+  <g style="fill:none;stroke:var(--ink2);stroke-width:1.3"><path d="M120 88H142" marker-end="url(#i1)"/><path d="M240 88H262" marker-end="url(#i1)"/><path d="M360 88H382" marker-end="url(#i1)"/><path d="M494 88H516" marker-end="url(#i1)"/><path d="M614 88H636" marker-end="url(#i1)"/><path d="M566 60V36H439V58" marker-end="url(#i1)"/><path d="M192 116V150"/></g>
+  <text x="456" y="30" style="fill:var(--ink2);font-size:10px">revise (bounded)</text>
+  <text x="200" y="146" style="fill:var(--ink2);font-size:10px">questions back to the issue</text>
+  <rect x="144" y="176" width="470" height="40" rx="8" style="fill:var(--panel);stroke:var(--line);stroke-dasharray:4 3"/><text x="379" y="200" text-anchor="middle" style="fill:var(--ink2);font-size:11px">factory brain: short curated notes about the repo, read at the start of every run</text>
+</svg></div>
+<figcaption>Foreman's pipeline. Each station is its own agent with its own instructions, sandbox, tools and model.</figcaption>
+</figure>
+
+<h2 id="tour">2. Code tour: Foreman</h2>
+<p><code>apps/templates/eve-software-factory-template/</code> is a complete, deployable factory. Read it in this order.</p>
+<ul>
+  <li><strong><code>agent/agent.ts</code></strong>: the orchestrator. Compaction at 75% of the window, and a session usage limit: stop when output passes 100,000 tokens or uncached input passes 40 million. "Crossing a limit asks an attended caller to continue; unattended work cannot wait."</li>
+  <li><strong><code>agent/lib/models.ts</code></strong>: one model per station, across vendors. Orchestrator and Implementer: Anthropic; Analyst and Classifier: a fast OpenAI model; Reviewer: a different OpenAI model; Researcher: Anthropic Opus; the triage decision: a Google model. Cheap models where judgement is narrow, strong ones where it is wide, and a reviewer that does not share the implementer's vendor.</li>
+  <li><strong><code>agent/subagents/</code></strong>: <code>classifier</code>, <code>analyst</code>, <code>implementer</code>, <code>reviewer</code>, <code>researcher</code>, each started by a <code>run_*</code> tool in <code>agent/tools/</code>.</li>
+  <li><strong><code>agent/channels/</code></strong>: <code>github.ts</code>, <code>linear.ts</code>, <code>intake.ts</code> (authenticated HTTP tickets), <code>eve.ts</code>. A <code>factory</code> label or an @mention starts work, but only from users GitHub verifies as having triage, write, maintain or admin rights.</li>
+  <li><strong><code>agent/lib/factory-brain.ts</code></strong>: the brain is "a short, curated set of durable notes about the target repository, not a transcript of every run", size-bounded, under a reserved storage prefix that only trusted callers may write.</li>
+  <li><strong><code>agent/tools/diagnose_ci_failure.ts</code></strong>: when CI goes red on a factory PR, Foreman classifies the failure first. Only code failures get a revision; missing logs, infrastructure, configuration and flaky failures stop for a person.</li>
+  <li><strong><code>evals/</code></strong>: <code>pipeline</code>, <code>routing</code> and <code>safety</code> suites. The factory is tested like the harness.</li>
+</ul>
+<p>The README's security details are worth copying: authenticated git runs in separate disposable transfer sandboxes, never in stations that execute repository code; only bounded git bundles cross that boundary; pushes target one branch prefix, refuse the default and protected branches and never force-push; label intake is at-most-once through a write-once claim; station sandboxes start with egress limited to GitHub and package registries, and install scripts are disabled by default.</p>
+
+<h2 id="industry">3. Factories in industry</h2>
+<div class="tbl"><table>
+  <tr><th>Company</th><th>System</th><th>Harness</th><th>Humans</th><th>Published result</th></tr>
+  <tr><td><a href="https://stripe.dev/blog/minions-stripes-one-shot-end-to-end-coding-agents-part-2">Stripe</a></td><td>Minions: unattended, one-shot, Slack to CI-passing PR</td><td>Heavily modified fork of Goose</td><td>Review every PR</td><td>1,300+ merged PRs a week with no human-written code</td></tr>
+  <tr><td>Ramp</td><td>Inspect</td><td>Composed on OpenCode</td><td>Review</td><td>Over half of merged PRs in its frontend and backend repos (<a href="https://ona.com/files/background_agents_white_paper.pdf">Ona</a>)</td></tr>
+  <tr><td>Coinbase</td><td>Cloudbot</td><td>Built from scratch</td><td>Review</td><td>Same architecture, reached independently</td></tr>
+  <tr><td><a href="https://simonwillison.net/2026/feb/7/software-factory/">StrongDM</a></td><td>Software Factory with the Attractor agent</td><td>In-house</td><td>Write specs and scenarios; review no code</td><td>Rules: code must not be written or reviewed by humans</td></tr>
+  <tr><td>Vercel</td><td>Foreman</td><td>eve</td><td>Mark ready and merge</td><td>Open source, deployable</td></tr>
+</table></div>
+<p>LangChain packaged the shared Stripe, Ramp and Coinbase pattern as Open SWE: isolated cloud sandboxes, entry points in Slack, Linear and GitHub, curated tools, resumable sessions and budget limits (<a href="https://github.com/langchain-ai/open-swe">Open SWE</a>). Stripe's lesson, often repeated: tool curation matters more than tool count.</p>
+
+<h2 id="decisions">4. Design decisions</h2>
+<div class="tbl"><table>
+  <tr><th>Decision</th><th>Options</th><th>Foreman's choice and why</th></tr>
+  <tr><td>Harness</td><td>Fork, compose, build</td><td>Compose on eve; stations are subagents</td></tr>
+  <tr><td>Review independence</td><td>Same model, other model, human</td><td>Other vendor, diff only, evidence per verdict, human merges</td></tr>
+  <tr><td>Who may start work</td><td>Anyone, collaborators, a label</td><td>Verified writers only; public PR content cannot start privileged sessions</td></tr>
+  <tr><td>Revision on failure</td><td>Always retry, classify first, stop</td><td>Classify CI failures; revise only for code failures</td></tr>
+  <tr><td>Memory across runs</td><td>None, transcripts, curated notes</td><td>A small, curated, write-protected factory brain</td></tr>
+  <tr><td>Spend control</td><td>None, per run, per session</td><td>Session usage limits; unattended runs stop at the limit</td></tr>
+</table></div>
+
+<h2 id="china">5. The Chinese view</h2>
+<ul>
+  <li>An Aliyun article on the "second half" of coding agents frames Stripe, Ramp and Coinbase converging on one architecture as the move from personal productivity to organization-level engineering systems, and lists the forcing problems: sandboxes, resumable sessions, many entry points (including Feishu) and budget limits (<a href="https://developer.aliyun.com/article/1742143">Aliyun</a>).</li>
+  <li>Chinese coverage of StrongDM's "lights-out factory" focused on the shock of a security company dropping human code review, and on its $1,000 per engineer per day token benchmark (<a href="https://eu.36kr.com/en/p/3675741413302915">36Kr</a>).</li>
+</ul>
+
+<h2 id="build">6. Build: four stations on your own repo</h2>
+<pre>&quot;&quot;&quot;A small software factory: triage -&gt; analyst -&gt; implementer -&gt; reviewer -&gt; draft PR.
+Each station is your harness with its own prompt, tools, model and working copy.&quot;&quot;&quot;
+import json, re, subprocess
+from pathlib import Path
+
+BRANCH_PREFIX = &quot;factory/&quot;
+BRAIN = Path(&quot;factory-brain.md&quot;)         # short, curated notes about the repo; every run starts from it
+BRAIN_MAX_CHARS = 6_000
+MAX_REVISIONS = 2
+
+STATIONS = {
+    &quot;triage&quot;: {&quot;model&quot;: &quot;cheap&quot;, &quot;tools&quot;: [&quot;read&quot;, &quot;bash&quot;],
+               &quot;system&quot;: &quot;Classify the issue. Reply JSON only: {\&quot;lane\&quot;: \&quot;ready\&quot;|\&quot;clarify\&quot;|\&quot;reject\&quot;, &quot;
+                         &quot;\&quot;questions\&quot;: [...], \&quot;reason\&quot;: \&quot;...\&quot;}. Use &#x27;clarify&#x27; if acceptance is unclear.&quot;},
+    &quot;analyst&quot;: {&quot;model&quot;: &quot;strong&quot;, &quot;tools&quot;: [&quot;read&quot;, &quot;bash&quot;],
+                &quot;system&quot;: &quot;Write an implementation plan for the issue. Reply JSON only: {\&quot;plan\&quot;: [steps], &quot;
+                          &quot;\&quot;acceptance\&quot;: [checkable criteria], \&quot;files\&quot;: [paths]}. Do not edit files.&quot;},
+    &quot;implementer&quot;: {&quot;model&quot;: &quot;strong&quot;, &quot;tools&quot;: [&quot;read&quot;, &quot;write&quot;, &quot;edit&quot;, &quot;bash&quot;],
+                    &quot;system&quot;: &quot;Implement the plan in this working copy. Run the repository&#x27;s own tests and linters &quot;
+                              &quot;until they pass. Commit your work. Reply with a short summary.&quot;},
+    &quot;reviewer&quot;: {&quot;model&quot;: &quot;other-vendor&quot;, &quot;tools&quot;: [&quot;read&quot;, &quot;bash&quot;],
+                 &quot;system&quot;: &quot;You review a diff against acceptance criteria. You did not write it and you cannot see &quot;
+                           &quot;how it was written. Reply JSON only: {\&quot;verdicts\&quot;: [{\&quot;criterion\&quot;: ..., \&quot;met\&quot;: true|false, &quot;
+                           &quot;\&quot;evidence\&quot;: \&quot;file:line or command output\&quot;}], \&quot;approve\&quot;: true|false}&quot;},
+}
+
+def sh(cmd, cwd):
+    p = subprocess.run(cmd, shell=True, cwd=cwd, capture_output=True, text=True)
+    return p.returncode, (p.stdout + p.stderr).strip()
+
+def parse_json(text):
+    m = re.search(r&quot;\{.*\}&quot;, text, re.S)
+    return json.loads(m.group(0)) if m else {}
+
+def brain():
+    return BRAIN.read_text()[:BRAIN_MAX_CHARS] if BRAIN.exists() else &quot;&quot;
+
+def run_factory(issue: dict, repo: str, run_station, log=print):
+    &quot;&quot;&quot;run_station(name, cfg, prompt, workdir) -&gt; final text. Returns a dict describing the outcome.&quot;&quot;&quot;
+    context = f&quot;Repository notes:\n{brain()}\n\nIssue #{issue[&#x27;number&#x27;]}: {issue[&#x27;title&#x27;]}\n{issue[&#x27;body&#x27;]}&quot;
+
+    triage = parse_json(run_station(&quot;triage&quot;, STATIONS[&quot;triage&quot;], context, repo))
+    log(f&quot;triage: {triage.get(&#x27;lane&#x27;)}&quot;)
+    if triage.get(&quot;lane&quot;) != &quot;ready&quot;:
+        return {&quot;status&quot;: triage.get(&quot;lane&quot;, &quot;clarify&quot;), &quot;questions&quot;: triage.get(&quot;questions&quot;, []),
+                &quot;reason&quot;: triage.get(&quot;reason&quot;, &quot;&quot;)}
+
+    plan = parse_json(run_station(&quot;analyst&quot;, STATIONS[&quot;analyst&quot;], context, repo))
+    criteria = plan.get(&quot;acceptance&quot;, [])
+    log(f&quot;analyst: {len(plan.get(&#x27;plan&#x27;, []))} steps, {len(criteria)} criteria&quot;)
+
+    branch = f&quot;{BRANCH_PREFIX}{issue[&#x27;number&#x27;]}&quot;
+    work = str(Path(repo).resolve().parent / f&quot;.factory-{issue[&#x27;number&#x27;]}&quot;)
+    _, base = sh(&quot;git rev-parse HEAD&quot;, repo)                  # review the whole change, not just the last commit
+    sh(f&quot;git worktree add -B {branch} {work}&quot;, repo)          # the implementer gets its own working copy
+    feedback = &quot;&quot;
+    for attempt in range(1 + MAX_REVISIONS):
+        prompt = f&quot;{context}\n\nPlan:\n{json.dumps(plan, indent=1)}{feedback}&quot;
+        run_station(&quot;implementer&quot;, STATIONS[&quot;implementer&quot;], prompt, work)
+        _, diff = sh(f&quot;git diff {base} --stat &amp;&amp; git diff {base}&quot;, work)
+        review = parse_json(run_station(&quot;reviewer&quot;, STATIONS[&quot;reviewer&quot;],
+                                        f&quot;Acceptance criteria:\n{json.dumps(criteria)}\n\nDiff:\n{diff[:60_000]}&quot;, work))
+        failed = [v for v in review.get(&quot;verdicts&quot;, []) if not v.get(&quot;met&quot;)]
+        log(f&quot;review {attempt + 1}: approve={review.get(&#x27;approve&#x27;)} failed={len(failed)}&quot;)
+        if review.get(&quot;approve&quot;) and not failed:
+            return {&quot;status&quot;: &quot;ready_for_pr&quot;, &quot;branch&quot;: branch, &quot;worktree&quot;: work, &quot;review&quot;: review}
+        feedback = &quot;\n\nThe reviewer rejected the last attempt:\n&quot; + json.dumps(failed, indent=1)
+    return {&quot;status&quot;: &quot;needs_human&quot;, &quot;branch&quot;: branch, &quot;worktree&quot;: work, &quot;review&quot;: review}
+
+def open_draft_pr(result, issue, repo):
+    &quot;&quot;&quot;Push only the factory branch, never force, never the default branch; open a draft PR.&quot;&quot;&quot;
+    assert result[&quot;branch&quot;].startswith(BRANCH_PREFIX)
+    sh(f&quot;git push origin {result[&#x27;branch&#x27;]}&quot;, result[&quot;worktree&quot;])
+    body = &quot;Closes #%d\n\nReviewer verdicts:\n%s&quot; % (issue[&quot;number&quot;], &quot;\n&quot;.join(
+        f&quot;- [{&#x27;x&#x27; if v[&#x27;met&#x27;] else &#x27; &#x27;}] {v[&#x27;criterion&#x27;]} ({v.get(&#x27;evidence&#x27;, &#x27;&#x27;)})&quot; for v in result[&quot;review&quot;][&quot;verdicts&quot;]))
+    return sh(f&quot;gh pr create --draft --head {result[&#x27;branch&#x27;]} --title {json.dumps(issue[&#x27;title&#x27;])} --body {json.dumps(body)}&quot;, repo)</pre>
+<p>Wiring:</p>
+<ul>
+  <li><code>run_station(name, cfg, prompt, workdir)</code> runs your harness with <code>cfg["system"]</code>, <code>cfg["tools"]</code>, a model chosen from <code>cfg["model"]</code> and its own session. Use a different provider for the reviewer than for the implementer.</li>
+  <li>Trigger it from the Chapter 12 GitHub channel when an issue gets a <code>factory</code> label from you. Post triage questions back to the issue; on success call <code>open_draft_pr</code>.</li>
+  <li>Point it at this book's repository. Good first issues: fix a typo, add a missing reference, add a test for a build script.</li>
+</ul>
+<h3>Measure</h3>
+<p>File 10 small issues. Record for each: lane chosen, revisions used, review verdicts, whether you merged the PR unchanged, and cost. Your merge-unchanged rate is the factory's real score.</p>
+
+<h2 id="exercises">7. Exercises</h2>
+<ol>
+  <li>Add Foreman's CI-failure classifier: on a red check, decide code, flaky, infrastructure or configuration before spending a revision.</li>
+  <li>Add a factory brain update step: after a merged PR, the orchestrator proposes at most one new note; you approve it.</li>
+  <li>Swap the reviewer to the same vendor as the implementer and compare how often it approves a change you later reject.</li>
+</ol>
+
+<h2 id="quiz">8. Check yourself</h2>
+<div class="widget quiz" data-quiz="qz13"></div>
+<script type="application/json" id="qz13">[
+{"q":"What does Foreman do when CI fails on its draft PR?","o":["Always revises","Classifies the failure first; only code failures get a revision, others stop for a person","Closes the PR","Retries CI forever"],"a":1,"e":"diagnose_ci_failure avoids spending revisions on flaky or infrastructure failures."},
+{"q":"What is Foreman's factory brain?","o":["A transcript of every run","A short, curated, size-bounded set of repo notes only trusted callers can write","The orchestrator model","A vector database"],"a":1,"e":"Small enough to load at the start of every task, protected from being used as a side channel."},
+{"q":"Which harness does Stripe's Minions build on?","o":["eve","A heavily modified fork of Block's Goose","OpenCode","Built from scratch"],"a":1,"e":"Ramp composed on OpenCode; Coinbase built from scratch."},
+{"q":"StrongDM's factory charter says:","o":["Humans review every PR","Code must not be written by humans and must not be reviewed by humans","Agents may not push code","Only one agent per repo"],"a":1,"e":"Humans write specs and scenarios and watch scores."},
+{"q":"Why does Foreman run authenticated git in separate transfer sandboxes?","o":["Speed","Stations execute repository code; credentials must never be reachable from that code","Git requires it","To save storage"],"a":1,"e":"Only bounded git bundles cross the boundary, without hooks or executables."}
+]</script>
+
+<h2 id="refs">9. References</h2>
+<ul>
+  <li>eve: <code>apps/templates/eve-software-factory-template/</code> (<code>README.md</code>, <code>agent/agent.ts</code>, <code>agent/lib/models.ts</code>, <code>agent/lib/factory-brain.ts</code>, <code>agent/tools/diagnose_ci_failure.ts</code>).</li>
+  <li><a href="https://stripe.dev/blog/minions-stripes-one-shot-end-to-end-coding-agents-part-2">Minions: Stripe's one-shot, end-to-end coding agents, Part 2</a>, 2026.</li>
+  <li><a href="https://simonwillison.net/2026/feb/7/software-factory/">How StrongDM's AI team build serious software without even looking at the code</a>, Simon Willison, Feb 2026.</li>
+  <li><a href="https://langchain.com/blog/open-swe-an-open-source-framework-for-internal-coding-agents">Open SWE</a>, LangChain, Mar 2026.</li>
+  <li><a href="https://factory.ai/news/software-factory">Factory 2.0: from coding agents to software factories</a>, Factory, Jun 2026.</li>
+  <li><a href="https://ona.com/files/background_agents_white_paper.pdf">Background agents white paper</a>, Ona.</li>
+</ul>
