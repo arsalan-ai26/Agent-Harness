@@ -74,7 +74,7 @@ window.IE_CHAPTERS = [
 "title": "Verification, evals and observability",
 "slug": "10-evals",
 "stage": 3,
-"ready": false
+"ready": true
 },
 {
 "n": "11",

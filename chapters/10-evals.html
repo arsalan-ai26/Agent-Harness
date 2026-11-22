@@ -1,0 +1,198 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>10. Verification, evals and observability</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&family=JetBrains+Mono:wght@400;600&display=swap">
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-chapter="10" data-stage="3">
+<div class="topbar" style="padding-left:0;padding-right:0"><a href="../index.html">← Build an Agent Harness</a><span>Stage 3 · Chapter 10</span></div>
+<div class="shell">
+<nav class="toc" aria-label="Chapter contents"></nav>
+<main><article>
+<div class="kicker">Stage 3 · Control · Chapter 10</div>
+<h1>Verification, evals and observability</h1>
+<p class="lede">A harness change that is not measured is a guess. This chapter is about three feedback loops: the agent checking its own work before it stops, you checking whether a harness change helped, and everyone seeing where time, tokens and money went. It reads eve's eval framework, Pi's paired "lift" evals, fx's 2 ms performance gate and nanocode's cost fold, then builds tracing, a cost report and a paired A/B eval runner. It closes Stage 3.</p>
+<div class="meta">
+  <span class="chip">Level: intermediate</span>
+  <span class="chip">Time: about 20 hours with the build</span>
+  <span class="chip">Needs: Stage 2, your test tasks from Chapter 1</span>
+  <span class="chip">Code read at: Pi fb248c7, eve 5c52fbf, fx cbe7daf, nanocode 015cbfa</span>
+</div>
+
+<div class="box skip">
+  <span class="lbl">Before you start: skip check</span>
+  <ol>
+    <li>Your change raises the pass rate from 6/10 to 7/10 on one run. Is the change better?</li>
+    <li>What is a paired comparison in agent evals?</li>
+    <li>Who should decide that a task is done: the agent or the harness?</li>
+  </ol>
+  <details><summary>Answers</summary><ol>
+    <li>Not proven. Agents are random; one extra pass on one run is noise. Repeat each task several times and compare the same tasks across both variants.</li>
+    <li>Running the same tasks, the same number of times, under two variants (old and new harness), then comparing per task. Pi's evals call the difference "lift".</li>
+    <li>The harness, through an external check: tests, a feature list, a reviewer. The agent's own "done" is a claim, not evidence.</li>
+  </ol></details>
+</div>
+
+<h2 id="loops">1. Three feedback loops</h2>
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 220" width="760" style="max-width:100%;height:auto" role="img" aria-label="Three feedback loops: inside the turn, across harness versions, across operations">
+  <rect x="24" y="30" width="220" height="150" rx="10" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="134" y="56" text-anchor="middle" style="fill:var(--ink);font-size:13px;font-weight:600">1. Inside the turn</text>
+  <text x="40" y="84" style="fill:var(--ink2);font-size:11px">tests and linters after edits</text><text x="40" y="104" style="fill:var(--ink2);font-size:11px">stop hook: no finish while red</text><text x="40" y="124" style="fill:var(--ink2);font-size:11px">separate reviewer or judge</text><text x="40" y="160" style="fill:var(--kv);font-size:11px">who: the agent and harness</text>
+  <rect x="270" y="30" width="220" height="150" rx="10" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="380" y="56" text-anchor="middle" style="fill:var(--ink);font-size:13px;font-weight:600">2. Across versions</text>
+  <text x="286" y="84" style="fill:var(--ink2);font-size:11px">fixed task set, repeated</text><text x="286" y="104" style="fill:var(--ink2);font-size:11px">paired A/B per change</text><text x="286" y="124" style="fill:var(--ink2);font-size:11px">pass rate, tokens, cost</text><text x="286" y="160" style="fill:var(--pre);font-size:11px">who: you, before merging</text>
+  <rect x="516" y="30" width="220" height="150" rx="10" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="626" y="56" text-anchor="middle" style="fill:var(--ink);font-size:13px;font-weight:600">3. In operation</text>
+  <text x="532" y="84" style="fill:var(--ink2);font-size:11px">traces per turn and tool</text><text x="532" y="104" style="fill:var(--ink2);font-size:11px">cost rolled up per session</text><text x="532" y="124" style="fill:var(--ink2);font-size:11px">failures become new tasks</text><text x="532" y="160" style="fill:var(--dec);font-size:11px">who: everyone, continuously</text>
+  <text x="24" y="210" style="fill:var(--ink2);font-size:11px">Loop 3 feeds loop 2: every real failure becomes an eval task, and the fix must pass it (Hashimoto's habit, made measurable).</text>
+</svg></div>
+</figure>
+
+<h2 id="tour">2. Code tour</h2>
+<h3>eve: evals that talk to the real agent</h3>
+<p>An eve eval is a <code>.eval.ts</code> file under <code>evals/</code> run by <code>eve eval</code> (<code>docs/evals/index.mdx</code>). It sends messages to a running agent over the same HTTP API as users and records assertions: <code>t.send(...)</code>, <code>t.succeeded()</code>, <code>t.calledTool("get_weather")</code>, <code>t.check(turn.reply, includes("Sunny"))</code>. Tool stubs fix what tools return; a judge (<code>src/evals/judge.ts</code>) scores open answers; a mock model (<code>mock-model.ts</code>) makes fast unit tests; reporters send results to Datadog and others. In production, Agent Runs shows every session's turns, tool calls, reasoning, timing and token use in the Vercel dashboard with no instrumentation.</p>
+<h3>Pi: measure the lift of a change</h3>
+<p><code>packages/evals</code> uses vitest-evals. Its documentation-lift evals run each case twice, <code>without_docs</code> and <code>with_docs</code>, in isolated Docker containers, expand cases into (case, variant, repetition) tasks (<code>src/plan.ts</code>), and pair the two arms to compute lift (<code>src/report.ts</code>). That is exactly the method for any harness change: same cases, both variants, repeated, paired. <code>packages/telemetry</code> defines vendor-neutral telemetry contracts with conformance tests.</p>
+<h3>fx: performance is a test too</h3>
+<p>fx's CI fails a pull request if any benchmarked command, such as <code>fx help</code> or <code>fx status --json</code>, takes over 2 ms on Linux, and release binaries must fit a size limit (<code>benchmarks/check_budgets.py</code>). It also benchmarks long-turn memory and approval review. <code>/trace</code> shows bounded compaction events in the app.</p>
+<h3>nanocode: cost as a pure fold</h3>
+<p><code>crates/core/cost-fold</code> computes tokens, dollars and machine time per step as a pure function over the event log, rolled up by agent, turn, board task and commit. <code>bin/nanocode-sim</code> tests the memory invariants from <code>docs/memory-invariant.md</code> as numbers.</p>
+
+<h2 id="decisions">3. Design decisions compared</h2>
+<div class="tbl"><table>
+  <tr><th>Decision</th><th>eve</th><th>Pi</th><th>fx</th><th>nanocode</th></tr>
+  <tr><td>Eval unit</td><td>Eval file against the live HTTP API</td><td>Case x variant x repetition in containers</td><td>Benchmarks and tests in CI</td><td>Simulator and tests</td></tr>
+  <tr><td>Grading</td><td>Assertions, judge, tool stubs</td><td>Paired lift</td><td>Time and size budgets</td><td>Invariant bounds</td></tr>
+  <tr><td>Observability</td><td>Agent Runs dashboard, OpenTelemetry</td><td>Telemetry contracts</td><td>/trace, debug traces</td><td>Cost fold, OpenTelemetry spans</td></tr>
+</table></div>
+
+<h2 id="research">4. Research and the Chinese view</h2>
+<ul>
+  <li><strong>Self-verification is the biggest lever.</strong> LangChain's Terminal Bench gains came mostly from making the agent verify its work and from tracing (<a href="https://langchain.com/blog/improving-deep-agents-with-harness-engineering">LangChain</a>).</li>
+  <li><strong>Harness optimization from traces.</strong> Meta-Harness gives a coding agent the raw traces, code and scores of past harness versions and lets it propose the next one; the access to raw traces, not summaries, is the key (<a href="https://arxiv.org/html/2603.28052v1">Meta-Harness</a>). JIT-Agent and test-time harness evolution extend this (<a href="https://arxiv.org/pdf/2608.25593">arXiv 2608.25593</a>).</li>
+  <li><strong>Scores mix model and harness.</strong> A Sep 2026 survey proposes evaluating model, harness, environment and evaluator as four separate factors (<a href="https://www.preprints.org/manuscript/202609.2140">survey</a>).</li>
+  <li><strong>Chinese view.</strong> Chinese write-ups describe harness feedback as "semantic gradient descent": natural-language feedback steers outputs the way numeric gradients steer weights (<a href="https://adg.csdn.net/6a5822cf10ee7a33f28df343.html">CSDN</a>). Alibaba published Terminal-Bench Pro as a harder benchmark.</li>
+</ul>
+
+<h2 id="build">5. Build: traces, cost and a paired eval runner</h2>
+<pre>&quot;&quot;&quot;Traces, cost, and a paired A/B eval runner: the harness&#x27;s feedback loop.&quot;&quot;&quot;
+import json, shutil, statistics, subprocess, tempfile, time, uuid
+from contextlib import contextmanager
+from pathlib import Path
+
+# ---- tracing: one JSONL line per span ----------------------------------------------------------
+class Tracer:
+    def __init__(self, path=&quot;traces.jsonl&quot;):
+        self.path, self.stack = Path(path), []
+    @contextmanager
+    def span(self, kind, **attrs):            # kind: &quot;turn&quot;, &quot;model&quot;, &quot;tool&quot;, &quot;compaction&quot;
+        sid, start = uuid.uuid4().hex[:8], time.time()
+        parent = self.stack[-1] if self.stack else None
+        self.stack.append(sid)
+        rec = {&quot;id&quot;: sid, &quot;parent&quot;: parent, &quot;kind&quot;: kind, **attrs}
+        try:
+            yield rec                         # callers add fields: tokens, cost, ok, error
+        finally:
+            self.stack.pop()
+            rec[&quot;ms&quot;] = round((time.time() - start) * 1000)
+            with self.path.open(&quot;a&quot;) as f:
+                f.write(json.dumps(rec, default=str) + &quot;\n&quot;)
+
+def report(path=&quot;traces.jsonl&quot;):
+    &quot;&quot;&quot;Where did time, tokens and money go? Roll spans up by kind (nanocode&#x27;s cost fold, simplified).&quot;&quot;&quot;
+    rows = [json.loads(l) for l in Path(path).read_text().splitlines()]
+    by = {}
+    for r in rows:
+        k = by.setdefault(r[&quot;kind&quot;] if r[&quot;kind&quot;] != &quot;tool&quot; else f&quot;tool:{r.get(&#x27;name&#x27;)}&quot;, {&quot;n&quot;: 0, &quot;ms&quot;: 0, &quot;tokens&quot;: 0, &quot;usd&quot;: 0.0, &quot;errors&quot;: 0})
+        k[&quot;n&quot;] += 1; k[&quot;ms&quot;] += r.get(&quot;ms&quot;, 0); k[&quot;tokens&quot;] += r.get(&quot;tokens&quot;, 0)
+        k[&quot;usd&quot;] += r.get(&quot;usd&quot;, 0.0); k[&quot;errors&quot;] += 0 if r.get(&quot;ok&quot;, True) else 1
+    return by
+
+# ---- evals: a task is a folder with prompt.md and check.sh; the scratch repo is copied fresh each run
+def load_tasks(root):
+    return [{&quot;id&quot;: d.name, &quot;prompt&quot;: (d / &quot;prompt.md&quot;).read_text(), &quot;check&quot;: d / &quot;check.sh&quot;}
+            for d in sorted(Path(root).resolve().iterdir()) if (d / &quot;prompt.md&quot;).exists()]
+
+def run_once(agent, task, repo):
+    &quot;&quot;&quot;agent(prompt, workdir) -&gt; dict with steps, tokens, usd. Pass/fail comes only from check.sh.&quot;&quot;&quot;
+    work = Path(tempfile.mkdtemp(prefix=f&quot;eval-{task[&#x27;id&#x27;]}-&quot;))
+    shutil.copytree(repo, work, dirs_exist_ok=True)
+    t0 = time.time()
+    try:
+        stats = agent(task[&quot;prompt&quot;], str(work)) or {}
+    except Exception as e:
+        stats = {&quot;error&quot;: str(e)}
+    ok = subprocess.run([&quot;bash&quot;, str(task[&quot;check&quot;])], cwd=work, capture_output=True).returncode == 0
+    shutil.rmtree(work, ignore_errors=True)
+    return {&quot;task&quot;: task[&quot;id&quot;], &quot;pass&quot;: ok, &quot;secs&quot;: round(time.time() - t0, 1), **stats}
+
+def compare(agent_a, agent_b, tasks, repo, repeats=3):
+    &quot;&quot;&quot;Paired comparison: the same tasks, repeated, for two harness variants. Reports lift, not anecdotes.&quot;&quot;&quot;
+    results = {&quot;A&quot;: [], &quot;B&quot;: []}
+    for task in tasks:
+        for _ in range(repeats):                         # agents are random; one run proves nothing
+            results[&quot;A&quot;].append(run_once(agent_a, task, repo))
+            results[&quot;B&quot;].append(run_once(agent_b, task, repo))
+    def summary(rs):
+        return {&quot;pass_rate&quot;: round(sum(r[&quot;pass&quot;] for r in rs) / len(rs), 3),
+                &quot;mean_tokens&quot;: round(statistics.mean(r.get(&quot;tokens&quot;, 0) for r in rs)),
+                &quot;mean_usd&quot;: round(statistics.mean(r.get(&quot;usd&quot;, 0) for r in rs), 4),
+                &quot;mean_steps&quot;: round(statistics.mean(r.get(&quot;steps&quot;, 0) for r in rs), 1)}
+    a, b = summary(results[&quot;A&quot;]), summary(results[&quot;B&quot;])
+    per_task = {t[&quot;id&quot;]: (sum(r[&quot;pass&quot;] for r in results[&quot;A&quot;] if r[&quot;task&quot;] == t[&quot;id&quot;]),
+                          sum(r[&quot;pass&quot;] for r in results[&quot;B&quot;] if r[&quot;task&quot;] == t[&quot;id&quot;])) for t in tasks}
+    return {&quot;A&quot;: a, &quot;B&quot;: b, &quot;lift_pass_rate&quot;: round(b[&quot;pass_rate&quot;] - a[&quot;pass_rate&quot;], 3),
+            &quot;per_task_passes_A_vs_B&quot;: per_task, &quot;runs&quot;: results}</pre>
+<p>Wiring:</p>
+<ul>
+  <li>Wrap each turn, model call, tool call and compaction in <code>tracer.span(...)</code> and add tokens, dollars and <code>ok</code> to the record.</li>
+  <li>Turn your 10 tasks into folders: <code>tasks/&lt;id&gt;/prompt.md</code> and <code>check.sh</code>. The check, not the agent, decides pass or fail.</li>
+  <li>Write <code>agent(prompt, workdir)</code> as a thin wrapper over your harness that returns steps, tokens and dollars. Make two variants (for example hooks off vs on) and call <code>compare(A, B, tasks, repo, repeats=3)</code>.</li>
+</ul>
+<h3>Stage 3 gate</h3>
+<ol>
+  <li>Publish a table for every feature you added in Stages 2 and 3: compaction, AGENTS.md rules, hooks, subagents, Code Mode. Each row: pass rate, tokens and dollars, with and without the feature.</li>
+  <li>Keep a feature only if it helps on at least one measure without hurting another badly. Delete the rest (the zero-tolerance rule, applied to code).</li>
+  <li>Plot pass rate from week 1 to now. This is the most shareable chart of the book.</li>
+</ol>
+
+<h2 id="exercises">6. Exercises</h2>
+<ol>
+  <li>Add a stop hook that runs <code>check.sh</code>-style verification before the agent may finish. How much does pass rate move?</li>
+  <li>Add a bootstrap confidence interval to <code>compare</code> so you can say whether a lift is real.</li>
+  <li>Add a performance budget like fx's: fail CI if starting your harness and printing help takes more than 300 ms.</li>
+</ol>
+
+<h2 id="quiz">7. Check yourself</h2>
+<div class="widget quiz" data-quiz="qz10"></div>
+<script type="application/json" id="qz10">[
+{"q":"Pi's documentation-lift evals run each case:","o":["Once","Twice, without_docs and with_docs, in isolated containers, with repetitions","Only with docs","On the user's machine"],"a":1,"e":"Paired arms let them report the lift caused by the docs."},
+{"q":"What does fx's CI fail on?","o":["Low test coverage","Any benchmarked command over 2 ms on Linux","Model errors","Lint warnings only"],"a":1,"e":"Performance budgets are enforced like tests."},
+{"q":"How do eve evals reach the agent?","o":["By importing its code","Over the same HTTP API as users, through the TypeScript client","Through the model API directly","By reading transcripts"],"a":1,"e":"A passing eval proves the real server started, accepted a request and produced the asserted result."},
+{"q":"Why repeat each task several times?","o":["To use more tokens","Agent runs are random; single runs cannot separate a real improvement from noise","Benchmarks require it","To warm the cache"],"a":1,"e":"Repetition plus pairing is the minimum for honest comparisons."},
+{"q":"What made Meta-Harness effective?","o":["A bigger model","Giving the optimizing agent raw traces, code and scores of earlier harnesses instead of summaries","Human review","Random search"],"a":1,"e":"Raw traces let the proposer diagnose specific failures."}
+]</script>
+
+<h2 id="refs">8. References</h2>
+<ul>
+  <li>eve: <code>docs/evals/</code>, <code>packages/eve/src/evals/</code>; <a href="https://vercel.com/eve?utm_id=fossy.dev">Agent Runs</a>.</li>
+  <li>Pi: <code>packages/evals/README.md</code>, <code>packages/telemetry</code>.</li>
+  <li>fx: <code>README.md</code> (2 ms budget), <code>benchmarks/</code>.</li>
+  <li>nanocode: <code>crates/core/cost-fold</code>, <code>docs/memory-invariant.md</code>.</li>
+  <li><a href="https://arxiv.org/html/2603.28052v1">Meta-Harness: End-to-End Optimization of Model Harnesses</a>, 2026.</li>
+  <li><a href="https://langchain.com/blog/improving-deep-agents-with-harness-engineering">Improving Deep Agents with harness engineering</a>, LangChain, Feb 2026.</li>
+</ul>
+
+<div class="navfoot"></div>
+</article></main>
+</div>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/book.js"></script>
+
+</body>
+</html>
