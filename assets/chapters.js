@@ -46,7 +46,7 @@ window.IE_CHAPTERS = [
 "title": "Sessions, state and memory",
 "slug": "06-sessions",
 "stage": 2,
-"ready": false
+"ready": true
 },
 {
 "n": "7",

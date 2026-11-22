@@ -1,0 +1,226 @@
+<div class="kicker">Stage 2 · Context · Chapter 6</div>
+<h1>Sessions, state and memory</h1>
+<p class="lede">A session is what lets you close the terminal and come back. State is what the agent knows is true right now. Memory is what it should still know next week. Harnesses mix these up at their cost. This chapter reads Pi's tree-shaped session files, fx's resumable sessions, eve's state and memory slots and nanocode's stores, then builds an append-only session tree with branching, resume and a memory slot that compaction can never touch. It closes Stage 2.</p>
+<div class="meta">
+  <span class="chip">Level: intermediate</span>
+  <span class="chip">Time: about 20 hours with the build</span>
+  <span class="chip">Needs: Chapters 4 and 5</span>
+  <span class="chip">Code read at: Pi fb248c7, eve 5c52fbf, fx cbe7daf, nanocode 015cbfa</span>
+</div>
+
+<div class="box skip">
+  <span class="lbl">Before you start: skip check</span>
+  <ol>
+    <li>What is the difference between history and memory?</li>
+    <li>Why store a session as a tree instead of a list?</li>
+    <li>Why should memory stay outside the conversation history?</li>
+  </ol>
+  <details><summary>Answers</summary><ol>
+    <li>History is what happened in this session (messages, tool calls). Memory is selected knowledge that should carry into future sessions.</li>
+    <li>So you can go back to an earlier point and try another approach without deleting the first attempt or dragging its detours through the context.</li>
+    <li>If it lives in history, compaction may summarize it away or distort it. Outside, it is recalled fresh every turn.</li>
+  </ol></details>
+</div>
+
+<h2 id="three">1. Three different things</h2>
+<div class="tbl"><table>
+  <tr><th></th><th>History</th><th>State</th><th>Memory</th></tr>
+  <tr><td>What</td><td>Every message and tool call, in order</td><td>Typed values the harness tracks: plan, budget, task table, cwd</td><td>Facts and preferences selected to survive sessions</td></tr>
+  <tr><td>Lifetime</td><td>One session (archived forever)</td><td>One session</td><td>Many sessions</td></tr>
+  <tr><td>Changed by</td><td>Appending only</td><td>The harness and tools</td><td>Explicit save tools or a capture step</td></tr>
+  <tr><td>Compaction</td><td>Summarizes it</td><td>Must not touch it</td><td>Must not see it</td></tr>
+</table></div>
+
+<h2 id="tour">2. Code tour</h2>
+<h3>Pi: sessions are append-only trees</h3>
+<p>The comment on <code>SessionManager</code> in <code>packages/coding-agent/src/core/session-manager.ts</code> says it best: sessions are append-only trees stored in JSONL files; each entry has an <code>id</code> and <code>parentId</code>; a leaf pointer tracks the current position; appending creates a child of the leaf; branching moves the leaf to an earlier entry, so new branches never modify history. <code>buildSessionContext()</code> walks from the root to the leaf and applies compaction summaries on the way.</p>
+<p>The entry types show what a session must record beyond messages: <code>model_change</code>, <code>thinking_level_change</code>, <code>usage</code>, <code>compaction</code>, <code>branch_summary</code>, <code>label</code> (bookmarks), <code>custom</code> (extension state), <code>context_edit</code>. A version-1 to version-2 migration added the tree, a reminder that session formats need versioning. Users drive it with <code>/tree</code>, <code>/fork</code> and <code>/clone</code>, all branches in one file.</p>
+<h3>fx: resumable by project</h3>
+<p>fx saves conversations under <code>~/.fx/sessions/</code>; <code>fx -c</code> picks up the last session in the current project and <code>fx ask --resume</code> continues one from a script. When fx compacts, the full text stays on disk where the agent can look it up (<code>src/core/session/</code>, <code>src/core/session_manager/</code>, <code>src/core/compactor/records.zig</code>).</p>
+<h3>eve: session, turn, step; state; memory slots</h3>
+<p>eve nests work in session, turn and step, and stores typed session values with <code>defineState</code>. Memory is separate (<code>docs/memory/index.mdx</code>): each slot is a file in <code>agent/memory/</code> that names a provider (built-in file memory on Vercel Blob, or Supermemory, Upstash, your own) and a scope (for example per signed-in caller). On every turn eve resolves the scope, asks the provider to <em>recall</em>, gives the model the provider's tools as <code>&lt;slot&gt;__&lt;tool&gt;</code>, and asks it to <em>capture</em> after the turn. Recalled content enters as user messages labeled with the slot, never as system instructions, and the summarizer never sees it.</p>
+<h3>nanocode: stores you choose</h3>
+<p><code>crates/integrations/store-jsonl</code> writes one append-only file per session (the CLI default). <code>store-sql</code> runs the same records over SQLite, Postgres or a host's own database, and on WASM over Durable Objects or D1. Branches live in <code>crates/runtime/durability</code>. Content-addressed blobs (<code>crates/integrations/s3</code>) keep large payloads out of rows.</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 220" width="760" style="max-width:100%;height:auto" role="img" aria-label="A session tree with two branches and a leaf pointer">
+  <g style="fill:none;stroke:var(--ink2);stroke-width:1.3">
+    <path d="M110 110H160"/><path d="M250 110H300"/><path d="M390 110C410 110 410 60 440 60"/><path d="M390 110C410 110 410 160 440 160"/><path d="M530 160H580"/>
+  </g>
+  <rect x="24" y="92" width="86" height="36" rx="6" style="fill:var(--panel2);stroke:var(--line)"/><text x="67" y="114" text-anchor="middle" style="fill:var(--ink);font-size:11px">session</text>
+  <rect x="160" y="92" width="90" height="36" rx="6" style="fill:var(--panel);stroke:var(--line)"/><text x="205" y="114" text-anchor="middle" style="fill:var(--ink);font-size:11px">user: fix bug</text>
+  <rect x="300" y="92" width="90" height="36" rx="6" style="fill:var(--panel);stroke:var(--line)"/><text x="345" y="114" text-anchor="middle" style="fill:var(--ink);font-size:11px">read files</text>
+  <rect x="440" y="42" width="90" height="36" rx="6" style="fill:var(--panel2);stroke:var(--line);stroke-dasharray:4 3"/><text x="485" y="64" text-anchor="middle" style="fill:var(--ink2);font-size:11px">approach A</text>
+  <rect x="440" y="142" width="90" height="36" rx="6" style="fill:var(--panel);stroke:var(--line)"/><text x="485" y="164" text-anchor="middle" style="fill:var(--ink);font-size:11px">approach B</text>
+  <rect x="580" y="142" width="96" height="36" rx="6" style="fill:var(--kv-s);stroke:var(--kv);stroke-width:2"/><text x="628" y="164" text-anchor="middle" style="fill:var(--ink);font-size:11px">tests pass</text>
+  <text x="686" y="164" style="fill:var(--kv);font-size:11px;font-weight:600">leaf</text>
+  <text x="440" y="100" style="fill:var(--ink2);font-size:10px">abandoned branch stays in the file</text>
+  <text x="24" y="206" style="fill:var(--ink2);font-size:11px">The model sees only the path from the root to the leaf. Every branch is kept.</text>
+</svg></div>
+<figcaption>Pi's session tree. Approach A failed; the user branched back and tried B. A stays on disk but never pollutes B's context.</figcaption>
+</figure>
+
+<h2 id="decisions">3. Design decisions compared</h2>
+<div class="tbl"><table>
+  <tr><th>Decision</th><th>Pi</th><th>fx</th><th>eve</th><th>nanocode</th></tr>
+  <tr><td>Shape</td><td>Tree in one JSONL file</td><td>Linear, resumable</td><td>Session, turn, step in a workflow</td><td>Log with branches</td></tr>
+  <tr><td>Storage</td><td>Local files</td><td>Local files</td><td>Workflow world (local, Vercel, Postgres)</td><td>JSONL, SQL, WASM hosts</td></tr>
+  <tr><td>Cross-session memory</td><td>AGENTS.md and extensions</td><td>AGENTS.md, skills</td><td>Memory slots with providers and scopes</td><td>AGENTS.md, host stores</td></tr>
+  <tr><td>Pro</td><td>Explore without polluting context</td><td>Simple</td><td>Scoped, multi-user memory</td><td>Same records everywhere</td></tr>
+  <tr><td>Con</td><td>Tree UI is harder</td><td>No branching</td><td>Needs a platform</td><td>Complex</td></tr>
+</table></div>
+
+<h2 id="research">4. Research and the Chinese view</h2>
+<ul>
+  <li><strong>Persistence is open research.</strong> The Dive into Claude Code paper lists memory and long-term human-agent relationships among its six open directions (<a href="https://arxiv.org/html/2604.14228v1">arXiv 2604.14228</a>).</li>
+  <li><strong>Artifacts beat chat history.</strong> Anthropic's long-running harness persists progress in <code>claude-progress.txt</code>, a feature list and git commits, so each new session can rebuild state without the old conversation.</li>
+  <li><strong>Chinese framing.</strong> OpenHarness's code walkthrough splits a harness into Brain (model calls), Hands (tools) and Session (memory) layers (<a href="https://gitcode.csdn.net/69fa8ce60a2f6a37c5a7ff6c.html">CSDN</a>); the Code as Agent Harness survey counts repository state and commit history as part of the harness's stateful medium.</li>
+</ul>
+
+<h2 id="build">5. Build: a session tree and a memory slot</h2>
+<pre>&quot;&quot;&quot;Sessions as append-only JSONL trees (Pi&#x27;s design), plus a memory slot that lives outside history (eve&#x27;s design).&quot;&quot;&quot;
+import json, os, time, uuid
+from pathlib import Path
+
+SESSIONS = Path.home() / &quot;.harness&quot; / &quot;sessions&quot;
+
+class Session:
+    &quot;&quot;&quot;Every entry has id and parent_id. The leaf is the current position; appending adds a child of the leaf.
+    Branching moves the leaf back. History is never rewritten.&quot;&quot;&quot;
+    def __init__(self, path: Path):
+        self.path, self.entries, self.leaf = path, {}, None
+        if path.exists():
+            for line in path.read_text().splitlines():
+                e = json.loads(line)
+                if e[&quot;type&quot;] == &quot;leaf&quot;:                 # leaf moves are entries too, so a reload restores the position
+                    self.leaf = e[&quot;to&quot;]
+                else:
+                    self.entries[e[&quot;id&quot;]] = e
+                    self.leaf = e[&quot;id&quot;]
+
+    @classmethod
+    def new(cls, cwd: str):
+        SESSIONS.mkdir(parents=True, exist_ok=True)
+        s = cls(SESSIONS / f&quot;{time.strftime(&#x27;%Y%m%d-%H%M%S&#x27;)}-{uuid.uuid4().hex[:6]}.jsonl&quot;)
+        s._write({&quot;type&quot;: &quot;session&quot;, &quot;cwd&quot;: cwd, &quot;id&quot;: uuid.uuid4().hex[:12], &quot;parent_id&quot;: None})
+        return s
+
+    @classmethod
+    def latest(cls, cwd: str):
+        &quot;&quot;&quot;Resume the newest session started in this directory (fx -c, pi --continue).&quot;&quot;&quot;
+        for p in sorted(SESSIONS.glob(&quot;*.jsonl&quot;), reverse=True):
+            first = json.loads(p.open().readline())
+            if first.get(&quot;cwd&quot;) == cwd:
+                return cls(p)
+        return None
+
+    def _write(self, entry):
+        with self.path.open(&quot;a&quot;) as f:                  # append only; one line per entry
+            f.write(json.dumps(entry, default=str) + &quot;\n&quot;)
+            f.flush(); os.fsync(f.fileno())
+        if entry[&quot;type&quot;] == &quot;leaf&quot;:
+            self.leaf = entry[&quot;to&quot;]
+        else:
+            self.entries[entry[&quot;id&quot;]] = entry
+            self.leaf = entry[&quot;id&quot;]
+
+    def append(self, kind: str, **data) -&gt; str:
+        &quot;&quot;&quot;kind: &#x27;message&#x27;, &#x27;checkpoint&#x27; (from compaction), &#x27;model_change&#x27;, &#x27;label&#x27; ...&quot;&quot;&quot;
+        entry = {&quot;type&quot;: kind, &quot;id&quot;: uuid.uuid4().hex[:12], &quot;parent_id&quot;: self.leaf, &quot;ts&quot;: time.time(), **data}
+        self._write(entry)
+        return entry[&quot;id&quot;]
+
+    def branch(self, entry_id: str):
+        &quot;&quot;&quot;Continue from an earlier entry. The old path stays in the file as a sibling branch.&quot;&quot;&quot;
+        assert entry_id in self.entries
+        self._write({&quot;type&quot;: &quot;leaf&quot;, &quot;to&quot;: entry_id})
+
+    def path_to_leaf(self):
+        out, cur = [], self.leaf
+        while cur:
+            e = self.entries[cur]
+            out.append(e)
+            cur = e[&quot;parent_id&quot;]
+        return out[::-1]
+
+    def messages(self):
+        &quot;&quot;&quot;Messages the model sees: start at the last checkpoint on the path, then everything after it.&quot;&quot;&quot;
+        path = self.path_to_leaf()
+        last_cp = max((i for i, e in enumerate(path) if e[&quot;type&quot;] == &quot;checkpoint&quot;), default=None)
+        start = 0 if last_cp is None else last_cp
+        out = []
+        for e in path[start:]:
+            if e[&quot;type&quot;] == &quot;checkpoint&quot;:
+                out.append({&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: f&quot;&lt;checkpoint&gt;\n{e[&#x27;summary&#x27;]}\n&lt;/checkpoint&gt;&quot;})
+            elif e[&quot;type&quot;] == &quot;message&quot;:
+                out.append(e[&quot;message&quot;])
+        return out
+
+    def tree(self):
+        &quot;&quot;&quot;Text view of all branches, for a /tree command.&quot;&quot;&quot;
+        children = {}
+        for e in self.entries.values():
+            children.setdefault(e[&quot;parent_id&quot;], []).append(e)
+        lines = []
+        def walk(pid, depth):
+            for e in children.get(pid, []):
+                text = e.get(&quot;message&quot;, {}).get(&quot;content&quot;) or e[&quot;type&quot;]
+                mark = &quot; &lt;- leaf&quot; if e[&quot;id&quot;] == self.leaf else &quot;&quot;
+                lines.append(f&quot;{&#x27;  &#x27; * depth}{e[&#x27;id&#x27;]} {str(text)[:50]!r}{mark}&quot;)
+                walk(e[&quot;id&quot;], depth + 1)
+        walk(None, 0)
+        return &quot;\n&quot;.join(lines)
+
+class FileMemory:
+    &quot;&quot;&quot;A memory slot outside history: recalled into each turn as a labeled user message, saved by a tool.
+    Compaction never sees it, so it cannot be summarized away (eve).&quot;&quot;&quot;
+    def __init__(self, path=Path.home() / &quot;.harness&quot; / &quot;memory.md&quot;):
+        self.path = path
+    def recall(self):
+        text = self.path.read_text() if self.path.exists() else &quot;&quot;
+        return {&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: f&quot;&lt;memory slot=&#x27;profile&#x27;&gt;\n{text}\n&lt;/memory&gt;&quot;} if text.strip() else None
+    def save(self, fact: str):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.path.open(&quot;a&quot;) as f:
+            f.write(f&quot;- {fact.strip()}\n&quot;)
+        return &quot;saved&quot;</pre>
+<p>Wiring:</p>
+<ul>
+  <li>At start: <code>Session.latest(cwd)</code> if the user passed <code>-c</code>, otherwise <code>Session.new(cwd)</code>. Rebuild <code>state.messages</code> from <code>session.messages()</code>.</li>
+  <li>After every message: <code>session.append("message", message=...)</code>. After compaction: <code>session.append("checkpoint", summary=...)</code>. History before it stays in the file.</li>
+  <li>Add <code>/tree</code> and <code>/fork &lt;id&gt;</code> commands that call <code>tree()</code> and <code>branch()</code>.</li>
+  <li>Each turn, prepend <code>memory.recall()</code> to the request (not to the stored history), and give the model a <code>memory_save(fact)</code> tool.</li>
+</ul>
+<h3>Stage 2 gate</h3>
+<ol>
+  <li>Start a long task, quit mid-way, resume with <code>-c</code>, and finish. Nothing should be repeated.</li>
+  <li>Let the agent try a wrong approach, branch back, and solve it another way. Show the tree in a post.</li>
+  <li>Tell the agent a preference in one session ("use pytest -q"). Start a new session and check it follows it without being told.</li>
+</ol>
+
+<h2 id="exercises">6. Exercises</h2>
+<ol>
+  <li>Add a <code>version</code> field to the session header and write a migration, as Pi did from v1 to v2.</li>
+  <li>Export a session path as Markdown for a blog post.</li>
+  <li>Scope memory per repository instead of per user. When is each scope right?</li>
+</ol>
+
+<h2 id="quiz">7. Check yourself</h2>
+<div class="widget quiz" data-quiz="qz6"></div>
+<script type="application/json" id="qz6">[
+{"q":"In Pi's session tree, what does branching do?","o":["Deletes later entries","Moves the leaf pointer to an earlier entry; later entries stay in the file","Copies the file","Starts a new session"],"a":1,"e":"History is append-only; branching just changes where the next entry attaches."},
+{"q":"Which messages does the model see in a tree session?","o":["All entries in the file","The path from the root to the current leaf, applying compaction summaries","Only the last 20 entries","The longest branch"],"a":1,"e":"buildSessionContext() follows the path to the leaf."},
+{"q":"How does eve add recalled memory to a turn?","o":["As system instructions","As user messages labeled with the slot","Into the compaction summary","It does not recall memory"],"a":1,"e":"Labeled user messages, never system instructions, and the summarizer never sees them."},
+{"q":"Why does Pi's session format include model_change and usage entries?","o":["For billing only","Because reconstructing and auditing a session needs more than messages","They are required by providers","To speed up loading"],"a":1,"e":"Model switches, thinking levels, usage and labels all affect how a session is rebuilt and understood."},
+{"q":"Where does nanocode store sessions by default in the CLI?","o":["Postgres","One append-only JSONL file per session","In memory only","S3"],"a":1,"e":"store-jsonl is the CLI default; store-sql covers SQLite, Postgres and host databases."}
+]</script>
+
+<h2 id="refs">8. References</h2>
+<ul>
+  <li>Pi: <code>packages/coding-agent/src/core/session-manager.ts</code>.</li>
+  <li>fx: <code>README.md</code> (sessions), <code>src/core/session/</code>.</li>
+  <li>eve: <code>docs/memory/index.mdx</code>, <code>docs/concepts/state.md</code>.</li>
+  <li>nanocode: <code>crates/README.md</code> (store-jsonl, store-sql, durability).</li>
+  <li><a href="https://anthropic.com/engineering/effective-harnesses-for-long-running-agents">Effective harnesses for long-running agents</a>, Anthropic, Nov 2025.</li>
+  <li><a href="https://lucumr.pocoo.org/2026/1/31/pi/">Pi: The Minimal Agent Within OpenClaw</a> (session trees), Armin Ronacher, Jan 2026.</li>
+</ul>
