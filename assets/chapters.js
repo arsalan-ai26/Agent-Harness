@@ -11,7 +11,7 @@ window.IE_CHAPTERS = [
 "title": "The agent loop",
 "slug": "01-agent-loop",
 "stage": 1,
-"ready": false
+"ready": true
 },
 {
 "n": "2",

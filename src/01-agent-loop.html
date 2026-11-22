@@ -1,0 +1,262 @@
+<div class="kicker">Stage 1 · Foundations · Chapter 1</div>
+<h1>The agent loop</h1>
+<p class="lede">The loop is the smallest part of a harness and the one every other part plugs into. This chapter shows how four harnesses shape it, why eve does not loop at all, and how the shape you choose today decides whether your agent can become durable later. You end the chapter with a working 120-line agent and a baseline score.</p>
+<div class="meta">
+  <span class="chip">Level: intermediate</span>
+  <span class="chip">Time: about 20 hours with the build</span>
+  <span class="chip">Needs: Python 3.11+, an API key for any OpenAI-compatible endpoint</span>
+  <span class="chip">Code read at: Pi fb248c7, eve 5c52fbf, fx cbe7daf, nanocode 015cbfa</span>
+</div>
+
+<div class="box skip">
+  <span class="lbl">Before you start: skip check</span>
+  <ol>
+    <li>What is the difference between a turn and a step?</li>
+    <li>A user types a correction while the agent is running tools. When should the model see it?</li>
+    <li>Why would you write the loop body as a function that returns the next state instead of a <code>while</code> loop?</li>
+  </ol>
+  <details><summary>Answers</summary><ol>
+    <li>A turn is one user message and all the work until the agent replies. A step is one model call plus the tool calls it asked for. A turn has one or more steps.</li>
+    <li>Before the next model call: queue it, and deliver it at the next step boundary (this is "steering").</li>
+    <li>Each return is a natural checkpoint. You can save the state, crash, and continue from the last step. That is how eve becomes durable.</li>
+  </ol></details>
+</div>
+
+<h2 id="vocab">1. Turn, step, run, session</h2>
+<p>The loop needs exact words, because harnesses save and resume at these boundaries.</p>
+<div class="box def">
+  <span class="lbl">Definitions</span>
+  <p><strong>Step:</strong> one model call plus the tool calls it asks for. The smallest unit that changes the conversation.</p>
+  <p><strong>Turn:</strong> one user input and every step it triggers until the model answers without a tool call.</p>
+  <p><strong>Run:</strong> Pi Durable's word for the steps from one admitted input to the final answer, possibly including follow-up input that arrived meanwhile.</p>
+  <p><strong>Session:</strong> all turns of one conversation. It can span days.</p>
+  <p><strong>Steering message:</strong> user input that arrives while a turn is running. <strong>Follow-up message:</strong> input that arrives just as the agent was about to stop.</p>
+</div>
+
+<h2 id="anatomy">2. What the loop must decide</h2>
+<p>The toy loop from Chapter 0 hides six decisions. Each harness answers them differently.</p>
+<ol>
+  <li><strong>When to stop.</strong> Normally when the model replies without tool calls. Harnesses add step limits, token budgets, cancellation, and stop hooks that can push the agent to keep working (for example "tests still fail").</li>
+  <li><strong>How to run several tool calls.</strong> A model can ask for five reads at once. Run them in parallel (fast) or in order (safe when tools share state)?</li>
+  <li><strong>When new user input is seen.</strong> Interrupt now, or wait for the next step boundary?</li>
+  <li><strong>What happens between steps.</strong> Compaction, model switches, context updates and checkpoints all happen here.</li>
+  <li><strong>Where state lives.</strong> In memory (lost on crash) or written down after every step?</li>
+  <li><strong>Who calls whom.</strong> Does the loop call the model, or does an outside engine call the loop one step at a time?</li>
+</ol>
+
+<h2 id="shapes">3. Three loop shapes</h2>
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 300" width="760" style="max-width:100%;height:auto" role="img" aria-label="Three loop shapes: nested in-memory loop, step function driven by a workflow engine, journaled runtime">
+  <defs><marker id="b1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <text x="24" y="24" style="fill:var(--ink);font-size:13px;font-weight:600">A. Nested loop in memory</text>
+  <text x="24" y="40" style="fill:var(--ink2);font-size:11px">Pi, fx</text>
+  <rect x="24" y="52" width="220" height="200" rx="10" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="36" y="72" style="fill:var(--ink2);font-size:11px">outer: follow-ups</text>
+  <rect x="44" y="84" width="180" height="120" rx="8" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="56" y="104" style="fill:var(--ink2);font-size:11px">inner: tool calls</text>
+  <text x="56" y="120" style="fill:var(--ink2);font-size:11px">or steering left</text>
+  <rect x="64" y="132" width="140" height="28" rx="6" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="134" y="150" text-anchor="middle" style="fill:var(--ink);font-size:11px">model call</text>
+  <rect x="64" y="166" width="140" height="28" rx="6" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="134" y="184" text-anchor="middle" style="fill:var(--ink);font-size:11px">tool batch</text>
+  <text x="36" y="236" style="fill:var(--bad);font-size:11px">crash: turn lost</text>
+
+  <text x="270" y="24" style="fill:var(--ink);font-size:13px;font-weight:600">B. Step function</text>
+  <text x="270" y="40" style="fill:var(--ink2);font-size:11px">eve</text>
+  <rect x="270" y="52" width="220" height="200" rx="10" style="fill:var(--panel);stroke:var(--line)"/>
+  <rect x="290" y="70" width="180" height="40" rx="8" style="fill:var(--panel2);stroke:var(--line)"/>
+  <text x="380" y="95" text-anchor="middle" style="fill:var(--ink);font-size:11px">workflow engine</text>
+  <rect x="290" y="150" width="180" height="56" rx="8" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="380" y="172" text-anchor="middle" style="fill:var(--ink);font-size:11px">step(session)</text>
+  <text x="380" y="190" text-anchor="middle" style="fill:var(--ink2);font-size:11px">→ { session, next }</text>
+  <g style="fill:none;stroke:var(--ink2);stroke-width:1.3"><path d="M350 110V148" marker-end="url(#b1)"/><path d="M410 148V112" marker-end="url(#b1)"/></g>
+  <text x="300" y="134" style="fill:var(--ink2);font-size:10px">call</text>
+  <text x="416" y="134" style="fill:var(--ink2);font-size:10px">save</text>
+  <text x="282" y="236" style="fill:var(--good);font-size:11px">crash: replay last step</text>
+
+  <text x="516" y="24" style="fill:var(--ink);font-size:13px;font-weight:600">C. Journaled runtime</text>
+  <text x="516" y="40" style="fill:var(--ink2);font-size:11px">nanocode, Pi Durable</text>
+  <rect x="516" y="52" width="220" height="200" rx="10" style="fill:var(--panel);stroke:var(--line)"/>
+  <rect x="536" y="70" width="180" height="30" rx="6" style="fill:var(--panel2);stroke:var(--line)"/>
+  <text x="626" y="90" text-anchor="middle" style="fill:var(--ink);font-size:11px">turn inbox</text>
+  <rect x="536" y="110" width="180" height="56" rx="8" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="626" y="134" text-anchor="middle" style="fill:var(--ink);font-size:11px">runtime loop</text>
+  <text x="626" y="152" text-anchor="middle" style="fill:var(--ink2);font-size:11px">every call journaled</text>
+  <rect x="536" y="176" width="180" height="30" rx="6" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="626" y="196" text-anchor="middle" style="fill:var(--ink);font-size:11px">store: JSONL, SQL</text>
+  <text x="528" y="236" style="fill:var(--good);font-size:11px">crash: finish from journal</text>
+</svg></div>
+<figcaption>Three shapes. A keeps everything in memory and is the easiest to read. B hands control to an engine after every step. C keeps a loop but writes every call to storage before moving on.</figcaption>
+</figure>
+
+<h2 id="tour">4. Code tour</h2>
+<h3>Pi: two nested loops with queues</h3>
+<p>Open <code>packages/agent/src/agent-loop.ts</code> (952 lines) and find <code>runLoop()</code>. The outer <code>while (true)</code> exists only for follow-up messages: when the agent would stop, it asks <code>getFollowUpMessages()</code> and continues if any arrived. The inner loop runs <code>while (hasMoreToolCalls || pendingMessages.length > 0)</code>. Steering messages are polled at the start and after each turn preparation, and injected before the next model call, never in the middle of one.</p>
+<p>Between turns, two hooks run: <code>prepareNextTurn</code> (can return a new context, new model or thinking level, which is how compaction and model switching plug in) and <code>prepareRequest</code> (last change before the call). Tool calls run in parallel by default; <code>executeToolCalls()</code> switches to sequential if the config says so or if any tool in the batch declares <code>executionMode: "sequential"</code>. That per-tool flag is a nice detail: a file-mutation tool can force order without slowing down a batch of reads.</p>
+<h3>eve: no loop, a kernel</h3>
+<p>Open <code>packages/eve/src/harness/kernel.ts</code>. <code>createKernel()</code> returns <code>runStep(session, input)</code>. One call runs a fixed sequence of stages in <code>runStages()</code>: settle runtime results (finished tasks, subagents), admit human answers (approvals), prepare turn input, run hook effects, apply human decisions, then either <em>park</em> (wait for a human), settle the turn, or call <code>runModelStep</code>. It returns <code>{ session, next }</code>. The Workflow SDK calls <code>next</code> in a new durable step. A step is by default one model call plus its inline tool calls; the experimental <code>workflow.modelCallsPerStep</code> groups several cycles to cut checkpoint overhead, at the cost of a bigger replay unit.</p>
+<p>Look at how many stages are about humans and background work: approvals, parked work, queued input, running tasks. A durable loop spends most of its code on waiting correctly.</p>
+<h3>fx: a native orchestrator with a step limit</h3>
+<p>fx's loop lives in <code>src/core/agent/runtime/orchestrator.zig</code>, with <code>parallel_execution.zig</code> and <code>tool_batch.zig</code> for tool batches and <code>interruption.zig</code> for cancel. <code>config.zig</code> defines an <code>agent_step_limit</code> and the message the model receives when it is hit: "Agent step limit reached; continue with a follow-up prompt if needed." Subagents get their own, smaller limit (<code>src/core/subagent/agent_adapter.zig</code>). The loop also warms the provider cache (<code>cache_warmer.zig</code>), because a native binary that starts in microseconds should not then wait on a cold prompt cache.</p>
+<h3>nanocode: a runtime with an inbox and a log</h3>
+<p>In <code>crates/runtime/agent/src</code>, <code>turn_inbox.rs</code> receives prompts and steering, <code>turn_log.rs</code> and <code>session_log.rs</code> record every event, and <code>runtime.rs</code> drives turns. Steering has a receipt status, so the caller knows whether a message was accepted into the running turn. The design goal is stated in the README: every model call and tool call is journaled, so a turn finishes after its process dies.</p>
+
+<h2 id="decisions">5. Design decisions compared</h2>
+<div class="tbl"><table>
+  <tr><th>Decision</th><th>Pi</th><th>eve</th><th>fx</th><th>nanocode</th></tr>
+  <tr><td>Loop shape</td><td>Nested in-memory loops</td><td>Step function called by a workflow engine</td><td>Native in-memory orchestrator</td><td>Journaled runtime</td></tr>
+  <tr><td>New input mid-turn</td><td>Steering queue, delivered at next step</td><td>Queued, delivered at a step boundary; can park</td><td>Interruption and follow-up</td><td>Turn inbox with receipts</td></tr>
+  <tr><td>Parallel tools</td><td>Parallel unless a tool is sequential</td><td>Inline calls per step</td><td>Tool batches in parallel</td><td>Parallel, also inside Code Mode cells</td></tr>
+  <tr><td>Stop control</td><td>No tool calls and no queued messages</td><td>Stages decide: settle, park, or next</td><td>Step limit plus notice</td><td>Turn control and budgets</td></tr>
+  <tr><td>Crash during a turn</td><td>Turn lost (Pi Durable fixes this)</td><td>Replays from last step</td><td>Turn lost; session on disk</td><td>Finishes from the journal</td></tr>
+  <tr><td>Main trade-off</td><td>Simple, hard to make durable</td><td>Durable, every step must be serializable</td><td>Fast, durability left to hosts</td><td>Durable everywhere, complex</td></tr>
+</table></div>
+<div class="box expert">
+  <span class="lbl">Why this matters later</span>
+  <p>Making an in-memory loop durable after the fact is hard: you discover every hidden piece of state (an open file handle, a half-streamed reply, a background process). Writing the loop body as <code>step(state) → state</code> from the start forces all state into one object you can save. We do that now, and Chapter 11 adds the journal.</p>
+</div>
+
+<h2 id="research">6. Research and how Chinese teams see the loop</h2>
+<ul>
+  <li><strong>ReAct (2022)</strong> introduced interleaving reasoning, action and observation. Every loop here is ReAct plus engineering.</li>
+  <li><strong>The Ralph loop</strong>: when the model tries to stop, a hook re-injects the original goal into a fresh context window; files carry state between iterations. LangChain describes it as a harness pattern for long goals.</li>
+  <li><strong>Loop engineering</strong> is the 2026 name for designing the outer loops that re-drive agents, one layer above harness engineering.</li>
+  <li><strong>Chinese view.</strong> Chinese analyses stress that the innermost loop can be about 200 lines and that the hard part is everything around it (<a href="https://eu.36kr.com/zh/p/3962917883805061">36Kr</a>). Practitioner write-ups describe the loop's job as mediating observation, action, feedback and completion (<a href="https://jimmysong.io/zh/book/ai-handbook/runtime/harness/">Jimmy Song</a>).</li>
+</ul>
+
+<h2 id="build">7. Build: a 120-line agent with a step function</h2>
+<p>We use the <code>openai</code> Python SDK because almost every provider (OpenAI, OpenRouter, Ollama, vLLM, most Chinese labs) offers an OpenAI-compatible endpoint. Chapter 2 replaces it with our own provider layer.</p>
+<pre>pip install openai
+export BASE_URL=...   # any OpenAI-compatible endpoint; leave unset for OpenAI
+export API_KEY=...
+export MODEL=...</pre>
+<pre>import json, os, subprocess
+from dataclasses import dataclass, field
+from openai import OpenAI
+
+client = OpenAI(base_url=os.getenv(&quot;BASE_URL&quot;), api_key=os.getenv(&quot;API_KEY&quot;))
+MODEL = os.getenv(&quot;MODEL&quot;, &quot;gpt-5-mini&quot;)
+SYSTEM = &quot;You are a coding agent. Use the tools to inspect and change files. Be brief.&quot;
+
+def tool(name, desc, props, required):
+    return {&quot;type&quot;: &quot;function&quot;, &quot;function&quot;: {&quot;name&quot;: name, &quot;description&quot;: desc,
+            &quot;parameters&quot;: {&quot;type&quot;: &quot;object&quot;, &quot;properties&quot;: props, &quot;required&quot;: required}}}
+
+TOOLS = [
+    tool(&quot;read&quot;, &quot;Read a text file.&quot;, {&quot;path&quot;: {&quot;type&quot;: &quot;string&quot;}}, [&quot;path&quot;]),
+    tool(&quot;write&quot;, &quot;Create or overwrite a file.&quot;, {&quot;path&quot;: {&quot;type&quot;: &quot;string&quot;}, &quot;content&quot;: {&quot;type&quot;: &quot;string&quot;}}, [&quot;path&quot;, &quot;content&quot;]),
+    tool(&quot;edit&quot;, &quot;Replace exact text in a file. old must appear exactly once.&quot;,
+         {&quot;path&quot;: {&quot;type&quot;: &quot;string&quot;}, &quot;old&quot;: {&quot;type&quot;: &quot;string&quot;}, &quot;new&quot;: {&quot;type&quot;: &quot;string&quot;}}, [&quot;path&quot;, &quot;old&quot;, &quot;new&quot;]),
+    tool(&quot;bash&quot;, &quot;Run a shell command and return its output.&quot;, {&quot;command&quot;: {&quot;type&quot;: &quot;string&quot;}}, [&quot;command&quot;]),
+]
+
+def run_tool(name, args):
+    try:
+        if name == &quot;read&quot;:
+            return open(args[&quot;path&quot;]).read()[:20_000]
+        if name == &quot;write&quot;:
+            os.makedirs(os.path.dirname(args[&quot;path&quot;]) or &quot;.&quot;, exist_ok=True)
+            open(args[&quot;path&quot;], &quot;w&quot;).write(args[&quot;content&quot;])
+            return f&quot;wrote {len(args[&#x27;content&#x27;])} chars&quot;
+        if name == &quot;edit&quot;:
+            text = open(args[&quot;path&quot;]).read()
+            if text.count(args[&quot;old&quot;]) != 1:
+                return f&quot;error: old text found {text.count(args[&#x27;old&#x27;])} times, need exactly 1&quot;
+            open(args[&quot;path&quot;], &quot;w&quot;).write(text.replace(args[&quot;old&quot;], args[&quot;new&quot;]))
+            return &quot;edited&quot;
+        if name == &quot;bash&quot;:
+            p = subprocess.run(args[&quot;command&quot;], shell=True, capture_output=True, text=True, timeout=120)
+            out = (p.stdout + p.stderr)[-20_000:]
+            return f&quot;{out}\n[exit code: {p.returncode}]&quot;
+        return f&quot;error: unknown tool {name}&quot;
+    except Exception as e:
+        return f&quot;error: {e}&quot;
+
+@dataclass
+class State:
+    messages: list
+    steps: int = 0
+    done: bool = False
+    steering: list = field(default_factory=list)  # messages typed while the agent works
+
+def step(state: State, max_steps: int = 50) -&gt; State:
+    &quot;&quot;&quot;One unit of work: one model call plus the tool calls it asks for.&quot;&quot;&quot;
+    if state.steering:                       # deliver queued user messages first
+        state.messages += [{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: m} for m in state.steering]
+        state.steering.clear()
+    reply = client.chat.completions.create(model=MODEL, messages=state.messages, tools=TOOLS).choices[0].message
+    state.messages.append(reply.model_dump(exclude_none=True))
+    state.steps += 1
+    if not reply.tool_calls:                 # no tool call: the turn is over
+        state.done = True
+        return state
+    for call in reply.tool_calls:
+        output = run_tool(call.function.name, json.loads(call.function.arguments or &quot;{}&quot;))
+        state.messages.append({&quot;role&quot;: &quot;tool&quot;, &quot;tool_call_id&quot;: call.id, &quot;content&quot;: output})
+    if state.steps &gt;= max_steps:             # the harness, not the model, enforces limits
+        state.messages.append({&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: &quot;Step limit reached. Summarize and stop.&quot;})
+    return state
+
+def run(task: str) -&gt; str:
+    state = State(messages=[{&quot;role&quot;: &quot;system&quot;, &quot;content&quot;: SYSTEM}, {&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: task}])
+    while not state.done:
+        state = step(state)
+    return state.messages[-1].get(&quot;content&quot;, &quot;&quot;)
+
+if __name__ == &quot;__main__&quot;:
+    import sys
+    print(run(&quot; &quot;.join(sys.argv[1:])))</pre>
+<p>Four design choices in this code, each taken from the code tour:</p>
+<ul>
+  <li><strong><code>step()</code> is the unit.</strong> It does one model call and its tools, and returns the state. <code>run()</code> is a thin driver, the role eve gives its workflow engine.</li>
+  <li><strong>Steering waits for a step boundary</strong>, as in Pi. Never inject input in the middle of a tool batch.</li>
+  <li><strong>Errors are results, not exceptions.</strong> A failed tool returns text that starts with <code>error:</code>, so the model can recover. Manus keeps failed actions in context for the same reason.</li>
+  <li><strong>The harness enforces the step limit</strong> and tells the model, as fx does. The model never decides its own budget.</li>
+</ul>
+<div class="box watch">
+  <span class="lbl">Safety for this week</span>
+  <p>This agent runs any shell command with your permissions. Run it inside a container or a throwaway VM (<code>docker run -it -v $PWD:/work python:3.12 bash</code>). Chapter 7 adds real permissions and a sandbox.</p>
+</div>
+<h3>Your first test tasks</h3>
+<p>Make a small scratch repository and write 10 tasks the agent must do in it. Each task needs an automatic check, usually a test that passes only when the task is done. Examples:</p>
+<ol>
+  <li>A function has an off-by-one bug; a failing test shows it. Fix it.</li>
+  <li>Rename <code>get_user</code> to <code>fetch_user</code> everywhere.</li>
+  <li>Add a <code>--verbose</code> flag to the CLI.</li>
+  <li>Add type hints to one module without changing behaviour.</li>
+  <li>Write a test for an untested function.</li>
+  <li>Fix an import error after a file was moved.</li>
+  <li>Make a slow function 10x faster (a timing test checks it).</li>
+  <li>Update a README section to match the code.</li>
+  <li>Add input validation that raises <code>ValueError</code>.</li>
+  <li>Find and remove dead code that a test proves is unused.</li>
+</ol>
+<p>Run all 10, reset the repo with <code>git checkout .</code> between tasks, and record: tasks passed, total steps, total tokens. That is your baseline. Every later chapter reports against it.</p>
+
+<h2 id="exercises">8. Exercises</h2>
+<ol>
+  <li>Make tool calls run in parallel with a thread pool, but force <code>write</code> and <code>edit</code> to run in order, like Pi's per-tool <code>executionMode</code>.</li>
+  <li>Add a follow-up queue: when the model stops, check for queued input before returning, like Pi's outer loop.</li>
+  <li>Save <code>state</code> to a JSON file after every step. Kill the process mid-task and restart from the file. What breaks? (You will meet this again in Chapter 11.)</li>
+</ol>
+
+<h2 id="quiz">9. Check yourself</h2>
+<div class="widget quiz" data-quiz="qz1"></div>
+<script type="application/json" id="qz1">[
+{"q":"In Pi's loop, why is there an outer while(true) loop?","o":["To retry failed model calls","To continue when follow-up messages arrive just as the agent would stop","To run tools in parallel","To compact the context"],"a":1,"e":"The inner loop handles tool calls and steering. The outer loop checks getFollowUpMessages() when the agent is about to finish."},
+{"q":"What does eve's kernel return after one step?","o":["The final answer","{ session, next }","A list of tool calls","Nothing; it loops internally"],"a":1,"e":"The workflow engine saves the session and calls next as a new durable step."},
+{"q":"Pi runs a tool batch sequentially when:","o":["Always","The config says sequential, or any tool in the batch declares executionMode sequential","The batch has more than five calls","A tool fails"],"a":1,"e":"A per-tool flag lets mutating tools force order without slowing every batch."},
+{"q":"Why return tool errors as text instead of raising exceptions?","o":["Exceptions are slow","The model can read the error and try another approach","Python cannot catch tool errors","It saves tokens"],"a":1,"e":"An error in context is evidence. Hiding it removes the model's chance to recover."},
+{"q":"What is the main cost of eve's step-function design?","o":["It cannot call tools","Every step's state must be serializable and replay-safe","It only works with one model","It cannot stream"],"a":1,"e":"Durability needs all state in a saveable form, and side effects must be safe to replay."}
+]</script>
+
+<h2 id="refs">10. References</h2>
+<ul>
+  <li>Pi: <code>packages/agent/src/agent-loop.ts</code>, <code>packages/agent/src/types.ts</code> (<a href="https://github.com/earendil-works/pi">earendil-works/pi</a>).</li>
+  <li>eve: <code>packages/eve/src/harness/kernel.ts</code>; <code>docs/concepts/execution-model-and-durability.mdx</code> (<a href="https://github.com/vercel/eve">vercel/eve</a>).</li>
+  <li>fx: <code>src/core/agent/runtime/orchestrator.zig</code>, <code>config.zig</code> (<a href="https://github.com/vercel-labs/fx">vercel-labs/fx</a>).</li>
+  <li>nanocode: <code>crates/runtime/agent/src/turn_inbox.rs</code>, <code>runtime.rs</code> (<a href="https://github.com/gakonst/nanocode">gakonst/nanocode</a>).</li>
+  <li><a href="https://openai.com/index/unrolling-the-codex-agent-loop">Unrolling the Codex agent loop</a>, OpenAI, Jan 2026.</li>
+  <li><a href="https://www.langchain.com/blog/the-anatomy-of-an-agent-harness">The Anatomy of an Agent Harness</a> (Ralph loop), LangChain, Mar 2026.</li>
+  <li>Yao et al., ReAct: Synergizing Reasoning and Acting in Language Models, 2022.</li>
+</ul>
