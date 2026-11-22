@@ -25,7 +25,7 @@ window.IE_CHAPTERS = [
 "title": "Tools and the action interface",
 "slug": "03-tools",
 "stage": 1,
-"ready": false
+"ready": true
 },
 {
 "n": "4",

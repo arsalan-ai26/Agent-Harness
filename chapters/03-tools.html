@@ -1,0 +1,270 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>3. Tools and the action interface</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&family=JetBrains+Mono:wght@400;600&display=swap">
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-chapter="3" data-stage="1">
+<div class="topbar" style="padding-left:0;padding-right:0"><a href="../index.html">← Build an Agent Harness</a><span>Stage 1 · Chapter 3</span></div>
+<div class="shell">
+<nav class="toc" aria-label="Chapter contents"></nav>
+<main><article>
+<div class="kicker">Stage 1 · Foundations · Chapter 3</div>
+<h1>Tools and the action interface</h1>
+<p class="lede">Tools are the only way a model touches the world, so their design decides what the agent can do, how often it fails, and how many tokens it burns. This chapter compares Pi's four tools, fx's toolbox with capability search, eve's sandboxed built-ins and nanocode's Code Mode, then builds a typed tool registry with validation, truncation, safe multi-edits and background jobs. It closes Stage 1: your harness is now a real coding agent.</p>
+<div class="meta">
+  <span class="chip">Level: intermediate</span>
+  <span class="chip">Time: about 20 hours with the build</span>
+  <span class="chip">Needs: Chapters 1 and 2</span>
+  <span class="chip">Code read at: Pi fb248c7, eve 5c52fbf, fx cbe7daf, nanocode 015cbfa</span>
+</div>
+
+<div class="box skip">
+  <span class="lbl">Before you start: skip check</span>
+  <ol>
+    <li>Why does Pi's edit tool require each old text to be unique in the file?</li>
+    <li>A test command prints 80,000 lines. What should the model see?</li>
+    <li>What is the difference between listing all tools and tool search?</li>
+  </ol>
+  <details><summary>Answers</summary><ol>
+    <li>If the text appears twice, the edit is ambiguous and may change the wrong place. Rejecting it with a clear error makes the model add surrounding lines.</li>
+    <li>A bounded slice (for example the last 2,000 lines or 50 KB, plus the head) and a path to the full output, so it can read more only if needed.</li>
+    <li>Listing puts every tool schema in every request. Tool search puts a small search tool in the request and loads a tool's schema only when the model asks for it.</li>
+  </ol></details>
+</div>
+
+<h2 id="aci">1. The agent-computer interface</h2>
+<p>In 2024 SWE-agent showed that the interface you give a model matters as much as the model. A raw Linux shell is designed for humans: it prints too much, fails silently and hides state. A good <strong>agent-computer interface (ACI)</strong> has simple actions, informative error messages and outputs sized for a context window.</p>
+<p>Every tool decision is a trade between three costs:</p>
+<ul>
+  <li><strong>Context cost.</strong> Every tool schema is in every request. Playwright's MCP server alone is about 13.7k tokens of definitions.</li>
+  <li><strong>Error cost.</strong> A vague tool gets misused. An edit tool that silently changes the wrong line is worse than one that refuses.</li>
+  <li><strong>Round-trip cost.</strong> Each tool result is another model call. Ten reads in ten steps cost ten times the prefix.</li>
+</ul>
+
+<h2 id="tour">2. Code tour</h2>
+<h3>Pi: few tools, carefully bounded</h3>
+<p><code>packages/coding-agent/src/core/tools/</code> contains <code>read.ts</code>, <code>write.ts</code>, <code>edit.ts</code>, <code>bash.ts</code>, plus <code>grep.ts</code>, <code>find.ts</code> and <code>ls.ts</code>, which are off by default. The core prompt and tools stay under 1,000 tokens. Three details are worth copying:</p>
+<ul>
+  <li><strong>Truncation</strong> (<code>truncate.ts</code>): <code>DEFAULT_MAX_LINES = 2000</code> and <code>DEFAULT_MAX_BYTES = 50 * 1024</code>. The bash tool description tells the model this up front, and when output is cut the result names the line range kept and a file with the full output.</li>
+  <li><strong>Multi-edit</strong> (<code>edit.ts</code>): one call carries several <code>edits[]</code>; each <code>oldText</code> must match a unique, non-overlapping region. Line endings are normalized to LF for matching and the original endings and BOM are restored when writing.</li>
+  <li><strong>File mutation queue</strong> (<code>file-mutation-queue.ts</code>): writes to the same real path are serialized, writes to different files run in parallel. This is how Pi keeps parallel tool batches safe.</li>
+</ul>
+<h3>fx: a toolbox with search</h3>
+<p><code>src/tools/</code> groups tools by kind: <code>filesystem/</code> (read, write, edit, glob, grep), <code>shell/</code>, <code>web/</code> (search and fetch with an HTML-to-Markdown converter and a URL policy), <code>agent/</code> (subagent, vision, ask the user), <code>skills/</code> and <code>capabilities/</code>. <code>capability_search.zig</code> searches skills and MCP tools on request and loads the matching schemas only for the next step. Tool results are capped at 64 KB by default (<code>src/core/tooling/tool_result_limits.zig</code>) with a visible cut marker.</p>
+<h3>eve: tools that proxy into a sandbox</h3>
+<p>eve's built-in <code>bash</code>, <code>read_file</code>, <code>write_file</code> and <code>edit_file</code> run in the trusted app runtime and proxy into the sandbox (<code>docs/concepts/built-in-tools.md</code>). <code>bash</code> waits 60 seconds by default and at most 120 (to leave time for the model call inside a serverless function). A command still running after that keeps going as its own process group and returns <code>status: "running"</code>, a pid and an output directory under <code>/tmp/.eve/jobs/</code>; the model checks it later with <code>tail</code> and <code>cat .../exit</code>. Each stream keeps its last 2,000 lines or 50 KB. Any tool can be replaced by a file of the same name in <code>agent/tools/</code>, or removed with <code>disableTool()</code>.</p>
+<h3>nanocode: Code Mode</h3>
+<p>nanocode's answer to round-trip cost is to change the interface itself. In Code Mode only two tools are top level, <code>exec</code> and <code>wait</code> (<code>crates/backends/claude/prompts/code_mode.md</code>). The model writes JavaScript that calls every other tool through a <code>tools</code> object, for example <code>await tools.Bash({ command: "ls" })</code>, uses <code>Promise.all</code> for independent calls, and returns only what the next decision needs. Cells run in a QuickJS worker with a fresh context each time (<code>crates/runtime/code-mode-engine</code>). Pi has the same idea in <code>packages/codemode</code>. Chapter 9 builds it.</p>
+
+<h2 id="decisions">3. Design decisions compared</h2>
+<div class="tbl"><table>
+  <tr><th>Decision</th><th>Pi</th><th>fx</th><th>eve</th><th>nanocode</th></tr>
+  <tr><td>Default tool count</td><td>4 (plus 3 optional)</td><td>~15 across 7 groups</td><td>bash, files, glob, grep, sleep, catalog tools</td><td>Vendor's own set, or exec and wait</td></tr>
+  <tr><td>Edit format</td><td>Exact multi-replace</td><td>Exact replace</td><td>Exact replace, in sandbox</td><td>Vendor's (Claude string replace, Codex apply_patch)</td></tr>
+  <tr><td>Output bound</td><td>2,000 lines or 50 KB, full output saved</td><td>64 KB with cut marker</td><td>2,000 lines or 50 KB per stream</td><td>Per tool, file handle for the rest</td></tr>
+  <tr><td>Long commands</td><td>Use tmux (no background bash)</td><td>Dev servers can keep running</td><td>Background after timeout, job directory</td><td>Background after timeout, reported by the next exec or wait</td></tr>
+  <tr><td>Many tools</td><td>Avoid; CLIs with READMEs</td><td>Capability search</td><td>Catalog search tools</td><td>BM25 search over MCP tools</td></tr>
+</table></div>
+<div class="grid2">
+  <div class="box ex"><span class="lbl">Few general tools</span><p><strong>Pro:</strong> tiny prompt, high cache hit rate, the model writes its own tools in bash. <strong>Con:</strong> weaker models need more guidance; bash output is noisy.</p></div>
+  <div class="box ex"><span class="lbl">Many specialized tools</span><p><strong>Pro:</strong> clear actions, validation and good errors per action. <strong>Con:</strong> schemas fill the context; more ways to choose wrong.</p></div>
+</div>
+
+<h2 id="research">4. Research and the Chinese view</h2>
+<ul>
+  <li><strong>SWE-agent</strong> (<a href="https://arxiv.org/abs/2405.15793v2">arXiv 2405.15793</a>): simple actions, informative errors and history processors beat a raw shell.</li>
+  <li><strong>Minimal works too.</strong> Terminus 2, a reference agent that sends raw keystrokes to tmux, ranks competitively on Terminal-Bench 2.0; Mario Zechner cites it as evidence for Pi's minimalism.</li>
+  <li><strong>Tool masking.</strong> Manus does not add or remove tools mid-task because tool definitions sit near the front of the context and any change breaks the KV cache; it masks tools instead.</li>
+  <li><strong>Chinese practice.</strong> Chinese write-ups summarize Claude Code's architecture as one loop plus a short list of tools (bash, read, write, edit, glob, grep, browser) plus on-demand skills and compression (<a href="https://www.gitlink.org.cn/mirrors/analysis_claude_code">Learn Claude Code mirror</a>), the same minimal-core-plus-extensions shape as Pi.</li>
+</ul>
+
+<h2 id="build">5. Build: a typed tool registry</h2>
+<p>Replace Chapter 1's tools with a registry. Each tool is a Python function plus a pydantic model for its arguments; the schema comes from the model, so code and schema never drift.</p>
+<pre>pip install pydantic</pre>
+<pre>&quot;&quot;&quot;A typed tool registry: schemas from type hints, validation, truncation, safe edits, background jobs.&quot;&quot;&quot;
+import os, subprocess, tempfile, threading, time, uuid
+from typing import Callable
+from pydantic import BaseModel, ValidationError
+
+MAX_LINES, MAX_BYTES = 2000, 50 * 1024        # same limits as Pi and eve
+JOBS = os.path.join(tempfile.gettempdir(), &quot;harness-jobs&quot;)
+
+class Tool:
+    def __init__(self, fn: Callable, args: type[BaseModel], sequential: bool):
+        self.fn, self.args, self.sequential = fn, args, sequential
+        self.name, self.description = fn.__name__, (fn.__doc__ or &quot;&quot;).strip()
+
+    def spec(self):
+        return {&quot;name&quot;: self.name, &quot;description&quot;: self.description, &quot;parameters&quot;: self.args.model_json_schema()}
+
+REGISTRY: dict[str, Tool] = {}
+
+def tool(args: type[BaseModel], sequential=False):
+    &quot;&quot;&quot;Register a function as a tool. sequential=True forces calls to run in order (Pi&#x27;s executionMode).&quot;&quot;&quot;
+    def wrap(fn):
+        REGISTRY[fn.__name__] = Tool(fn, args, sequential)
+        return fn
+    return wrap
+
+def truncate(text: str, label: str) -&gt; str:
+    &quot;&quot;&quot;Keep the head and the tail; save the full text to a file the agent can read in parts.&quot;&quot;&quot;
+    lines, size = text.splitlines(), len(text.encode())
+    if len(lines) &lt;= MAX_LINES and size &lt;= MAX_BYTES:
+        return text
+    path = os.path.join(tempfile.gettempdir(), f&quot;{label}-{uuid.uuid4().hex[:8]}.txt&quot;)
+    open(path, &quot;w&quot;).write(text)
+    head, tail = lines[:200], lines[-(MAX_LINES - 200):]
+    kept = &quot;\n&quot;.join(head) + f&quot;\n[... {len(lines) - len(head) - len(tail)} lines cut; full output: {path} ...]\n&quot; + &quot;\n&quot;.join(tail)
+    return kept.encode()[-MAX_BYTES:].decode(errors=&quot;ignore&quot;)
+
+def call(name: str, raw_args: dict) -&gt; str:
+    &quot;&quot;&quot;Validate, run, truncate. Every failure comes back as text the model can read.&quot;&quot;&quot;
+    t = REGISTRY.get(name)
+    if t is None:
+        return f&quot;error: unknown tool &#x27;{name}&#x27;. Available: {&#x27;, &#x27;.join(REGISTRY)}&quot;
+    try:
+        args = t.args.model_validate(raw_args)
+    except ValidationError as e:
+        return f&quot;error: invalid arguments for {name}: {e.errors(include_url=False)}&quot;
+    try:
+        return truncate(str(t.fn(args)), name)
+    except Exception as e:
+        return f&quot;error: {type(e).__name__}: {e}&quot;
+
+# ---- file tools -------------------------------------------------------------
+class ReadArgs(BaseModel):
+    path: str
+    offset: int = 1        # first line, 1-based
+    limit: int = MAX_LINES
+
+@tool(ReadArgs)
+def read(a: ReadArgs):
+    &quot;&quot;&quot;Read a text file. Use offset and limit for large files.&quot;&quot;&quot;
+    lines = open(a.path, encoding=&quot;utf-8&quot;, errors=&quot;replace&quot;).read().splitlines()
+    chunk = lines[a.offset - 1 : a.offset - 1 + a.limit]
+    more = f&quot;\n[lines {a.offset}-{a.offset + len(chunk) - 1} of {len(lines)}]&quot; if len(lines) &gt; len(chunk) else &quot;&quot;
+    return &quot;\n&quot;.join(f&quot;{a.offset + i:&gt;6}  {l}&quot; for i, l in enumerate(chunk)) + more
+
+_locks: dict[str, threading.Lock] = {}
+def _lock(path):                                   # one lock per real file path (Pi&#x27;s file mutation queue)
+    return _locks.setdefault(os.path.realpath(path), threading.Lock())
+
+class WriteArgs(BaseModel):
+    path: str
+    content: str
+
+@tool(WriteArgs, sequential=True)
+def write(a: WriteArgs):
+    &quot;&quot;&quot;Create or overwrite a file. Prefer edit for changes to existing files.&quot;&quot;&quot;
+    with _lock(a.path):
+        os.makedirs(os.path.dirname(os.path.abspath(a.path)), exist_ok=True)
+        open(a.path, &quot;w&quot;, encoding=&quot;utf-8&quot;).write(a.content)
+    return f&quot;wrote {a.path} ({len(a.content)} chars)&quot;
+
+class Edit(BaseModel):
+    old: str
+    new: str
+
+class EditArgs(BaseModel):
+    path: str
+    edits: list[Edit]
+
+@tool(EditArgs, sequential=True)
+def edit(a: EditArgs):
+    &quot;&quot;&quot;Replace exact text. Each edits[].old must match exactly one place in the file; edits must not overlap.&quot;&quot;&quot;
+    with _lock(a.path):
+        raw = open(a.path, encoding=&quot;utf-8&quot;, newline=&quot;&quot;).read()
+        crlf = &quot;\r\n&quot; in raw
+        text = raw.replace(&quot;\r\n&quot;, &quot;\n&quot;)                      # match on LF, write back the original line endings
+        spans = []
+        for e in a.edits:
+            old, new = e.old.replace(&quot;\r\n&quot;, &quot;\n&quot;), e.new.replace(&quot;\r\n&quot;, &quot;\n&quot;)
+            n = text.count(old)
+            if n != 1:
+                return f&quot;error: edit.old found {n} times in {a.path}; include more surrounding lines so it is unique&quot;
+            i = text.index(old)
+            spans.append((i, i + len(old), new))
+        spans.sort()
+        if any(spans[k][1] &gt; spans[k + 1][0] for k in range(len(spans) - 1)):
+            return &quot;error: edits overlap; merge them into one edit&quot;
+        for start, end, new in reversed(spans):
+            text = text[:start] + new + text[end:]
+        open(a.path, &quot;w&quot;, encoding=&quot;utf-8&quot;, newline=&quot;&quot;).write(text.replace(&quot;\n&quot;, &quot;\r\n&quot;) if crlf else text)
+    return f&quot;applied {len(spans)} edit(s) to {a.path}&quot;
+
+# ---- shell with background jobs --------------------------------------------
+class BashArgs(BaseModel):
+    command: str
+    timeout: int = 60       # seconds to wait before the command moves to the background
+
+@tool(BashArgs, sequential=True)
+def bash(a: BashArgs):
+    &quot;&quot;&quot;Run a shell command. If it runs longer than timeout, it keeps running in the background and you get
+    a job directory: read its stdout file and its exit file later with bash.&quot;&quot;&quot;
+    job = os.path.join(JOBS, uuid.uuid4().hex[:8])
+    os.makedirs(job)
+    cmd = f&quot;({a.command}) &gt; {job}/stdout 2&gt;&amp;1; echo $? &gt; {job}/exit&quot;
+    proc = subprocess.Popen(cmd, shell=True, start_new_session=True)
+    deadline = time.time() + max(1, min(a.timeout, 600))
+    while time.time() &lt; deadline and proc.poll() is None:
+        time.sleep(0.1)
+    out = open(f&quot;{job}/stdout&quot;, errors=&quot;replace&quot;).read()
+    if proc.poll() is None:
+        return f&quot;{out}\n[still running as pid {proc.pid}; output in {job}/stdout, exit code will be in {job}/exit]&quot;
+    proc.wait()
+    return f&quot;{out}\n[exit code: {open(f&#x27;{job}/exit&#x27;).read().strip()}]&quot;</pre>
+<p>What each piece borrows:</p>
+<ul>
+  <li><strong>Errors as text, everywhere.</strong> Unknown tool, invalid arguments and exceptions all return readable strings, including the list of valid tool names.</li>
+  <li><strong>Truncation</strong> keeps 200 head lines and the tail up to 2,000 lines or 50 KB, and saves the full output to a file the agent can read with <code>read(offset, limit)</code>. Pi's limits.</li>
+  <li><strong>Multi-edit</strong> with uniqueness, overlap checks and preserved line endings: Pi's <code>edit.ts</code>.</li>
+  <li><strong>Per-file locks</strong>: Pi's file mutation queue. <strong><code>sequential=True</code></strong>: Pi's per-tool execution mode.</li>
+  <li><strong>Background bash</strong> with a job directory: eve's design.</li>
+  <li><strong>Read with line numbers</strong>: the model can cite and target exact lines.</li>
+</ul>
+<h3>Wire it in</h3>
+<p>In <code>step()</code>, send <code>[t.spec() for t in REGISTRY.values()]</code> as the tools. Run tool calls with a thread pool when none of them is <code>sequential</code>, otherwise in order; each result comes from <code>call(name, args)</code>.</p>
+<h3>Stage 1 gate</h3>
+<p>Rerun your 10 test tasks with both models and compare with the Chapter 1 baseline. Record pass rate, steps per task and tokens per task. Stage 1 is done when the agent passes most tasks and you can explain every failure by reading its transcript.</p>
+
+<h2 id="exercises">6. Exercises</h2>
+<ol>
+  <li>Add <code>grep</code> and <code>glob</code> tools. Do pass rate or token use change on your tasks? Pi keeps them off by default; decide with data.</li>
+  <li>Count the tokens of your tool schemas (<code>len(json.dumps(specs)) / 4</code> is a fair estimate). How much of each request are they?</li>
+  <li>Write an <code>apply_patch</code> tool in the V4A format Codex uses, and compare GPT and Claude models on both edit tools.</li>
+</ol>
+
+<h2 id="quiz">7. Check yourself</h2>
+<div class="widget quiz" data-quiz="qz3"></div>
+<script type="application/json" id="qz3">[
+{"q":"Pi's default output limit for bash is:","o":["1,000 lines","2,000 lines or 50 KB, whichever comes first","64 KB only","No limit"],"a":1,"e":"truncate.ts sets DEFAULT_MAX_LINES = 2000 and DEFAULT_MAX_BYTES = 50 KB, and saves the full output to a file."},
+{"q":"What does Pi's file mutation queue guarantee?","o":["All tools run in order","Writes to the same file are serialized; different files can run in parallel","Files are backed up","Edits are undoable"],"a":1,"e":"It keys a queue on the real path, so parallel batches stay safe without slowing unrelated writes."},
+{"q":"What happens when eve's bash command runs past its timeout?","o":["It is killed","It keeps running as its own process group and returns status running with a job directory","The session fails","The model is asked to retry"],"a":1,"e":"The model checks stdout and the exit file in later calls, so long builds never block a turn."},
+{"q":"In nanocode's Code Mode, which tools are top level?","o":["All vendor tools","exec and wait","Bash only","read and write"],"a":1,"e":"Everything else is called from JavaScript inside exec, and only the returned result enters the context."},
+{"q":"Why does Manus mask tools instead of removing them mid-task?","o":["Removal is not supported by APIs","Tool definitions sit near the start of the context, so changing them breaks the KV cache","Masking is faster to code","To hide tools from users"],"a":1,"e":"A stable prefix keeps cache hits; masking constrains choice without changing the prefix."}
+]</script>
+
+<h2 id="refs">8. References</h2>
+<ul>
+  <li>Pi: <code>packages/coding-agent/src/core/tools/</code> (<code>truncate.ts</code>, <code>edit.ts</code>, <code>file-mutation-queue.ts</code>, <code>bash.ts</code>).</li>
+  <li>fx: <code>src/tools/</code>, <code>src/tools/capabilities/capability_search.zig</code>, <code>src/core/tooling/tool_result_limits.zig</code>.</li>
+  <li>eve: <code>docs/concepts/built-in-tools.md</code>.</li>
+  <li>nanocode: <code>crates/backends/claude/prompts/code_mode.md</code>, <code>crates/runtime/code-mode-engine/README.md</code>.</li>
+  <li><a href="https://arxiv.org/abs/2405.15793v2">SWE-agent: Agent-Computer Interfaces Enable Automated Software Engineering</a>, 2024.</li>
+  <li><a href="https://www.mariozechner.at/posts/2025-11-30-pi-coding-agent/">What I learned building an opinionated and minimal coding agent</a>, Mario Zechner, Nov 2025.</li>
+  <li><a href="https://manus.im/blog/Context-Engineering-for-AI-Agents-Lessons-from-Building-Manus">Context Engineering for AI Agents: Lessons from Building Manus</a>, Jul 2025.</li>
+</ul>
+
+<div class="navfoot"></div>
+</article></main>
+</div>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/book.js"></script>
+
+</body>
+</html>
