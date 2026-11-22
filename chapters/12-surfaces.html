@@ -1,0 +1,206 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>12. Surfaces: embedding, protocols and channels</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&family=JetBrains+Mono:wght@400;600&display=swap">
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-chapter="12" data-stage="4">
+<div class="topbar" style="padding-left:0;padding-right:0"><a href="../index.html">← Build an Agent Harness</a><span>Stage 4 · Chapter 12</span></div>
+<div class="shell">
+<nav class="toc" aria-label="Chapter contents"></nav>
+<main><article>
+<div class="kicker">Stage 4 · Durability and surfaces · Chapter 12</div>
+<h1>Surfaces: embedding, protocols and channels</h1>
+<p class="lede">The same harness can sit behind a terminal, an editor, a web app, Slack and a GitHub issue. Getting there means separating the harness from its front doors: a session API, an event stream, a protocol for editors, and channels that turn outside messages into sessions. This chapter reads how fx embeds itself in scripts, editors and apps, how eve's channels work, how nanocode runs one Rust core in many languages and how Pi exposes its modes, then builds a session server with a GitHub channel. It closes Stage 4.</p>
+<div class="meta">
+  <span class="chip">Level: intermediate to advanced</span>
+  <span class="chip">Time: about 20 hours with the build</span>
+  <span class="chip">Needs: Chapter 11</span>
+  <span class="chip">Code read at: Pi fb248c7, eve 5c52fbf, fx cbe7daf, nanocode 015cbfa</span>
+</div>
+
+<div class="box skip">
+  <span class="lbl">Before you start: skip check</span>
+  <ol>
+    <li>A web client loses its connection mid-turn. How does it catch up without missing events?</li>
+    <li>What is the Agent Client Protocol (ACP) for?</li>
+    <li>Why must a GitHub channel check who wrote a comment?</li>
+  </ol>
+  <details><summary>Answers</summary><ol>
+    <li>Every event has a sequence number in a stored log; the client reconnects with the last number it saw and the server replays the rest.</li>
+    <li>A standard way for editors to talk to coding agents over stdio, so one agent works in many editors without per-editor plugins.</li>
+    <li>Public comments are untrusted input. Anyone could ask the agent to run privileged tools; only verified collaborators may start sessions with write access.</li>
+  </ol></details>
+</div>
+
+<h2 id="shape">1. Split the harness from its front doors</h2>
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 260" width="760" style="max-width:100%;height:auto" role="img" aria-label="Several surfaces reach one harness through a session API and event log">
+  <defs><marker id="h1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="24" y="20" width="150" height="32" rx="6" style="fill:var(--panel);stroke:var(--line)"/><text x="36" y="41" style="fill:var(--ink);font-size:11px">terminal UI</text>
+  <rect x="24" y="60" width="150" height="32" rx="6" style="fill:var(--panel);stroke:var(--line)"/><text x="36" y="81" style="fill:var(--ink);font-size:11px">script: ask --json</text>
+  <rect x="24" y="100" width="150" height="32" rx="6" style="fill:var(--panel);stroke:var(--line)"/><text x="36" y="121" style="fill:var(--ink);font-size:11px">editor via ACP</text>
+  <rect x="24" y="140" width="150" height="32" rx="6" style="fill:var(--panel);stroke:var(--line)"/><text x="36" y="161" style="fill:var(--ink);font-size:11px">web app via SDK</text>
+  <rect x="24" y="180" width="150" height="32" rx="6" style="fill:var(--panel);stroke:var(--line)"/><text x="36" y="201" style="fill:var(--ink);font-size:11px">Slack, GitHub, Linear</text>
+  <g style="fill:none;stroke:var(--ink2);stroke-width:1.2"><path d="M176 36H250"/><path d="M176 76H250"/><path d="M176 116H250"/><path d="M176 156H250"/><path d="M176 196H250"/><path d="M250 36V196"/><path d="M250 116H288" marker-end="url(#h1)"/></g>
+  <rect x="290" y="70" width="180" height="92" rx="8" style="fill:var(--panel2);stroke:var(--line)"/><text x="380" y="96" text-anchor="middle" style="fill:var(--ink);font-size:12px;font-weight:600">Session API</text><text x="380" y="116" text-anchor="middle" style="fill:var(--ink2);font-size:10px">create, send, answer, cancel</text><text x="380" y="134" text-anchor="middle" style="fill:var(--ink2);font-size:10px">event stream with seq numbers</text><text x="380" y="152" text-anchor="middle" style="fill:var(--ink2);font-size:10px">auth per channel</text>
+  <path d="M472 116H526" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#h1)"/>
+  <rect x="528" y="56" width="208" height="120" rx="8" style="fill:var(--kv-s);stroke:var(--kv);stroke-width:1.6"/><text x="632" y="84" text-anchor="middle" style="fill:var(--ink);font-size:12px;font-weight:600">Harness</text><text x="632" y="106" text-anchor="middle" style="fill:var(--ink2);font-size:10px">loop, tools, context</text><text x="632" y="124" text-anchor="middle" style="fill:var(--ink2);font-size:10px">durable journal</text><text x="632" y="142" text-anchor="middle" style="fill:var(--ink2);font-size:10px">knows nothing about Slack</text>
+  <text x="24" y="244" style="fill:var(--ink2);font-size:11px">Channels normalize transport and own addresses (a Slack thread, an issue); the harness only sees sessions and messages.</text>
+</svg></div>
+</figure>
+
+<h2 id="tour">2. Code tour</h2>
+<h3>fx: built to be embedded</h3>
+<p>fx's README lists three surfaces besides the terminal: <code>fx ask</code> for one request from a script or CI job (<code>--json</code> for structured output, <code>--resume</code> to continue a saved session); <code>fx acp</code> for editors and other Agent Client Protocol clients over stdio (<code>src/acp/</code>); and <strong>libfx</strong>, the agent core as a JavaScript library built both as a native Node.js addon and as WebAssembly, where <code>createFxAgent()</code> runs an agent with your own tools, MCP clients and skills and <code>createFxTerminal()</code> embeds the fx terminal (<code>sdk/</code>, <code>sdk/NAPI.md</code> for the security model). Vercel's AI SDK added an fx harness adapter, so apps can run fx as one option behind a common harness API. Vercel Labs describes fx as built for people building agent infrastructure more than for people wanting another chat window.</p>
+<h3>eve: channels as adapters</h3>
+<p>eve's README states the split: the <em>channel</em> normalizes inbound transport, applies auth and delivery policy and owns channel-local addresses; the <em>harness</em> does one unit of work and returns <code>{ session, next }</code>. <code>src/public/channels/</code> ships HTTP (on by default), Slack, Discord, Teams, Telegram, Twilio, GitHub, Linear and even MCP; <code>defineChannel</code> adds your own. A Slack thread or an issue is an address that maps to one session. eve has a conformance test kit for channels (<code>src/internal/testing/channel-conformance/</code>) and an ACP adapter (<code>src/acp/adapter.ts</code>).</p>
+<h3>nanocode: one core, many languages</h3>
+<p>Every reusable nanocode crate builds for native and <code>wasm32-unknown-unknown</code>. Bindings live in separate repos: TypeScript as one WebAssembly module (nanocode-ts), Swift for macOS and iOS, and C for a game engine or any host (libnanocode). A WASM embedder installs one host object that supplies scheduling, sleeps, clocks and secure random bytes. Live views (<code>crates/runtime/live</code>) fold the event log into diffs shared by every subscribed socket.</p>
+<h3>Pi: modes and composition</h3>
+<p>Pi runs interactively, in print or JSON mode, over RPC and as an SDK, and OpenClaw embeds it as its engine. <code>packages/chord</code> is a standalone application-composition runtime (services, replicated state, RPC, plugins) that Pi Durable builds on; Cloudflare's Agents SDK wraps Pi Durable as <code>PiHarness</code>.</p>
+
+<h2 id="decisions">3. Design decisions compared</h2>
+<div class="tbl"><table>
+  <tr><th>Decision</th><th>fx</th><th>eve</th><th>nanocode</th><th>Pi</th></tr>
+  <tr><td>Embedding</td><td>libfx: Node addon and WASM</td><td>An eve app is a Vercel project with an HTTP API and client SDK</td><td>Rust core; TS, Swift, C bindings</td><td>SDK, RPC, Chord</td></tr>
+  <tr><td>Editors</td><td>ACP</td><td>ACP adapter</td><td>Host-specific</td><td>RPC; ACP via community</td></tr>
+  <tr><td>Chat channels</td><td>Via host apps</td><td>Many built in</td><td>Via host apps</td><td>pi-chat (Slack and chat workflows)</td></tr>
+  <tr><td>Pro</td><td>Tiny and fast anywhere</td><td>Every channel for free</td><td>One runtime on every platform</td><td>Simple, composable</td></tr>
+  <tr><td>Con</td><td>Experimental SDK</td><td>Platform-centred</td><td>Bindings to maintain</td><td>You assemble surfaces</td></tr>
+</table></div>
+
+<h2 id="research">4. Research and the Chinese view</h2>
+<ul>
+  <li><strong>The harness boundary moves.</strong> The Dive into Claude Code paper lists "where, when, what and with whom the agent acts" as an open design direction; surfaces are how that boundary moves.</li>
+  <li><strong>Enterprise convergence.</strong> Stripe, Ramp and Coinbase independently built internal agents triggered from Slack and GitHub; an Aliyun article lists many entry points (Slack, GitHub, Feishu) as one of the problems that forced the same architecture (<a href="https://developer.aliyun.com/article/1742143">Aliyun</a>).</li>
+  <li><strong>Chinese desktop agents.</strong> Alibaba's QoderWork, launched Jan 2026, reached several hundred thousand users, with close to 80% starting three or more tasks a day (<a href="https://www.36kr.com/p/3777620397691911">36Kr</a>): the same harness idea, delivered as a desktop surface.</li>
+</ul>
+
+<h2 id="build">5. Build: a session server and a GitHub channel</h2>
+<pre>pip install fastapi uvicorn</pre>
+<pre>&quot;&quot;&quot;One harness, many front doors: a session server with an event stream, plus a GitHub channel.&quot;&quot;&quot;
+import asyncio, hashlib, hmac, json, os, uuid
+from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request
+from fastapi.responses import StreamingResponse
+
+app = FastAPI()
+SESSIONS: dict[str, dict] = {}        # in production: the Chapter 11 journal, not a dict
+
+def run_turn(session_id: str, text: str, emit):
+    &quot;&quot;&quot;Replace with your harness. emit(event) is called for text deltas, tool calls and the final reply.&quot;&quot;&quot;
+    emit({&quot;type&quot;: &quot;turn.started&quot;})
+    emit({&quot;type&quot;: &quot;text&quot;, &quot;delta&quot;: f&quot;(working on: {text})&quot;})
+    emit({&quot;type&quot;: &quot;turn.completed&quot;, &quot;reply&quot;: f&quot;done: {text}&quot;})
+
+def emitter(session_id):
+    s = SESSIONS[session_id]
+    def emit(event):
+        event = {&quot;seq&quot;: len(s[&quot;events&quot;]), **event}
+        s[&quot;events&quot;].append(event)                  # the log is the source of truth; clients replay from any seq
+    return emit
+
+@app.post(&quot;/sessions&quot;)
+def create_session(body: dict | None = None):
+    sid = uuid.uuid4().hex[:12]
+    SESSIONS[sid] = {&quot;events&quot;: [], &quot;busy&quot;: False, &quot;address&quot;: (body or {}).get(&quot;address&quot;)}
+    return {&quot;session_id&quot;: sid}
+
+@app.post(&quot;/sessions/{sid}/messages&quot;)
+def send(sid: str, body: dict, tasks: BackgroundTasks):
+    s = SESSIONS.get(sid)
+    if s is None:
+        raise HTTPException(404)
+    if s[&quot;busy&quot;]:                                  # queue as steering instead of starting a second turn
+        s[&quot;events&quot;].append({&quot;seq&quot;: len(s[&quot;events&quot;]), &quot;type&quot;: &quot;steering.queued&quot;, &quot;text&quot;: body[&quot;text&quot;]})
+        return {&quot;queued&quot;: True}
+    s[&quot;busy&quot;] = True
+    def work():
+        try: run_turn(sid, body[&quot;text&quot;], emitter(sid))
+        finally: s[&quot;busy&quot;] = False
+    tasks.add_task(work)
+    return {&quot;accepted&quot;: True}
+
+@app.get(&quot;/sessions/{sid}/events&quot;)
+async def events(sid: str, after: int = -1, follow: bool = True):
+    &quot;&quot;&quot;Server-sent events. A client that reconnects passes the last seq it saw and misses nothing.&quot;&quot;&quot;
+    if sid not in SESSIONS: raise HTTPException(404)
+    async def stream():
+        seq = after
+        while True:
+            for e in SESSIONS[sid][&quot;events&quot;][seq + 1:]:
+                seq = e[&quot;seq&quot;]
+                yield f&quot;id: {seq}\ndata: {json.dumps(e)}\n\n&quot;
+            if not follow or (SESSIONS[sid][&quot;events&quot;] and SESSIONS[sid][&quot;events&quot;][-1][&quot;type&quot;] == &quot;turn.completed&quot;
+                              and not SESSIONS[sid][&quot;busy&quot;]):
+                return
+            await asyncio.sleep(0.2)
+    return StreamingResponse(stream(), media_type=&quot;text/event-stream&quot;)
+
+# ---- a channel: GitHub issue comments start or continue a session -------------------------------
+def verify(secret: str, body: bytes, signature: str | None) -&gt; bool:
+    expected = &quot;sha256=&quot; + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+    return bool(signature) and hmac.compare_digest(expected, signature)
+
+@app.post(&quot;/channels/github&quot;)
+async def github(request: Request, tasks: BackgroundTasks, x_hub_signature_256: str | None = Header(None)):
+    raw = await request.body()
+    if not verify(os.environ.get(&quot;GITHUB_WEBHOOK_SECRET&quot;, &quot;&quot;), raw, x_hub_signature_256):
+        raise HTTPException(401, &quot;bad signature&quot;)
+    ev = json.loads(raw)
+    comment = ev.get(&quot;comment&quot;, {}).get(&quot;body&quot;, &quot;&quot;)
+    if &quot;@harness&quot; not in comment or ev.get(&quot;comment&quot;, {}).get(&quot;author_association&quot;) not in (&quot;OWNER&quot;, &quot;MEMBER&quot;, &quot;COLLABORATOR&quot;):
+        return {&quot;ignored&quot;: True}                   # only trusted users may start privileged work
+    address = f&quot;{ev[&#x27;repository&#x27;][&#x27;full_name&#x27;]}#{ev[&#x27;issue&#x27;][&#x27;number&#x27;]}&quot;   # one session per issue
+    sid = next((k for k, v in SESSIONS.items() if v[&quot;address&quot;] == address), None) or create_session({&quot;address&quot;: address})[&quot;session_id&quot;]
+    return send(sid, {&quot;text&quot;: comment.replace(&quot;@harness&quot;, &quot;&quot;).strip()}, tasks)</pre>
+<p>Wiring:</p>
+<ul>
+  <li>Replace <code>run_turn</code> with your durable harness from Chapter 11, calling <code>emit</code> for text deltas, tool calls and the reply. Store events in the journal, not in memory.</li>
+  <li>Make your CLI a client: create a session, post messages, read <code>/events</code>. Now the terminal is just one surface.</li>
+  <li>Expose the server (a small VM, or a tunnel), add the webhook to your repo with a secret, and comment <code>@harness</code> on an issue. Post replies back with the GitHub API from the trusted process only.</li>
+</ul>
+<h3>Stage 4 gate</h3>
+<ol>
+  <li>Start a task from a GitHub comment, kill the server mid-task, restart it, and watch the task finish and reply on the issue.</li>
+  <li>Reconnect a client with <code>?after=&lt;seq&gt;</code> mid-stream and confirm no event is missed or repeated.</li>
+</ol>
+
+<h2 id="exercises">6. Exercises</h2>
+<ol>
+  <li>Add a <code>fx ask</code>-style command: <code>harness ask --json "..."</code> that prints one JSON result for scripts and CI.</li>
+  <li>Implement a minimal ACP server over stdio and connect it to an editor that supports ACP.</li>
+  <li>Add a Telegram or Slack channel. Which parts of the GitHub channel could you reuse?</li>
+</ol>
+
+<h2 id="quiz">7. Check yourself</h2>
+<div class="widget quiz" data-quiz="qz12"></div>
+<script type="application/json" id="qz12">[
+{"q":"What is libfx?","o":["A logging library","fx's agent core as a JavaScript library, built as a native Node addon and as WebAssembly","A Zig standard library","A web UI"],"a":1,"e":"createFxAgent() runs the agent with your own tools; createFxTerminal() embeds the terminal."},
+{"q":"In eve, what does a channel do?","o":["Runs the model","Normalizes inbound transport, applies auth and delivery policy, and owns channel-local addresses","Stores memory","Compacts history"],"a":1,"e":"The harness never needs to know about Slack or GitHub."},
+{"q":"How does a reconnecting client avoid missing events?","o":["It restarts the session","It passes the last sequence number it saw and the server replays the rest from the stored log","It polls every second","It cannot"],"a":1,"e":"The event log is the source of truth."},
+{"q":"How does nanocode reach TypeScript, Swift and C?","o":["Rewrites per language","One Rust core built for native and WASM, with bindings in separate repos","Only TypeScript","Through HTTP only"],"a":1,"e":"Every reusable crate builds for native and wasm32."},
+{"q":"Why check author_association on a GitHub comment?","o":["For analytics","Public comments are untrusted; only collaborators may start privileged sessions","GitHub requires it","To save tokens"],"a":1,"e":"Foreman applies the same rule: only verified writers can start work."}
+]</script>
+
+<h2 id="refs">8. References</h2>
+<ul>
+  <li>fx: <code>README.md</code> (Embed and extend), <code>src/acp/</code>, <code>sdk/README.md</code>; <a href="https://vercel.com/changelog/fx-ai-sdk-harness-adapter">AI SDK harness adapter for fx</a>.</li>
+  <li>eve: <code>packages/eve/README.md</code>, <code>src/public/channels/</code>, <code>src/acp/adapter.ts</code>.</li>
+  <li>nanocode: <code>README.md</code>, <code>crates/README.md</code> (WASM, composition).</li>
+  <li>Pi: <code>packages/chord</code>; <a href="https://developers.cloudflare.com/agents/harnesses/pi/">Pi harness on Cloudflare Agents</a>.</li>
+  <li><a href="https://infoq.com/news/2026/10/vercel-zig-fx-agent">Vercel Labs open-sources fx</a>, InfoQ, Oct 2026.</li>
+</ul>
+
+<div class="navfoot"></div>
+</article></main>
+</div>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/book.js"></script>
+
+</body>
+</html>

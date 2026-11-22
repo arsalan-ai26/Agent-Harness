@@ -88,7 +88,7 @@ window.IE_CHAPTERS = [
 "title": "Surfaces: embedding, protocols and channels",
 "slug": "12-surfaces",
 "stage": 4,
-"ready": false
+"ready": true
 },
 {
 "n": "13",
