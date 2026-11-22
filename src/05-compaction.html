@@ -55,7 +55,7 @@
   <tr><td>fx</td><td>80% by default (10 to 80% allowed)</td><td>User messages and final replies exactly</td><td>Handles M1, T1 for every turn and tool call; a lint pass checks notes against saved turns; full text stays on disk for lookup</td><td><code>src/core/compactor/</code></td></tr>
   <tr><td>Pi CLI</td><td>Window minus 16,384 reserve tokens</td><td>About 20,000 recent tokens</td><td>Branch summarization when you move in the session tree</td><td><code>coding-agent/src/core/compaction/</code></td></tr>
   <tr><td>Pi Durable</td><td>Background threshold, blocking threshold, or overflow</td><td>Per model (<code>keepRecentTokens</code>, e.g. 8,000 for a 32k model)</td><td>Background compaction runs while the conversation keeps working</td><td><code>durable/docs/spec.md</code> section 8.7</td></tr>
-  <tr><td>nanocode</td><td>Per backend</td><td>Per backend</td><td>Each vendor's own compaction prompt; Codex uses OpenAI's server-side compact endpoint</td><td><code>crates/backends/*/prompts/compact.md</code></td></tr>
+  <tr><td>nanocode</td><td>Per backend</td><td>Per backend</td><td>Each vendor driver owns compaction with its own prompt and a per-model auto-compact token limit</td><td><code>crates/backends/*/prompts/compact.md</code></td></tr>
 </table></div>
 
 <h3>eve: compaction with a size contract</h3>
@@ -72,7 +72,7 @@
   <tr><td>Late trigger (90%)</td><td>Uses the window fully</td><td>Risk of overflow on one big result</td><td>eve</td></tr>
   <tr><td>Verified summary</td><td>Catches invented facts</td><td>Extra pass, more code</td><td>fx</td></tr>
   <tr><td>Background compaction</td><td>No pause for the user</td><td>Summary may race with new work</td><td>Pi Durable</td></tr>
-  <tr><td>Server-side opaque compaction</td><td>Best quality for that vendor's model</td><td>Cannot inspect or reuse with another model</td><td>Codex via nanocode</td></tr>
+  <tr><td>Vendor-specific compaction</td><td>Matches what each model was trained with</td><td>One compactor per vendor to maintain; summaries not portable</td><td>nanocode (Codex CLI's server-side path is the extreme case)</td></tr>
   <tr><td>No compaction, fresh sessions plus files</td><td>No summary drift</td><td>Agent must write progress files</td><td>Early Pi, Anthropic's long-running harness</td></tr>
 </table></div>
 
