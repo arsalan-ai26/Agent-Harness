@@ -109,6 +109,6 @@ window.IE_CHAPTERS = [
 "title": "Capstone: benchmark and retrospective",
 "slug": "15-capstone",
 "stage": 5,
-"ready": false
+"ready": true
 }
 ];

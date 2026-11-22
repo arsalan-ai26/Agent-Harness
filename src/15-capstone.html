@@ -1,0 +1,128 @@
+<div class="kicker">Stage 5 · Software factory · Chapter 15</div>
+<h1>Capstone: benchmark and retrospective</h1>
+<p class="lede">Sixteen weeks ago the loop was 120 lines. Now it has a provider layer, typed tools, cache-stable context, compaction, session trees, a safety gate, skills and hooks, subagents and Code Mode, evals, durability, a server, channels and a factory. This chapter measures it honestly against Pi and fx on the same tasks, writes down what each design choice bought, and tags version 1.0.</p>
+<div class="meta">
+  <span class="chip">Level: advanced</span>
+  <span class="chip">Time: about 20 hours</span>
+  <span class="chip">Needs: all earlier chapters</span>
+  <span class="chip">Facts checked: 22 Nov 2026</span>
+</div>
+
+<h2 id="why">1. Why compare against real harnesses</h2>
+<p>Your weekly eval tells you whether your harness improved. It does not tell you whether it is good. Running Pi and fx on the same tasks, with the same model where they allow it, separates three things: the model, the harness and the task. Several 2026 papers make the same point: benchmark scores mix model and harness, so honest comparisons hold one fixed while changing the other (<a href="https://arxiv.org/abs/2608.26218">Same model, different harness</a>; <a href="https://arxiv.org/pdf/2610.04433">What does a harness buy?</a>).</p>
+<div class="box watch">
+  <span class="lbl">Safety</span>
+  <p>Pi has no permission gate and <code>fx ask --full-access</code> turns fx's checks off. Run every harness in this chapter inside a container with only the task's copy of the repository mounted.</p>
+</div>
+
+<h2 id="method">2. Method</h2>
+<ol>
+  <li><strong>Tasks.</strong> Your test tasks from Chapter 1 and 10, plus at least 10 new ones you have never tuned against (a holdout). Optionally add a subset of Terminal-Bench 2.0 or Alibaba's Terminal-Bench Pro through their official runners.</li>
+  <li><strong>Models.</strong> Use the same model for all three where possible (fx talks to one provider at a time through Vercel AI Gateway, a subscription or any OpenAI-compatible endpoint; Pi supports most providers). Then repeat with each harness's preferred model.</li>
+  <li><strong>Repeats.</strong> At least 3 runs per task per harness. Report pass rate, mean time, mean cost and failure categories.</li>
+  <li><strong>Failure analysis.</strong> Read every failed transcript and label it: wrong plan, wrong edit, gave up, stopped early, tool misuse, environment, timeout.</li>
+</ol>
+
+<h2 id="build">3. Build: the comparison runner</h2>
+<pre>&quot;&quot;&quot;Capstone: run three harnesses headless on the same tasks, same model where possible, and compare.&quot;&quot;&quot;
+import json, shutil, subprocess, sys, tempfile, time
+from pathlib import Path
+
+# Each harness is a command that takes the prompt as its last argument and works in the current directory.
+# Run every one of them inside a container (Chapter 7): fx in full-access mode and Pi have no gate.
+HARNESSES = {
+    &quot;mine&quot;: [&quot;harness&quot;, &quot;ask&quot;, &quot;--json&quot;],          # your CLI from Chapter 12
+    &quot;pi&quot;:   [&quot;pi&quot;, &quot;--print&quot;],                     # Pi&#x27;s non-interactive mode
+    &quot;fx&quot;:   [&quot;fx&quot;, &quot;ask&quot;, &quot;--json&quot;],               # fx&#x27;s scripting mode; final answer in .final_output
+}
+
+def run(harness, cmd, task, repo, timeout=1800):
+    work = Path(tempfile.mkdtemp(prefix=f&quot;cap-{harness}-{task[&#x27;id&#x27;]}-&quot;))
+    shutil.copytree(repo, work, dirs_exist_ok=True)
+    t0 = time.time()
+    try:
+        p = subprocess.run(cmd + [task[&quot;prompt&quot;]], cwd=work, capture_output=True, text=True, timeout=timeout)
+        out, err = p.stdout[-4000:], p.returncode
+    except subprocess.TimeoutExpired:
+        out, err = &quot;timeout&quot;, -1
+    passed = subprocess.run([&quot;bash&quot;, str(task[&quot;check&quot;])], cwd=work, capture_output=True).returncode == 0
+    shutil.rmtree(work, ignore_errors=True)
+    return {&quot;harness&quot;: harness, &quot;task&quot;: task[&quot;id&quot;], &quot;pass&quot;: passed, &quot;secs&quot;: round(time.time() - t0, 1),
+            &quot;exit&quot;: err, &quot;output_tail&quot;: out[-300:]}
+
+def main(tasks_dir, repo, repeats=3, out=&quot;capstone.json&quot;):
+    tasks = [{&quot;id&quot;: d.name, &quot;prompt&quot;: (d / &quot;prompt.md&quot;).read_text(), &quot;check&quot;: d / &quot;check.sh&quot;}
+             for d in sorted(Path(tasks_dir).resolve().iterdir()) if (d / &quot;prompt.md&quot;).exists()]
+    rows = [run(h, cmd, t, repo) for t in tasks for h, cmd in HARNESSES.items() for _ in range(repeats)]
+    Path(out).write_text(json.dumps(rows, indent=1))
+    print(f&quot;{&#x27;harness&#x27;:8} {&#x27;pass rate&#x27;:&gt;9} {&#x27;mean secs&#x27;:&gt;9}&quot;)
+    for h in HARNESSES:
+        r = [x for x in rows if x[&quot;harness&quot;] == h]
+        print(f&quot;{h:8} {sum(x[&#x27;pass&#x27;] for x in r) / len(r):9.0%} {sum(x[&#x27;secs&#x27;] for x in r) / len(r):9.1f}&quot;)
+
+if __name__ == &quot;__main__&quot;:
+    main(*sys.argv[1:3])</pre>
+<p>Run it as <code>python capstone.py tasks/ scratch-repo/</code>. Add token and cost columns where a harness reports them (your own harness and fx's JSON output; Pi's session files record usage).</p>
+
+<h2 id="report">4. The results table to publish</h2>
+<div class="tbl"><table>
+  <tr><th>Harness</th><th>Model</th><th>Pass rate (train)</th><th>Pass rate (holdout)</th><th>Mean time</th><th>Mean cost</th><th>Top failure</th></tr>
+  <tr><td>Yours</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+  <tr><td>Pi</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+  <tr><td>fx</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+</table></div>
+<p class="note">Fill this in with your measured numbers. If your harness wins on your training tasks but loses on the holdout, say so; that is the most useful finding in the book.</p>
+
+<h2 id="retro">5. Retrospective: what each choice bought</h2>
+<p>For each feature, write the measured effect from your weekly evals and one sentence on whether you would build it again.</p>
+<div class="tbl"><table>
+  <tr><th>Chapter</th><th>Choice</th><th>Borrowed from</th><th>Measured effect</th><th>Keep?</th></tr>
+  <tr><td>1</td><td>Step function loop</td><td>eve</td><td></td><td></td></tr>
+  <tr><td>2</td><td>Two provider adapters, retries, cache accounting</td><td>Pi, eve, nanocode</td><td></td><td></td></tr>
+  <tr><td>3</td><td>Bounded output, multi-edit, background jobs</td><td>Pi, eve</td><td></td><td></td></tr>
+  <tr><td>4</td><td>Stable prefix, appended updates, folder rules</td><td>fx, Codex</td><td></td><td></td></tr>
+  <tr><td>5</td><td>Compaction with handles and lint</td><td>fx, eve</td><td></td><td></td></tr>
+  <tr><td>6</td><td>Session tree, memory outside history</td><td>Pi, eve</td><td></td><td></td></tr>
+  <tr><td>7</td><td>Rules, evidence-checked classifier, Docker</td><td>fx, eve, nanocode</td><td></td><td></td></tr>
+  <tr><td>8</td><td>Skills, hooks, MCP</td><td>eve, fx, Pi</td><td></td><td></td></tr>
+  <tr><td>9</td><td>Subagents and Code Mode</td><td>nanocode, Pi</td><td></td><td></td></tr>
+  <tr><td>10</td><td>Paired evals and traces</td><td>Pi, eve</td><td></td><td></td></tr>
+  <tr><td>11</td><td>Journal with the effect sandwich</td><td>Pi Durable</td><td></td><td></td></tr>
+  <tr><td>12</td><td>Session server and channels</td><td>eve, fx</td><td></td><td></td></tr>
+  <tr><td>13 to 14</td><td>Factory stations, gates, improvement loop</td><td>Foreman, StrongDM, Meta-Harness</td><td></td><td></td></tr>
+</table></div>
+
+<h2 id="lessons">6. Lessons the four harnesses teach</h2>
+<ul>
+  <li><strong>Pi:</strong> a small core you can read in an afternoon beats a large one you cannot. Add a feature when its absence costs you, not before.</li>
+  <li><strong>fx:</strong> treat your own outputs as untrusted. fx checks its summaries against the record and makes its safety reviewer prove its claims.</li>
+  <li><strong>eve:</strong> shape the loop for durability from day one, and keep secrets out of the place where the model's commands run.</li>
+  <li><strong>nanocode:</strong> respect each model's native harness, and state your invariants as numbers you can test.</li>
+  <li><strong>Pi Durable:</strong> write the specification before the code when correctness is hard. The effect sandwich fits on a napkin and prevents a class of bugs.</li>
+  <li><strong>Chinese practice:</strong> every rule must trace to a failure, and the harness, not the model, is where most teams now compete.</li>
+</ul>
+
+<h2 id="release">7. Release checklist for v1.0</h2>
+<ul>
+  <li>README with a 60-second quick start, the results table and a link to this book.</li>
+  <li>A container image that runs the harness safely by default.</li>
+  <li>The eval suite and holdout in the repo, with instructions to reproduce your numbers.</li>
+  <li>An AGENTS.md where every rule names the failure that created it.</li>
+  <li>A tagged release and a final post: what you built, what it scores, what you would do differently.</li>
+</ul>
+
+<h2 id="next">8. Where to go next</h2>
+<ul>
+  <li>Contribute one fix upstream to Pi, fx, eve or nanocode, in a component you now understand deeply.</li>
+  <li>Read the research frontier: harness search (Meta-Harness), natural-language harnesses (NLAH), harness-aware evaluation, and test-time harness evolution.</li>
+  <li>Run your factory on a real project for a month and publish the merge-unchanged rate.</li>
+</ul>
+
+<h2 id="refs">9. References</h2>
+<ul>
+  <li>Pi: <code>pi --print</code> (non-interactive mode), <a href="https://github.com/earendil-works/pi">earendil-works/pi</a>.</li>
+  <li>fx: <code>fx ask --json</code>, <a href="https://github.com/vercel-labs/fx">vercel-labs/fx</a>.</li>
+  <li><a href="https://arxiv.org/pdf/2609.00006">Harness Engineering: a source-code study of eleven coding-agent systems</a>, 2026.</li>
+  <li><a href="https://www.preprints.org/manuscript/202609.2140">Harness-aware evaluation of LLM agents</a>, 2026.</li>
+  <li>Terminal-Bench: Merrill et al., <a href="https://arxiv.org/abs/2601.11868">arXiv 2601.11868</a>, 2026.</li>
+</ul>
