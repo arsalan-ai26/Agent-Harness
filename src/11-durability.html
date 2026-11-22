@@ -1,0 +1,157 @@
+<div class="kicker">Stage 4 · Durability and surfaces · Chapter 11</div>
+<h1>Durable execution</h1>
+<p class="lede">A terminal agent dies with its process. A durable agent survives crashes, redeploys and a laptop lid, and can wait days for a human. This is where eve, Pi Durable and nanocode converged independently in 2026, each in its own way. This chapter reads Pi Durable's 7,300-line specification, eve's workflow-backed sessions and nanocode's journaled runtime, then builds a SQLite journal with the "effect sandwich" and tests it by crashing the agent mid-task.</p>
+<div class="meta">
+  <span class="chip">Level: advanced</span>
+  <span class="chip">Time: about 20 hours with the build</span>
+  <span class="chip">Needs: Chapters 1, 6 and 10</span>
+  <span class="chip">Code read at: Pi fb248c7, eve 5c52fbf, nanocode 015cbfa</span>
+</div>
+
+<div class="box skip">
+  <span class="lbl">Before you start: skip check</span>
+  <ol>
+    <li>The agent sends an email, then the process dies before saving that it did. On restart, what should happen?</li>
+    <li>What is the difference between replaying a model call and repeating it?</li>
+    <li>Why can only some tool calls be safely re-run?</li>
+  </ol>
+  <details><summary>Answers</summary><ol>
+    <li>Not send it again blindly. The harness knows it started (intent recorded) but not whether it finished, so it tells the agent the outcome is unknown and lets it check, or polls an external handle.</li>
+    <li>Replaying returns the recorded result from the journal; repeating calls the model again, costs money and may return something different.</li>
+    <li>Only idempotent ones (reads, pure computations, "set X to 5") give the same result when run twice. "Append a line", "charge a card" or "send an email" do not.</li>
+  </ol></details>
+</div>
+
+<h2 id="problem">1. The problem in one picture</h2>
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 230" width="760" style="max-width:100%;height:auto" role="img" aria-label="The effect sandwich: commit intent, perform effect, commit outcome; a crash between them leaves an unknown outcome">
+  <defs><marker id="g1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="24" y="40" width="190" height="64" rx="8" style="fill:var(--kv-s);stroke:var(--kv)"/><text x="119" y="66" text-anchor="middle" style="fill:var(--ink);font-size:12px;font-weight:600">1. Commit intent</text><text x="119" y="86" text-anchor="middle" style="fill:var(--ink2);font-size:10px">journal: key, phase=intent</text>
+  <rect x="284" y="40" width="190" height="64" rx="8" style="fill:var(--dec-s);stroke:var(--dec)"/><text x="379" y="66" text-anchor="middle" style="fill:var(--ink);font-size:12px;font-weight:600">2. Perform effect</text><text x="379" y="86" text-anchor="middle" style="fill:var(--ink2);font-size:10px">model call, tool, API</text>
+  <rect x="544" y="40" width="190" height="64" rx="8" style="fill:var(--kv-s);stroke:var(--kv)"/><text x="639" y="66" text-anchor="middle" style="fill:var(--ink);font-size:12px;font-weight:600">3. Commit outcome</text><text x="639" y="86" text-anchor="middle" style="fill:var(--ink2);font-size:10px">journal: phase=done, result</text>
+  <g style="fill:none;stroke:var(--ink2);stroke-width:1.3"><path d="M214 72H282" marker-end="url(#g1)"/><path d="M474 72H542" marker-end="url(#g1)"/></g>
+  <path d="M508 112V140" style="stroke:var(--bad);stroke-width:2"/><text x="508" y="158" text-anchor="middle" style="fill:var(--bad);font-size:11px;font-weight:600">crash here</text>
+  <text x="24" y="190" style="fill:var(--ink);font-size:12px">On restart: done → replay the recorded result. Intent only → the effect may have happened:</text>
+  <text x="24" y="210" style="fill:var(--ink2);font-size:12px">re-run if idempotent, poll an external handle, or tell the agent the outcome is unknown.</text>
+</svg></div>
+<figcaption>Pi Durable calls this the effect sandwich. Every durable harness implements some version of it.</figcaption>
+</figure>
+
+<h2 id="tour">2. Code tour</h2>
+<h3>Pi Durable: a specification first</h3>
+<p><code>packages/durable/docs/spec.md</code> is normative and long; read sections 1, 4, 5.2 and 8. Its core rule: a Session atomically commits immutable entries, full task records and documents, and only committed state is observable. Selected invariants: one commit is atomic across all writes; all visible progress is durable (except explicitly deferred commits, which may be lost within a bounded window); <strong>external effects do not run inside the mutation transaction</strong>; entries and IDs are never reused. Work is modelled as tasks, durable state machines with phases; a terminal task record is the result receipt. Section 5.2 is the effect sandwich: commit the intent phase, perform the external effect, commit the outcome or next phase; reopening in an intent phase means the effect may have happened, so the handler retries safely, polls an external handle, or records interruption. Storage backends: memory, SQLite, JSONL, IndexedDB (<code>src/storage/</code>), each passing a conformance suite. Section 13 lists non-goals, including no automatic checkpoint heuristic and no forced termination of non-cooperative extension code.</p>
+<p>Field note: a team killed a Pi Durable agent right after a Gmail write and found two drafts; the sandwich detects the risk, but only you can make the effect idempotent (<a href="https://www.withone.ai/blog/pi-durable-crash-safe-one-cli/md">withone.ai</a>).</p>
+<h3>eve: the workflow engine is the journal</h3>
+<p>Every eve session is one workflow on the open-source Workflow SDK (<code>docs/concepts/execution-model-and-durability.mdx</code>). The kernel from Chapter 1 returns <code>{ session, next }</code>; each step is saved; a crash replays from the last step. Locally, runs persist under <code>.eve/.workflow-data</code>; self-hosted worlds include Postgres. Durability brings new problems eve solves explicitly: an idle session moves to a new deployment on its next message; a session built by an older eve version is "stranded" and retired safely; after compaction the session moves to a fresh workflow run so its run history stays bounded. On Vercel, the same mechanism runs other harnesses durably too: Vercel documents running Pi, fx, OpenCode, Claude Code and Codex this way.</p>
+<h3>nanocode: journaled calls everywhere</h3>
+<p>The README promise: every model call and tool call is journaled, so a turn finishes after its process dies. <code>crates/core/durability-core</code> holds the <code>StateStore</code>, content-addressed payloads and a deterministic state machine; each backend defines its own checkpoint format; stores run on JSONL, SQLite, Postgres, Durable Objects or D1. Subagents are durable sessions too (with only 2 resident by default when durable).</p>
+
+<h2 id="decisions">3. Design decisions compared</h2>
+<div class="tbl"><table>
+  <tr><th>Approach</th><th>Who</th><th>Pro</th><th>Con</th></tr>
+  <tr><td>Transactional session library; you host it</td><td>Pi Durable</td><td>Portable (Node, Cloudflare, browser); precise semantics</td><td>You build hosting, routing, upgrades</td></tr>
+  <tr><td>Workflow engine steps</td><td>eve</td><td>Durability, deploy handoff and dashboards come with the platform</td><td>Bound to Workflow SDK semantics and eve versions</td></tr>
+  <tr><td>Journal inside the runtime</td><td>nanocode</td><td>Same runtime native and in WASM</td><td>Large, complex system</td></tr>
+  <tr><td>No durability; resume from session file</td><td>Pi CLI, fx</td><td>Simple</td><td>A crash loses the running turn</td></tr>
+</table></div>
+
+<h2 id="research">4. Research and the Chinese view</h2>
+<ul>
+  <li><strong>Durable execution is an old idea.</strong> Workflow engines (Temporal, Step Functions) have used journals and replay for years; 2026 harnesses apply them to agents, where every model call is a slow, expensive, non-deterministic effect worth recording.</li>
+  <li><strong>Long-horizon work needs it.</strong> Anthropic's long-running harness and the Dive into Claude Code paper both name horizon scaling (from single sessions to multi-day programs) as an open direction.</li>
+  <li><strong>Chinese coverage.</strong> Taiwanese and Chinese tech press covered Pi Durable's release as an agent framework that reads saved progress after a restart and handles unfinished work, with several conversations at once and several people joining one task (<a href="https://www.ithome.com.tw/news/179369">iThome</a>). Cloudflare's Agents SDK already runs Pi Durable as a harness (<a href="https://developers.cloudflare.com/changelog/post/2026-10-02-pi-harness/">Cloudflare</a>).</li>
+</ul>
+
+<h2 id="build">5. Build: a journal with the effect sandwich</h2>
+<pre>&quot;&quot;&quot;Durable execution: journal every model and tool call; commit intent, do the effect, commit the outcome.&quot;&quot;&quot;
+import json, sqlite3, time
+
+class Journal:
+    def __init__(self, path=&quot;harness.db&quot;):
+        self.db = sqlite3.connect(path, isolation_level=None)       # autocommit; every write is durable
+        self.db.execute(&quot;PRAGMA journal_mode=WAL&quot;)
+        self.db.execute(&quot;&quot;&quot;CREATE TABLE IF NOT EXISTS effects (
+            session TEXT, key TEXT, phase TEXT, payload TEXT, ts REAL, PRIMARY KEY (session, key))&quot;&quot;&quot;)
+        self.db.execute(&quot;&quot;&quot;CREATE TABLE IF NOT EXISTS checkpoints (
+            session TEXT PRIMARY KEY, step INTEGER, state TEXT, ts REAL)&quot;&quot;&quot;)
+
+    # -- the effect sandwich (Pi Durable spec, section 5.2) ---------------------------------------
+    def effect(self, session, key, fn, idempotent=False):
+        &quot;&quot;&quot;Run fn() at most once per (session, key), unless it is idempotent.
+        key must be deterministic, e.g. f&quot;step{n}:tool:{call_id}&quot; or f&quot;step{n}:model&quot;.&quot;&quot;&quot;
+        row = self.db.execute(&quot;SELECT phase, payload FROM effects WHERE session=? AND key=?&quot;, (session, key)).fetchone()
+        if row and row[0] == &quot;done&quot;:
+            return json.loads(row[1])                       # replay: the effect already happened, reuse its result
+        if row and row[0] == &quot;intent&quot; and not idempotent:
+            # We crashed between starting and recording. The effect may or may not have happened.
+            outcome = {&quot;interrupted&quot;: True, &quot;note&quot;: f&quot;&#x27;{key}&#x27; was started before a crash and its outcome is unknown. &quot;
+                       &quot;Check the current state before repeating it.&quot;}
+            self._done(session, key, outcome)
+            return outcome
+        self.db.execute(&quot;INSERT OR REPLACE INTO effects VALUES (?,?,?,?,?)&quot;, (session, key, &quot;intent&quot;, None, time.time()))
+        result = fn()                                          # the external effect, outside any transaction
+        self._done(session, key, result)
+        return result
+
+    def _done(self, session, key, result):
+        self.db.execute(&quot;UPDATE effects SET phase=&#x27;done&#x27;, payload=? WHERE session=? AND key=?&quot;,
+                        (json.dumps(result, default=str), session, key))
+
+    # -- state checkpoints at step boundaries (eve&#x27;s step function) ------------------------------
+    def save(self, session, step, state: dict):
+        self.db.execute(&quot;INSERT OR REPLACE INTO checkpoints VALUES (?,?,?,?)&quot;,
+                        (session, step, json.dumps(state, default=str), time.time()))
+
+    def load(self, session):
+        row = self.db.execute(&quot;SELECT step, state FROM checkpoints WHERE session=?&quot;, (session,)).fetchone()
+        return (row[0], json.loads(row[1])) if row else (0, None)
+
+def run_durable(journal, session, initial_state, step_fn, done):
+    &quot;&quot;&quot;Resume from the last checkpoint, then step until done. step_fn(state, n, effect) -&gt; state.
+    Inside step_fn, every model call and tool call goes through effect(key, fn, idempotent).&quot;&quot;&quot;
+    n, state = journal.load(session)
+    state = state or initial_state
+    while not done(state):
+        effect = lambda key, fn, idempotent=False, n=n: journal.effect(session, f&quot;step{n}:{key}&quot;, fn, idempotent)
+        state = step_fn(state, n, effect)
+        n += 1
+        journal.save(session, n, state)                      # the step boundary is the checkpoint
+    return state</pre>
+<p>Wiring:</p>
+<ul>
+  <li>Your <code>step()</code> from Chapter 1 becomes <code>step_fn(state, n, effect)</code>. Wrap the model call as <code>effect("model", lambda: llm.complete(...))</code> and each tool call as <code>effect(f"tool:{call.id}", lambda: call_tool(...), idempotent=tool.idempotent)</code>.</li>
+  <li>Mark <code>read</code>, <code>grep</code>, <code>recall</code> idempotent. Leave <code>bash</code>, <code>write</code>, <code>edit</code> non-idempotent unless you can prove otherwise.</li>
+  <li>State must be JSON: messages, checkpoint text, counters. Anything else (open files, live processes) is not state; recreate it on start.</li>
+</ul>
+<h3>Stage 4 gate: kill it ten times</h3>
+<ol>
+  <li>Run a long eval task. At 10 random moments, <code>kill -9</code> the process and restart it with the same session ID.</li>
+  <li>Check: the task finishes; no model call is paid twice for a completed step; no non-idempotent tool ran twice; every interrupted effect produced the "outcome unknown" note.</li>
+  <li>Post the result, and the one bug you found. There is always one.</li>
+</ol>
+
+<h2 id="exercises">6. Exercises</h2>
+<ol>
+  <li>Add an idempotency key to a <code>create_issue</code> tool (search for an issue with the key in its body before creating one). Now it can be safely re-run.</li>
+  <li>Add a <code>wait_for_human</code> effect that parks the session in the journal and resumes when an answer row appears, even days later.</li>
+  <li>Implement the background compaction from Chapter 5 as its own durable task.</li>
+</ol>
+
+<h2 id="quiz">7. Check yourself</h2>
+<div class="widget quiz" data-quiz="qz11"></div>
+<script type="application/json" id="qz11">[
+{"q":"What does Pi Durable's effect sandwich consist of?","o":["Retry, backoff, retry","Commit intent, perform the external effect, commit the outcome","Lock, write, unlock","Plan, act, review"],"a":1,"e":"Reopening in the intent phase signals that the effect may have happened."},
+{"q":"Pi Durable's invariant about external effects says they:","o":["Run inside the commit transaction","Do not run inside the Session mutation transaction","Are forbidden","Are always idempotent"],"a":1,"e":"Effects take time and can fail independently; transactions stay short and local."},
+{"q":"How is an eve session made durable?","o":["Each session runs as a workflow on the Workflow SDK that saves progress at step boundaries","It writes a JSONL file","It keeps a hot standby process","It does not survive crashes"],"a":0,"e":"The kernel returns { session, next }; the engine checkpoints each step."},
+{"q":"On restart, a journal entry shows intent but no outcome for 'send_email'. What is safest?","o":["Send it again","Report the outcome as unknown so the agent checks before repeating, or poll an external handle","Delete the entry","Mark it done"],"a":1,"e":"Blind repetition can double the effect."},
+{"q":"Which state belongs in a checkpoint?","o":["Open file handles","JSON-serializable data such as messages, checkpoint text and counters","Running subprocesses","Network sockets"],"a":1,"e":"Anything that cannot be serialized must be recreated on start."}
+]</script>
+
+<h2 id="refs">8. References</h2>
+<ul>
+  <li>Pi Durable: <code>packages/durable/docs/spec.md</code> (sections 1, 4, 5.2, 8, 13), <code>README.md</code>, <code>src/storage/</code>.</li>
+  <li>eve: <code>docs/concepts/execution-model-and-durability.mdx</code>; <a href="https://vercel.com/docs/agent-harnesses/eve">Running eve agents durably</a>.</li>
+  <li>nanocode: <code>README.md</code>, <code>crates/README.md</code> (durability), <code>crates/core/durability-core</code>.</li>
+  <li><a href="https://www.withone.ai/blog/pi-durable-crash-safe-one-cli/md">We killed a Pi Durable agent after a Gmail write</a>, withone.ai.</li>
+  <li><a href="https://developers.cloudflare.com/changelog/post/2026-10-02-pi-harness/">Run the Pi Durable harness on Cloudflare</a>, Cloudflare, Oct 2026.</li>
+</ul>

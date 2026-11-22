@@ -81,7 +81,7 @@ window.IE_CHAPTERS = [
 "title": "Durable execution",
 "slug": "11-durability",
 "stage": 4,
-"ready": false
+"ready": true
 },
 {
 "n": "12",
