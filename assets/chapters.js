@@ -39,7 +39,7 @@ window.IE_CHAPTERS = [
 "title": "Context management and compaction",
 "slug": "05-compaction",
 "stage": 2,
-"ready": false
+"ready": true
 },
 {
 "n": "6",

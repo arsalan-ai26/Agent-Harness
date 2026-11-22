@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>5. Context management and compaction</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&family=JetBrains+Mono:wght@400;600&display=swap">
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-chapter="5" data-stage="2">
+<div class="topbar" style="padding-left:0;padding-right:0"><a href="../index.html">← Build an Agent Harness</a><span>Stage 2 · Chapter 5</span></div>
+<div class="shell">
+<nav class="toc" aria-label="Chapter contents"></nav>
+<main><article>
+<div class="kicker">Stage 2 · Context · Chapter 5</div>
+<h1>Context management and compaction</h1>
+<p class="lede">Every long session eventually fills the context window. Compaction replaces old turns with a summary so the agent can keep working. It is also where harnesses quietly lose information. This chapter reads four real compactors with their exact thresholds, shows why fx verifies its own summaries and why Pi Durable compacts in the background, then builds a compactor with turn handles, a lint pass and recallable raw history.</p>
+<div class="meta">
+  <span class="chip">Level: intermediate to advanced</span>
+  <span class="chip">Time: about 20 hours with the build</span>
+  <span class="chip">Needs: Chapters 2 and 4</span>
+  <span class="chip">Code read at: Pi fb248c7, eve 5c52fbf, fx cbe7daf, nanocode 015cbfa</span>
+</div>
+
+<div class="box skip">
+  <span class="lbl">Before you start: skip check</span>
+  <ol>
+    <li>Why not simply drop the oldest messages when the window is full?</li>
+    <li>A summary says "tests passed in step 14", but they never did. How could the harness catch that?</li>
+    <li>Why must compaction never split a tool call from its tool result?</li>
+  </ol>
+  <details><summary>Answers</summary><ol>
+    <li>The oldest messages usually hold the goal and the user's constraints. Dropping them loses the task; summarizing keeps the meaning.</li>
+    <li>Give every turn and tool call a handle, ask the summary to cite handles, and check that each cited handle exists and supports the claim (fx's lint pass).</li>
+    <li>Providers reject histories with a tool result whose call is missing, or a call with no result. The kept tail must start at a clean boundary.</li>
+  </ol></details>
+</div>
+
+<h2 id="why">1. The problem</h2>
+<p>A coding agent's context grows with every tool result. Manus measured about 50 tool calls per task and about 100 input tokens for every output token. Long before the window is full, quality drops (often called context rot) and cost rises. The harness has four tools against this, in rising order of loss:</p>
+<ol>
+  <li><strong>Bound tool output</strong> at the source (Chapter 3: 2,000 lines or 50 KB, full output saved to a file).</li>
+  <li><strong>Offload</strong>: keep large content in files and keep only the path in context (Manus calls this restorable compression).</li>
+  <li><strong>Isolate</strong>: do exploration in a subagent and bring back only its conclusion (Chapter 9).</li>
+  <li><strong>Compact</strong>: summarize old turns into a checkpoint and keep a recent tail word for word.</li>
+</ol>
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 210" width="760" style="max-width:100%;height:auto" role="img" aria-label="Before and after compaction">
+  <text x="24" y="22" style="fill:var(--ink);font-size:13px;font-weight:600">Before: 90% of the window</text>
+  <rect x="24" y="32" width="64" height="36" style="fill:var(--kv-s);stroke:var(--kv)"/><text x="56" y="55" text-anchor="middle" style="fill:var(--ink);font-size:10px">prefix</text>
+  <rect x="88" y="32" width="450" height="36" style="fill:var(--panel2);stroke:var(--line)"/><text x="313" y="55" text-anchor="middle" style="fill:var(--ink2);font-size:11px">old turns: goal, decisions, tool results</text>
+  <rect x="538" y="32" width="150" height="36" style="fill:var(--dec-s);stroke:var(--dec)"/><text x="613" y="55" text-anchor="middle" style="fill:var(--ink);font-size:11px">recent tail</text>
+  <rect x="688" y="32" width="48" height="36" style="fill:var(--bg);stroke:var(--line);stroke-dasharray:3 3"/>
+  <text x="24" y="112" style="fill:var(--ink);font-size:13px;font-weight:600">After: under 50%</text>
+  <rect x="24" y="122" width="64" height="36" style="fill:var(--kv-s);stroke:var(--kv)"/><text x="56" y="145" text-anchor="middle" style="fill:var(--ink);font-size:10px">prefix</text>
+  <rect x="88" y="122" width="96" height="36" style="fill:var(--pre-s);stroke:var(--pre)"/><text x="136" y="145" text-anchor="middle" style="fill:var(--ink);font-size:11px">checkpoint</text>
+  <rect x="184" y="122" width="150" height="36" style="fill:var(--dec-s);stroke:var(--dec)"/><text x="259" y="145" text-anchor="middle" style="fill:var(--ink);font-size:11px">recent tail</text>
+  <rect x="334" y="122" width="402" height="36" style="fill:var(--bg);stroke:var(--line);stroke-dasharray:3 3"/><text x="535" y="145" text-anchor="middle" style="fill:var(--ink2);font-size:11px">free room for the next turns</text>
+  <rect x="88" y="170" width="450" height="30" rx="4" style="fill:none;stroke:var(--line);stroke-dasharray:4 3"/>
+  <text x="100" y="190" style="fill:var(--ink2);font-size:11px">raw old turns archived on disk, recallable by handle</text>
+</svg></div>
+<figcaption>Compaction trades a long middle for a short checkpoint. The prefix stays cached; the raw history leaves the context but not the disk.</figcaption>
+</figure>
+
+<h2 id="tour">2. Four compactors, with their real numbers</h2>
+<div class="tbl"><table>
+  <tr><th>Harness</th><th>Trigger</th><th>Kept word for word</th><th>Distinctive idea</th><th>Where</th></tr>
+  <tr><td>eve</td><td>90% of the window (configurable)</td><td>Recent messages up to 20,000 tokens or half the threshold; their tool results cut to 2,000 chars</td><td>Must land under 50% of the window; falls back to text-only tail, then summary only; then moves the idle session to a fresh workflow run</td><td><code>src/harness/compaction/engine.ts</code>, <code>config.ts</code></td></tr>
+  <tr><td>fx</td><td>80% by default (10 to 80% allowed)</td><td>User messages and final replies exactly</td><td>Handles M1, T1 for every turn and tool call; a lint pass checks notes against saved turns; full text stays on disk for lookup</td><td><code>src/core/compactor/</code></td></tr>
+  <tr><td>Pi CLI</td><td>Window minus 16,384 reserve tokens</td><td>About 20,000 recent tokens</td><td>Branch summarization when you move in the session tree</td><td><code>coding-agent/src/core/compaction/</code></td></tr>
+  <tr><td>Pi Durable</td><td>Background threshold, blocking threshold, or overflow</td><td>Per model (<code>keepRecentTokens</code>, e.g. 8,000 for a 32k model)</td><td>Background compaction runs while the conversation keeps working</td><td><code>durable/docs/spec.md</code> section 8.7</td></tr>
+  <tr><td>nanocode</td><td>Per backend</td><td>Per backend</td><td>Each vendor's own compaction prompt; Codex uses OpenAI's server-side compact endpoint</td><td><code>crates/backends/*/prompts/compact.md</code></td></tr>
+</table></div>
+
+<h3>eve: compaction with a size contract</h3>
+<p>eve measures size against the provider's last reported input tokens plus an estimate for new messages, and scales its character estimate by the ratio between the two (<code>DEFAULT_ESTIMATE_RATIO = 1.6</code> until calibrated). The summary prompt separates completed progress and decisions from remaining work and keeps constraints, preferences, data and references. A later compaction passes the previous summary in full and replaces it. Memory stays outside history, so the summarizer never sees it. If instructions, tools and memory alone do not fit, eve does not call the provider at all; the turn fails with <code>COMPACTION_FAILED</code>.</p>
+<h3>fx: compaction you can check</h3>
+<p>The header of <code>src/core/compactor/compactor.zig</code> lists the pipeline: <code>window.zig</code> chooses what to compact; <code>summarize.zig</code> keeps user messages and final replies exact and gives every turn and tool call a handle; <code>ledger.zig</code> asks the model for notes; <code>lint.zig</code> checks every note against the saved turns and marks what it cannot confirm; <code>model.zig</code> calls the conversation's model at its lowest reasoning with a fallback; <code>records.zig</code> saves the records and searches them. Manual <code>/compact</code>, automatic compaction and provider-overflow recovery all use the same path.</p>
+<h3>Pi Durable: compaction that does not block</h3>
+<p>Spec section 8.7 defines three starts: a manual <code>Conversation.compact()</code>, a background start above one threshold, and a blocking start above a higher threshold or on overflow. Only the blocking one makes the run wait. Background summaries are placed like any passive write at a turn boundary, and several compactions may run at once. Raw history always stays in storage; the summary entry just marks the first kept entry as its head.</p>
+
+<h2 id="decisions">3. Design decisions</h2>
+<div class="tbl"><table>
+  <tr><th>Choice</th><th>Pro</th><th>Con</th><th>Who</th></tr>
+  <tr><td>Early trigger (80%)</td><td>Each compaction loses less; headroom for big tool results</td><td>Compacts more often</td><td>fx</td></tr>
+  <tr><td>Late trigger (90%)</td><td>Uses the window fully</td><td>Risk of overflow on one big result</td><td>eve</td></tr>
+  <tr><td>Verified summary</td><td>Catches invented facts</td><td>Extra pass, more code</td><td>fx</td></tr>
+  <tr><td>Background compaction</td><td>No pause for the user</td><td>Summary may race with new work</td><td>Pi Durable</td></tr>
+  <tr><td>Server-side opaque compaction</td><td>Best quality for that vendor's model</td><td>Cannot inspect or reuse with another model</td><td>Codex via nanocode</td></tr>
+  <tr><td>No compaction, fresh sessions plus files</td><td>No summary drift</td><td>Agent must write progress files</td><td>Early Pi, Anthropic's long-running harness</td></tr>
+</table></div>
+
+<h2 id="research">4. Research and the Chinese view</h2>
+<ul>
+  <li><strong>Externalize memory.</strong> Anthropic's long-running harness has each session read a progress file and git log instead of relying on a summary. Chinese readings of that post put it bluntly: the context window is not reliable memory; reliable memory must be externalized (<a href="https://aicoding.csdn.net/6a3ceb0610ee7a33f2824176.html">CSDN</a>).</li>
+  <li><strong>Restorable compression.</strong> Manus drops a page's content but keeps its URL, or a file's content but keeps its path, so nothing is truly lost (<a href="https://manus.im/blog/Context-Engineering-for-AI-Agents-Lessons-from-Building-Manus">Manus</a>).</li>
+  <li><strong>Long-horizon harness work.</strong> Alibaba's DreamX team's LongHorizon-Harness asks how much long-task performance changes when only the harness changes; compaction policy is a major lever.</li>
+</ul>
+
+<h2 id="build">5. Build: a compactor with handles, lint and recall</h2>
+<pre>&quot;&quot;&quot;Compaction: summarize old turns into a checkpoint, keep a verbatim tail, keep raw history recallable.&quot;&quot;&quot;
+import json, re
+
+THRESHOLD = 0.85          # compact at 85% of the window (fx: 80%, eve: 90%)
+TARGET = 0.5              # after compaction, the request must fit in half the window (eve)
+KEEP_TAIL_TOKENS = 20_000 # recent messages kept word for word (eve, Pi)
+TAIL_TOOL_CHARS = 2_000   # tool results inside the kept tail are shortened (eve)
+
+class TokenEstimator:
+    &quot;&quot;&quot;chars / 4, corrected by the provider&#x27;s reported input tokens (eve&#x27;s ratio trick).&quot;&quot;&quot;
+    def __init__(self):
+        self.ratio = 1.0
+    def raw(self, messages):
+        return sum(len(json.dumps(m, default=str)) for m in messages) / 4
+    def calibrate(self, messages, reported_input_tokens):
+        est = self.raw(messages)
+        if est &gt; 0 and reported_input_tokens:
+            self.ratio = reported_input_tokens / est
+    def __call__(self, messages):
+        return int(self.raw(messages) * self.ratio)
+
+SUMMARY_PROMPT = &quot;&quot;&quot;You are writing a checkpoint so another engineer can continue this task with no other context.
+Every message has a handle M&lt;n&gt;; every tool call has a handle T&lt;n&gt;. Write these sections:
+## Goal - the user&#x27;s request, in their words where possible.
+## Done - completed steps and decisions, each citing the handles it rests on, e.g. (M3, T7).
+## Remaining - what is left, in order.
+## Facts - file paths, commands, constraints and preferences needed to continue, each with a handle.
+Cite only handles that appear in the transcript. Do not invent results.&quot;&quot;&quot;
+
+def with_handles(messages):
+    &quot;&quot;&quot;Give every message and tool call a stable handle, as fx does (M1, T1, ...).&quot;&quot;&quot;
+    lines, t = [], 0
+    for i, m in enumerate(messages, 1):
+        body = m.get(&quot;content&quot;) or &quot;&quot;
+        for c in m.get(&quot;tool_calls&quot;, []) or []:
+            t += 1
+            body += f&quot;\n[T{t}] {c.name}({json.dumps(c.args)[:300]})&quot;
+        lines.append(f&quot;[M{i}] {m[&#x27;role&#x27;]}: {str(body)[:4000]}&quot;)
+    return &quot;\n&quot;.join(lines), len(messages), t
+
+def lint(summary, n_messages, n_tools):
+    &quot;&quot;&quot;Flag summary lines that cite handles which do not exist (fx&#x27;s lint pass).&quot;&quot;&quot;
+    bad = [h for h in re.findall(r&quot;\b([MT])(\d+)\b&quot;, summary)
+           if int(h[1]) &lt; 1 or int(h[1]) &gt; (n_messages if h[0] == &quot;M&quot; else n_tools)]
+    cited = len(re.findall(r&quot;\b[MT]\d+\b&quot;, summary))
+    return {&quot;bad_handles&quot;: [f&quot;{a}{b}&quot; for a, b in bad], &quot;cited&quot;: cited}
+
+def split_tail(messages, estimate):
+    &quot;&quot;&quot;Keep the newest messages up to KEEP_TAIL_TOKENS. Never split a tool call from its results.&quot;&quot;&quot;
+    kept, total = [], 0
+    for m in reversed(messages):
+        total += estimate([m])
+        if total &gt; KEEP_TAIL_TOKENS and kept:
+            break
+        kept.insert(0, m)
+    while kept and kept[0][&quot;role&quot;] == &quot;tool&quot;:          # a tail may not start with orphaned tool results
+        kept.pop(0)
+    old = messages[: len(messages) - len(kept)]
+    tail = [dict(m, content=m[&quot;content&quot;][:TAIL_TOOL_CHARS] + &quot;\n[shortened]&quot;)
+            if m[&quot;role&quot;] == &quot;tool&quot; and len(m.get(&quot;content&quot;, &quot;&quot;)) &gt; TAIL_TOOL_CHARS else m for m in kept]
+    return old, tail
+
+def maybe_compact(state, window, estimate, summarize, archive):
+    &quot;&quot;&quot;summarize(prompt, transcript) -&gt; str uses a cheap model. archive(messages) stores raw history.
+    Returns True if the history was compacted.&quot;&quot;&quot;
+    if estimate(state.messages) &lt; THRESHOLD * window:
+        return False
+    old, tail = split_tail(state.messages, estimate)
+    if not old:
+        return False
+    archive(old)                                       # raw history stays recoverable (Pi Durable, fx)
+    transcript, n_m, n_t = with_handles(old)
+    previous = state.checkpoint or &quot;&quot;
+    summary = summarize(SUMMARY_PROMPT, (f&quot;Previous checkpoint:\n{previous}\n\n&quot; if previous else &quot;&quot;) + transcript)
+    report = lint(summary, n_m, n_t)
+    if report[&quot;bad_handles&quot;]:
+        summary += f&quot;\n\n[warning: these cited handles do not exist and may be wrong: {&#x27;, &#x27;.join(report[&#x27;bad_handles&#x27;])}]&quot;
+    state.checkpoint = summary
+    state.messages = [{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: f&quot;&lt;checkpoint&gt;\n{summary}\n&lt;/checkpoint&gt;\n&quot;
+                       &quot;Older turns were summarized above; the raw history is available with the recall tool.&quot;}] + tail
+    if estimate(state.messages) &gt; TARGET * window:     # tail too big: keep only its text
+        state.messages = state.messages[:1] + [m for m in tail if m[&quot;role&quot;] != &quot;tool&quot;][-4:]
+    return True</pre>
+<p>Wiring:</p>
+<ul>
+  <li>After every model call, call <code>estimator.calibrate(messages, reply.input_tokens)</code>.</li>
+  <li>Before every model call, call <code>maybe_compact(state, window, estimator, summarize, archive)</code>. <code>summarize</code> calls a cheap model with the prompt and transcript. <code>archive</code> appends the raw messages to <code>session-archive.jsonl</code>.</li>
+  <li>Add a <code>recall(handle_or_query)</code> tool that searches the archive, so the agent can read what the checkpoint left out.</li>
+</ul>
+<h3>Measure</h3>
+<ol>
+  <li>Create one long task (for example a 3-hour refactor across 15 files) that needs at least two compactions. Record whether it finishes, how many lint warnings appear, and whether the agent used <code>recall</code>.</li>
+  <li>Run it with the threshold at 0.8 and at 0.9. Compare completion and total tokens.</li>
+  <li>Read one checkpoint and mark every claim as true or false against the transcript. That number is your summary accuracy.</li>
+</ol>
+
+<h2 id="exercises">6. Exercises</h2>
+<ol>
+  <li>Make compaction run in a background thread when usage passes 70% and block only above 90%, as Pi Durable does. What can go wrong?</li>
+  <li>Keep user messages word for word inside the checkpoint, as fx does. Does accuracy improve?</li>
+  <li>Use eve's fallback chain: if the tail does not fit under 50%, keep only its text, then only the summary. Test with one giant tool result.</li>
+</ol>
+
+<h2 id="quiz">7. Check yourself</h2>
+<div class="widget quiz" data-quiz="qz5"></div>
+<script type="application/json" id="qz5">[
+{"q":"fx's default auto-compaction threshold is:","o":["50%","80%","90%","95%"],"a":1,"e":"settings.zig: default_percent = 80, allowed range 10 to 80."},
+{"q":"After compacting, eve requires the request to fit under:","o":["90% of the window","50% of the window","20,000 tokens","The threshold"],"a":1,"e":"So the next compaction is far away. If the kept tail does not fit, eve keeps only its text, then only the summary."},
+{"q":"What does fx's lint.zig do?","o":["Formats code","Checks every summary note against the saved turns and marks what it cannot confirm","Counts tokens","Removes duplicates"],"a":1,"e":"Verification keeps an invented fact in a summary from steering the rest of the session."},
+{"q":"How does Pi Durable avoid making the user wait for compaction?","o":["It never compacts","Background compaction runs while the conversation keeps working; only the blocking threshold or overflow makes the run wait","It uses a bigger model","It compacts on another machine"],"a":1,"e":"Spec section 8.7 defines background, blocking and overflow starts."},
+{"q":"Why does the kept tail never start with a tool result?","o":["Tool results are unimportant","Providers reject a tool result whose call is missing","It saves tokens","Tool results are already in the summary"],"a":1,"e":"Cut only at a clean boundary: a user or assistant message."}
+]</script>
+
+<h2 id="refs">8. References</h2>
+<ul>
+  <li>eve: <code>packages/eve/src/harness/compaction/</code>; <code>docs/concepts/default-harness.md</code>.</li>
+  <li>fx: <code>src/core/compactor/compactor.zig</code>, <code>settings.zig</code>, <code>lint.zig</code>.</li>
+  <li>Pi: <code>packages/coding-agent/src/core/compaction/compaction.ts</code>; <code>packages/durable/docs/spec.md</code> section 8.7.</li>
+  <li>nanocode: <code>crates/backends/claude/prompts/compact.md</code>, <code>crates/backends/codex/client/prompts/compact.md</code>.</li>
+  <li><a href="https://anthropic.com/engineering/effective-harnesses-for-long-running-agents">Effective harnesses for long-running agents</a>, Anthropic, Nov 2025.</li>
+  <li><a href="https://manus.im/blog/Context-Engineering-for-AI-Agents-Lessons-from-Building-Manus">Context Engineering for AI Agents: Lessons from Building Manus</a>, Jul 2025.</li>
+</ul>
+
+<div class="navfoot"></div>
+</article></main>
+</div>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/book.js"></script>
+
+</body>
+</html>
