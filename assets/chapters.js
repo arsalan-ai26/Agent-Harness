@@ -60,7 +60,7 @@ window.IE_CHAPTERS = [
 "title": "Extensibility: skills, MCP and hooks",
 "slug": "08-extensibility",
 "stage": 3,
-"ready": false
+"ready": true
 },
 {
 "n": "9",

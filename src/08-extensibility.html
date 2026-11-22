@@ -1,0 +1,214 @@
+<div class="kicker">Stage 3 · Control · Chapter 8</div>
+<h1>Extensibility: skills, MCP and hooks</h1>
+<p class="lede">No harness ships every feature its users need. Extension points let people add knowledge (skills), connections (MCP), policy (hooks) and whole features (extensions) without forking the core. Each one has a context cost and a safety cost. This chapter reads Pi's code extensions and its new MCP client, eve's directory-as-contract and packaged extensions, fx's four hook kinds and nanocode's tool search, then builds skills with progressive disclosure, lifecycle hooks and a small MCP client.</p>
+<div class="meta">
+  <span class="chip">Level: intermediate</span>
+  <span class="chip">Time: about 20 hours with the build</span>
+  <span class="chip">Needs: Chapters 3 and 7</span>
+  <span class="chip">Code read at: Pi fb248c7, eve 5c52fbf, fx cbe7daf, nanocode 015cbfa</span>
+</div>
+
+<div class="box skip">
+  <span class="lbl">Before you start: skip check</span>
+  <ol>
+    <li>What is progressive disclosure for skills?</li>
+    <li>Why put "run tests after every edit" in a hook instead of the system prompt?</li>
+    <li>Why did Pi first refuse MCP, and what changed?</li>
+  </ol>
+  <details><summary>Answers</summary><ol>
+    <li>Only each skill's name and description go into the prompt. The model loads a skill's full procedure, and its supporting files, only when a task needs it.</li>
+    <li>A hook always runs; a prompt line runs only when the model remembers and agrees. Policy that must hold belongs in code.</li>
+    <li>MCP tool schemas cost context on every request (Playwright's server was about 13.7k tokens). Pi 1.0 added a small standalone MCP client, while still favouring CLIs and skills for most work.</li>
+  </ol></details>
+</div>
+
+<h2 id="four">1. Four extension points, four jobs</h2>
+<div class="tbl"><table>
+  <tr><th>Point</th><th>Adds</th><th>Context cost</th><th>Runs</th></tr>
+  <tr><td>Skills</td><td>Procedures and knowledge (Markdown plus files)</td><td>One line per skill until loaded</td><td>When the model chooses to load one</td></tr>
+  <tr><td>MCP servers</td><td>Connections to outside systems as tools</td><td>Every tool schema, every request (unless searched)</td><td>When the model calls a tool</td></tr>
+  <tr><td>Hooks</td><td>Deterministic policy and automation</td><td>None, unless they append output</td><td>Always, at fixed lifecycle points</td></tr>
+  <tr><td>Extensions or plugins</td><td>Whole features: tools, UI, commands, state</td><td>Whatever they add</td><td>Inside the harness process</td></tr>
+</table></div>
+<p>A practitioner's rule for Claude Code captures the split: tools and MCP give new actions, skills give reusable methods, subagents isolate execution, hooks enforce constraints and collect audit signals, plugins distribute all of it.</p>
+
+<h2 id="tour">2. Code tour</h2>
+<h3>Pi: code extensions the agent can write</h3>
+<p><code>packages/coding-agent/src/core/extensions/</code> loads TypeScript extensions at runtime through <code>jiti</code> (<code>loader.ts</code>, <code>jiti-loader.ts</code>, <code>runner.ts</code>). Extensions can register tools, commands and UI, hook the lifecycle and persist state into the session. Because they are plain files, the agent can write and hot-reload its own; Armin Ronacher's daily extensions (<code>/answer</code>, <code>/todos</code>, <code>/review</code>) were all written by the agent. Pi 1.0 added <code>packages/mcp</code>: a small, standalone MCP client that does not depend on the official SDK, with stdio and Streamable HTTP transports. Its earlier stance remains in the docs: prefer CLI tools with READMEs that the agent reads on demand.</p>
+<h3>eve: the directory is the contract</h3>
+<p>Every extension point is a folder: <code>skills/</code>, <code>hooks/</code>, <code>connections/</code> (MCP and OAuth services), <code>tools/</code>, <code>channels/</code>. Skills follow the Agent Skills standard (<code>docs/skills.mdx</code>): a flat <code>name.md</code> or a directory with <code>SKILL.md</code> plus <code>references/</code>, <code>assets/</code>, <code>scripts/</code>; the model loads one with <code>eve__skill</code>; names are checked at build time. An eve <em>extension</em> (<code>docs/extensions/index.md</code>) is an npm package with the same layout that an agent mounts from <code>agent/extensions/</code>; the repo ships several, including <code>eve-git</code>, <code>eve-code</code>, <code>eve-recall</code>, <code>eve-self-improvement</code> and <code>eve-self-modification</code>.</p>
+<h3>fx: four hook kinds, skills and MCP</h3>
+<p><code>src/core/hooks/definitions.zig</code> defines exactly four <code>HookKind</code>s: <code>pre_tool_use</code> (can allow, block or change a call), <code>stop</code> (can refuse to let the turn end), <code>post_turn_end</code> and <code>attention_required</code> (the agent is waiting for you). Skills live in <code>src/core/skills/</code>, and the agent can search and install skills itself (<code>src/tools/skills/</code>). MCP tools are found through capability search instead of being listed up front.</p>
+<h3>nanocode: its own MCP client and BM25 search</h3>
+<p>nanocode replaces the common Rust MCP libraries with its own client (<code>crates/core/mcp</code>, <code>mcp-http</code>), and searches MCP tools with its own BM25 index (<code>crates/integrations/mcp-tools/src/SEARCH.md</code>), so many servers can be connected without filling the context.</p>
+
+<h2 id="decisions">3. Design decisions compared</h2>
+<div class="tbl"><table>
+  <tr><th>Decision</th><th>Pi</th><th>eve</th><th>fx</th><th>nanocode</th></tr>
+  <tr><td>Main extension unit</td><td>TypeScript extension file</td><td>Agent folder; npm extension package</td><td>Skills, MCP, hooks config</td><td>Rust crates, host integrations</td></tr>
+  <tr><td>MCP</td><td>Added in 1.0; CLIs preferred</td><td><code>connections/</code></td><td>Built in, found via search</td><td>Own client, BM25 search</td></tr>
+  <tr><td>Hooks</td><td>Extension lifecycle events</td><td><code>hooks/</code> for lifecycle and stream events</td><td>4 kinds</td><td>Event sinks</td></tr>
+  <tr><td>Self-modification</td><td>Agent writes extensions</td><td>Opt-in extensions</td><td>Agent installs skills</td><td>No</td></tr>
+</table></div>
+<div class="box watch">
+  <span class="lbl">Risk</span>
+  <p>An agent that can install skills or write extensions can widen its own powers. Pair self-extension with a <code>pre_tool_use</code> hook that blocks writes to the harness's own config and extension folders unless the user approves.</p>
+</div>
+
+<h2 id="research">4. Research and the Chinese view</h2>
+<ul>
+  <li><strong>Progressive disclosure</strong> is LangChain's name for loading only skill metadata up front, to protect against context rot (<a href="https://www.langchain.com/blog/the-anatomy-of-an-agent-harness">LangChain</a>).</li>
+  <li><strong>Skills marketplaces in China.</strong> In early 2026 Alibaba, ByteDance and Tencent all launched skills squares alongside their desktop agents; 36Kr summarizes the stack as coding builds tools, skills store experience, the harness governs the whole (<a href="https://www.36kr.com/p/3777620397691911">36Kr</a>).</li>
+  <li><strong>Cross-runtime skills.</strong> Codex reads <code>~/.agents/skills/</code>, a path shared with Copilot CLI and Gemini CLI, and eve's skills follow the Agent Skills standard, so one skill works in several harnesses.</li>
+  <li><strong>Natural-language harness modules.</strong> NLAH treats modules such as verifier, self-evolution and file-backed state as named natural-language sections, very close to skills (<a href="https://arxiv.org/html/2603.25723v1">NLAH</a>).</li>
+</ul>
+
+<h2 id="build">5. Build: skills, hooks and an MCP client</h2>
+<pre>&quot;&quot;&quot;Extensibility: skills with progressive disclosure, lifecycle hooks, and a minimal MCP stdio client.&quot;&quot;&quot;
+import json, re, subprocess, threading
+from pathlib import Path
+
+# ---- skills: only names and descriptions in the prompt; the body loads on demand ---------------
+def parse_skill(path: Path):
+    text = path.read_text()
+    meta, body = {}, text
+    m = re.match(r&quot;^---\n(.*?)\n---\n(.*)$&quot;, text, re.S)
+    if m:
+        body = m.group(2)
+        for line in m.group(1).splitlines():
+            if &quot;:&quot; in line:
+                k, v = line.split(&quot;:&quot;, 1)
+                meta[k.strip()] = v.strip()
+    name = meta.get(&quot;name&quot;) or (path.parent.name if path.name == &quot;SKILL.md&quot; else path.stem)
+    return {&quot;name&quot;: name, &quot;description&quot;: meta.get(&quot;description&quot;, body.strip().splitlines()[0][:150]),
+            &quot;path&quot;: path, &quot;body&quot;: body}
+
+def load_skills(*roots):
+    skills = {}
+    for root in roots:
+        for p in sorted(Path(root).glob(&quot;*/SKILL.md&quot;)) + sorted(Path(root).glob(&quot;*.md&quot;)):
+            s = parse_skill(p)
+            skills.setdefault(s[&quot;name&quot;], s)        # first root wins, so project skills override global ones
+    return skills
+
+def skill_catalog(skills):
+    &quot;&quot;&quot;A few lines for the system prompt. The full procedures cost nothing until used.&quot;&quot;&quot;
+    lines = [f&quot;- {s[&#x27;name&#x27;]}: {s[&#x27;description&#x27;]}&quot; for s in skills.values()]
+    return &quot;Skills (load one with the skill tool before following it):\n&quot; + &quot;\n&quot;.join(lines)
+
+def skill_tool(skills, name: str):
+    s = skills.get(name)
+    if not s:
+        return f&quot;error: no skill &#x27;{name}&#x27;. Available: {&#x27;, &#x27;.join(skills)}&quot;
+    files = [str(p.relative_to(s[&quot;path&quot;].parent)) for p in s[&quot;path&quot;].parent.rglob(&quot;*&quot;)
+             if p.is_file() and p != s[&quot;path&quot;]] if s[&quot;path&quot;].name == &quot;SKILL.md&quot; else []
+    extra = &quot;\nSupporting files (read them if the procedure says so): &quot; + &quot;, &quot;.join(files) if files else &quot;&quot;
+    return s[&quot;body&quot;] + extra
+
+# ---- hooks: deterministic policy that does not depend on the model&#x27;s judgement ----------------
+HOOKS = {&quot;pre_tool_use&quot;: [], &quot;post_tool_use&quot;: [], &quot;stop&quot;: []}
+
+def hook(event):
+    def wrap(fn):
+        HOOKS[event].append(fn)
+        return fn
+    return wrap
+
+def run_pre(name, args):
+    &quot;&quot;&quot;Each hook returns None (no opinion), (&#x27;block&#x27;, reason) or (&#x27;rewrite&#x27;, new_args).&quot;&quot;&quot;
+    for h in HOOKS[&quot;pre_tool_use&quot;]:
+        r = h(name, args)
+        if r and r[0] == &quot;block&quot;:
+            return None, f&quot;blocked by hook {h.__name__}: {r[1]}&quot;
+        if r and r[0] == &quot;rewrite&quot;:
+            args = r[1]
+    return args, None
+
+def run_post(name, args, output):
+    for h in HOOKS[&quot;post_tool_use&quot;]:
+        extra = h(name, args, output)
+        if extra:
+            output += &quot;\n&quot; + extra
+    return output
+
+def run_stop(state):
+    &quot;&quot;&quot;A stop hook may refuse to let the turn end and give the model a reason to continue.&quot;&quot;&quot;
+    for h in HOOKS[&quot;stop&quot;]:
+        reason = h(state)
+        if reason:
+            return reason
+    return None
+
+# ---- MCP over stdio: JSON-RPC 2.0, one JSON object per line ----------------------------------
+class MCPClient:
+    def __init__(self, command: list[str]):
+        self.proc = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1)
+        self.next_id, self.lock = 1, threading.Lock()
+        self.request(&quot;initialize&quot;, {&quot;protocolVersion&quot;: &quot;2025-06-18&quot;, &quot;capabilities&quot;: {},
+                                    &quot;clientInfo&quot;: {&quot;name&quot;: &quot;harness&quot;, &quot;version&quot;: &quot;0.1&quot;}})
+        self.notify(&quot;notifications/initialized&quot;)
+
+    def notify(self, method, params=None):
+        self.proc.stdin.write(json.dumps({&quot;jsonrpc&quot;: &quot;2.0&quot;, &quot;method&quot;: method, **({&quot;params&quot;: params} if params else {})}) + &quot;\n&quot;)
+
+    def request(self, method, params=None):
+        with self.lock:
+            rid, self.next_id = self.next_id, self.next_id + 1
+            self.proc.stdin.write(json.dumps({&quot;jsonrpc&quot;: &quot;2.0&quot;, &quot;id&quot;: rid, &quot;method&quot;: method, &quot;params&quot;: params or {}}) + &quot;\n&quot;)
+            while True:                                   # skip server notifications until our reply arrives
+                msg = json.loads(self.proc.stdout.readline())
+                if msg.get(&quot;id&quot;) == rid:
+                    if &quot;error&quot; in msg:
+                        raise RuntimeError(msg[&quot;error&quot;].get(&quot;message&quot;))
+                    return msg[&quot;result&quot;]
+
+    def tools(self, prefix):
+        &quot;&quot;&quot;MCP tools as our tool specs, namespaced so two servers cannot collide.&quot;&quot;&quot;
+        return [{&quot;name&quot;: f&quot;{prefix}__{t[&#x27;name&#x27;]}&quot;, &quot;description&quot;: t.get(&quot;description&quot;, &quot;&quot;),
+                 &quot;parameters&quot;: t.get(&quot;inputSchema&quot;, {&quot;type&quot;: &quot;object&quot;, &quot;properties&quot;: {}})}
+                for t in self.request(&quot;tools/list&quot;)[&quot;tools&quot;]]
+
+    def call(self, name, args):
+        r = self.request(&quot;tools/call&quot;, {&quot;name&quot;: name, &quot;arguments&quot;: args})
+        text = &quot;\n&quot;.join(c.get(&quot;text&quot;, &quot;&quot;) for c in r.get(&quot;content&quot;, []) if c.get(&quot;type&quot;) == &quot;text&quot;)
+        return (&quot;error: &quot; if r.get(&quot;isError&quot;) else &quot;&quot;) + text</pre>
+<p>Wiring:</p>
+<ul>
+  <li>Add <code>skill_catalog(skills)</code> to the system prompt (it is stable, so it caches), and a <code>skill(name)</code> tool.</li>
+  <li>Before each tool call run <code>run_pre</code>; after it, <code>run_post</code>. When the model stops, call <code>run_stop</code>; if it returns a reason, append it as a user message and keep looping.</li>
+  <li>For each configured MCP server, add <code>client.tools(prefix)</code> to the tool list and route <code>prefix__name</code> calls to <code>client.call(name, args)</code>.</li>
+</ul>
+<p>Two hooks to start with: a <code>post_tool_use</code> hook that runs the test suite after any <code>edit</code> or <code>write</code> and appends a one-line result, and a <code>stop</code> hook that refuses to finish while tests fail.</p>
+<h3>Measure</h3>
+<ol>
+  <li>Count tokens of your skill catalog and of one MCP server's schemas. Put both numbers in a post.</li>
+  <li>Rerun your 10 tasks with the two hooks on. Did pass rate change? Did steps per task rise?</li>
+</ol>
+
+<h2 id="exercises">6. Exercises</h2>
+<ol>
+  <li>Add tool search: instead of listing MCP tools, give the model a <code>find_tool(query)</code> tool that ranks tools by keyword match and returns the best schemas, as fx and nanocode do.</li>
+  <li>Let the agent write a skill from a session it just finished. Review it before you keep it.</li>
+  <li>Add the <code>attention_required</code> hook from fx: notify yourself (a desktop notification or a Telegram message) when the agent waits for input.</li>
+</ol>
+
+<h2 id="quiz">7. Check yourself</h2>
+<div class="widget quiz" data-quiz="qz8"></div>
+<script type="application/json" id="qz8">[
+{"q":"Which hook kinds does fx define?","o":["Only pre_tool_use","pre_tool_use, stop, post_turn_end, attention_required","Twenty lifecycle events","None"],"a":1,"e":"definitions.zig enumerates exactly these four."},
+{"q":"What goes into the prompt with progressive disclosure?","o":["Every skill's full text","Each skill's name and description only","Nothing about skills","Only the most used skill"],"a":1,"e":"The body loads when the model calls the skill tool."},
+{"q":"Why should 'tests must pass before finishing' be a stop hook?","o":["Hooks are faster","A hook always runs; a prompt rule depends on the model remembering","Prompts cannot mention tests","Stop hooks are cheaper"],"a":1,"e":"Deterministic policy belongs in code."},
+{"q":"How does nanocode keep many MCP tools from filling the context?","o":["It forbids MCP","A BM25 search over MCP tools","It summarizes schemas","It uses a bigger window"],"a":1,"e":"Search loads only the schemas the model needs."},
+{"q":"What is an eve extension?","o":["A browser plugin","An npm package with tools, skills, hooks and more, mounted from agent/extensions","A model provider","A hook"],"a":1,"e":"It reuses the agent folder layout so capabilities can be shared across agents."}
+]</script>
+
+<h2 id="refs">8. References</h2>
+<ul>
+  <li>Pi: <code>packages/coding-agent/src/core/extensions/</code>; <code>packages/mcp/README.md</code>.</li>
+  <li>eve: <code>docs/skills.mdx</code>, <code>docs/extensions/index.md</code>, <code>packages/eve-*</code>.</li>
+  <li>fx: <code>src/core/hooks/definitions.zig</code>, <code>src/core/skills/</code>, <code>src/tools/skills/</code>.</li>
+  <li>nanocode: <code>crates/core/mcp</code>, <code>crates/integrations/mcp-tools/src/SEARCH.md</code>.</li>
+  <li><a href="https://lucumr.pocoo.org/2026/1/31/pi/">Pi: The Minimal Agent Within OpenClaw</a>, Armin Ronacher, Jan 2026.</li>
+  <li><a href="https://tw93.fun/en/2026-03-12/claude.html">Claude Code Deep Dive: Architecture, Governance, and Engineering Practices</a>, Mar 2026.</li>
+  <li>Model Context Protocol specification, modelcontextprotocol.io.</li>
+</ul>
