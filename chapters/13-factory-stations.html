@@ -15,7 +15,7 @@
 <main><article>
 <div class="kicker">Stage 5 · Software factory · Chapter 13</div>
 <h1>Software factory I: stations</h1>
-<p class="lede">A software factory is the harness scaled from one session to the whole delivery loop: an issue goes in, a reviewed draft pull request comes out, and people make the judgement calls. This chapter reads the real code of eve's Foreman template and compares it with Stripe's Minions, Ramp, Coinbase and StrongDM. You build a four-station factory that works on your own book repository.</p>
+<p class="lede">One session with one context fills up (fact 3), and a model checking its own work shares its own blind spots (fact 5). A software factory follows from taking those facts seriously at scale: it is the harness scaled from one session to the whole delivery loop: an issue goes in, a reviewed draft pull request comes out, and people make the judgement calls. This chapter reads the real code of eve's Foreman template and compares it with Stripe's Minions, Ramp, Coinbase and StrongDM. You build a four-station factory that works on your own book repository.</p>
 <div class="meta">
   <span class="chip">Level: advanced</span>
   <span class="chip">Time: about 20 hours with the build</span>
@@ -38,6 +38,8 @@
 </div>
 
 <h2 id="what">1. What a factory adds to a harness</h2>
+<p>Why split one job into stations instead of giving one agent the whole issue? Derive it. A single session that triages, plans, codes and reviews accumulates everything in one window, so by the review it is reasoning through a crowded context (fact 3). Worse, it reviews its own work with the same weights, the same prompt and the same history that produced the mistake (fact 5); its errors are correlated with themselves. Splitting gives each station a fresh window holding only what that job needs, and lets the reviewer be a different model that sees only the diff and the criteria. Independence is the point: two samples with different blind spots catch more than one sample checked twice.</p>
+<p>The other parts follow too. Acceptance criteria must be written before the code, because a check written after it is shaped by it. The revision loop must be bounded, because a model that failed twice on the same feedback is unlikely to succeed on the tenth try, while the bill keeps growing (fact 4). Memory across runs must be small and curated, because it is loaded into every station's window.</p>
 <p>Everything in Stages 1 to 4 still applies inside each station. The factory adds structure around them: intake from where work is filed, triage, a plan with checkable acceptance criteria, isolated implementation, independent review, a bounded revision loop, safe delivery and memory across runs.</p>
 <figure>
 <div class="svgwrap"><svg viewBox="0 0 760 240" width="760" style="max-width:100%;height:auto" role="img" aria-label="Factory pipeline: intake, triage, analyst, implementer, reviewer, draft PR, with a revision loop and a shared factory brain">

@@ -15,7 +15,7 @@
 <main><article>
 <div class="kicker">Stage 3 · Control · Chapter 9</div>
 <h1>Subagents and Code Mode</h1>
-<p class="lede">Two ideas attack the same cost from different sides. Subagents move work into a separate context and bring back only a report. Code Mode lets the model write one program that calls many tools and returns only the result. Both keep intermediate noise out of the main context. Pi rejects subagents, nanocode makes each one a durable session, and both Pi and nanocode ship Code Mode. You build a subagent tool and a Python Code Mode cell runner, and measure what each saves.</p>
+<p class="lede">Every token in the window is resent on every later step and competes for attention (facts 3 and 4), yet most of what an agent reads along the way is only needed for a moment. Two ideas attack that cost from different sides. Subagents move work into a separate context and bring back only a report. Code Mode lets the model write one program that calls many tools and returns only the result. Both keep intermediate noise out of the main context. Pi rejects subagents, nanocode makes each one a durable session, and both Pi and nanocode ship Code Mode. You build a subagent tool and a Python Code Mode cell runner, and measure what each saves.</p>
 <div class="meta">
   <span class="chip">Level: advanced</span>
   <span class="chip">Time: about 20 hours with the build</span>
@@ -38,6 +38,9 @@
 </div>
 
 <h2 id="why">1. Two ways to keep the context clean</h2>
+<p>Look at where tokens go in a typical task. To answer "where is the retry logic?", the agent reads ten files. The answer is two lines. But all ten files stay in the message list, are resent on every later step and dilute attention for the rest of the session. The work needed those tokens for one step; the session pays for them on every step.</p>
+<p>There are two places to cut. You can cut the <em>reasoning</em> out: give the exploration to a fresh model call with its own empty window (it starts with nothing, by fact 2), let it read all ten files there, and return only the two-line answer. That is a <strong>subagent</strong>. Or you can cut the <em>round trips</em> out: many tool calls exist only to feed one result into the next call, and the model adds nothing in between. If the model writes a short program that does all those calls itself, the intermediate results stay inside the program and only the final value comes back. That is <strong>Code Mode</strong>.</p>
+<p>Both have a price you can predict. A subagent knows nothing you did not tell it, so a vague brief gives a wrong report. Code Mode runs model-written code, so it needs the same sandbox as any other code (Chapter 7).</p>
 <figure>
 <div class="svgwrap"><svg viewBox="0 0 760 250" width="760" style="max-width:100%;height:auto" role="img" aria-label="Subagent and Code Mode compared">
   <defs><marker id="f1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>

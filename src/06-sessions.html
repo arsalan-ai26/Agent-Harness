@@ -1,6 +1,6 @@
 <div class="kicker">Stage 2 · Context · Chapter 6</div>
 <h1>Sessions, state and memory</h1>
-<p class="lede">A session is what lets you close the terminal and come back. State is what the agent knows is true right now. Memory is what it should still know next week. Harnesses mix these up at their cost. This chapter reads Pi's tree-shaped session files, fx's resumable sessions, eve's state and memory slots and nanocode's stores, then builds an append-only session tree with branching, resume and a memory slot that compaction can never touch. It closes Stage 2.</p>
+<p class="lede">The model forgets everything after each call (fact 2) and processes die (fact 6), so anything an agent "knows" over time is something the harness wrote down. A session is what lets you close the terminal and come back. State is what the agent knows is true right now. Memory is what it should still know next week. Harnesses mix these up at their cost. This chapter reads Pi's tree-shaped session files, fx's resumable sessions, eve's state and memory slots and nanocode's stores, then builds an append-only session tree with branching, resume and a memory slot that compaction can never touch. It closes Stage 2.</p>
 <div class="meta">
   <span class="chip">Level: intermediate</span>
   <span class="chip">Time: about 20 hours with the build</span>
@@ -23,6 +23,13 @@
 </div>
 
 <h2 id="three">1. Three different things</h2>
+<p>Since the model remembers nothing, ask a sharper question: what does the harness need to write down, and for how long? There are three answers, and they differ in who reads the record and when.</p>
+<ul>
+  <li>To <strong>resume or audit</strong> a conversation, you need what actually happened, in order, unchanged. Anything else could be wrong. That is <strong>history</strong>, and the only safe operation on a record of the past is appending.</li>
+  <li>To <strong>keep working correctly</strong>, the harness needs some facts to be exact: the budget left, the plan, which background jobs are running. A summary written by the model (fact 5) might round a number or drop a job. So these live outside the message list as typed values. That is <strong>state</strong>.</li>
+  <li>To <strong>help next week</strong>, you need a small selection that is still true and still useful after the conversation is gone. A full history is too large to resend (fact 3), so something must choose. That is <strong>memory</strong>.</li>
+</ul>
+<p>Mixing them causes predictable failures: store state only in messages and compaction will paraphrase it away; store memory in history and it disappears when the session ends; edit history in place and you can no longer trust what happened.</p>
 <div class="tbl"><table>
   <tr><th></th><th>History</th><th>State</th><th>Memory</th></tr>
   <tr><td>What</td><td>Every message and tool call, in order</td><td>Typed values the harness tracks: plan, budget, task table, cwd</td><td>Facts and preferences selected to survive sessions</td></tr>

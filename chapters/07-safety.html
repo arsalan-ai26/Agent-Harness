@@ -15,7 +15,7 @@
 <main><article>
 <div class="kicker">Stage 3 · Control · Chapter 7</div>
 <h1>Permissions, approvals and sandboxing</h1>
-<p class="lede">An agent that can run code can delete your work, leak your keys or follow instructions hidden in a README. Safety in a harness is three separate controls: what is technically possible, when to stop and ask, and who decides. This chapter compares Pi's deliberate absence of a gate, fx's evidence-checked classifier, eve's split between a trusted runtime and an untrusted sandbox, and nanocode's kernel-level confinement, then builds a gate with rules, a classifier and a Docker sandbox.</p>
+<p class="lede">The model's choices are samples that can be wrong (fact 5), it cannot tell your instructions from an attacker's text (fact 5), and some actions cannot be undone (fact 6). An agent that can run code can therefore delete your work, leak your keys or follow instructions hidden in a README. Safety in a harness is three separate controls: what is technically possible, when to stop and ask, and who decides. This chapter compares Pi's deliberate absence of a gate, fx's evidence-checked classifier, eve's split between a trusted runtime and an untrusted sandbox, and nanocode's kernel-level confinement, then builds a gate with rules, a classifier and a Docker sandbox.</p>
 <div class="meta">
   <span class="chip">Level: intermediate to advanced</span>
   <span class="chip">Time: about 20 hours with the build</span>
@@ -38,13 +38,15 @@
 </div>
 
 <h2 id="threats">1. What can go wrong</h2>
+<p>Start from how the model reads its input. Your system prompt, the user's request, a README it opened and a web page it fetched all arrive as one token sequence. Role markers help, but nothing in the model guarantees that text from one source is obeyed and text from another is ignored; it was trained to follow instructions wherever they appear. Add that every choice is a sample, and two conclusions follow. The model will sometimes choose a harmful action on its own, and an attacker can make it choose one on purpose. Neither can be fixed by asking the model nicely, because the request to behave is just more text in the same sequence.</p>
+<p>So the four threats below are not separate bugs; they are what facts 5 and 6 look like in practice:</p>
 <ul>
   <li><strong>Overeager actions.</strong> The model does more than asked: force-pushes, deletes "unused" files, edits outside the repo.</li>
   <li><strong>Prompt injection.</strong> Web pages, issues, READMEs and tool output contain instructions the model follows.</li>
   <li><strong>Exfiltration.</strong> Secrets in environment variables or <code>~/.ssh</code> leave the machine through any network call.</li>
   <li><strong>Machine damage.</strong> Fork bombs, filling the disk, killing processes.</li>
 </ul>
-<p>Mario Zechner argues in his Pi post that most permission systems are security theatre: an agent that can write and run code can find a way around any list of rules. That is half right. Rules alone are weak; layers are not.</p>
+<p>Mario Zechner argues in his Pi post that most permission systems are security theatre: an agent that can write and run code can find a way around any list of rules. That is half right, and the facts show which half. A rule matches text, and the model can always write different text with the same effect (<code>rm</code>, <code>find -delete</code>, a Python one-liner). So any check that looks at the request can be wrong. What cannot be talked around is a limit on what is physically possible: a container with no network cannot leak a key, whatever command it runs. That gives the structure: checks on the request decide what usually runs, and a hard boundary limits the damage when the checks are wrong. Rules alone are weak; layers are not.</p>
 
 <figure>
 <div class="svgwrap"><svg viewBox="0 0 760 230" width="760" style="max-width:100%;height:auto" role="img" aria-label="Defence in depth: rules, classifier, human, sandbox">

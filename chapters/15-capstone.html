@@ -24,7 +24,7 @@
 </div>
 
 <h2 id="why">1. Why compare against real harnesses</h2>
-<p>Your weekly eval tells you whether your harness improved. It does not tell you whether it is good. Running Pi and fx on the same tasks, with the same model where they allow it, separates three things: the model, the harness and the task. Several 2026 papers make the same point: benchmark scores mix model and harness, so honest comparisons hold one fixed while changing the other (<a href="https://arxiv.org/abs/2608.26218">Same model, different harness</a>).</p>
+<p>Your weekly eval tells you whether your harness improved. It does not tell you whether it is good. Reason from what a score is: a pass rate is produced jointly by the model, the harness and the tasks, and the model's outputs vary from run to run (fact 5). To learn what the harness contributes, you must hold the other two fixed and repeat enough to see through the noise. Running Pi and fx on the same tasks, with the same model where they allow it, separates three things: the model, the harness and the task. Several 2026 papers make the same point: benchmark scores mix model and harness, so honest comparisons hold one fixed while changing the other (<a href="https://arxiv.org/abs/2608.26218">Same model, different harness</a>).</p>
 <div class="box watch">
   <span class="lbl">Safety</span>
   <p>Pi has no permission gate and <code>fx ask --full-access</code> turns fx's checks off. Run every harness in this chapter inside a container with only the task's copy of the repository mounted.</p>
@@ -89,7 +89,7 @@ if __name__ == &quot;__main__&quot;:
 <p class="note">Fill this in with your measured numbers. If your harness wins on your training tasks but loses on the holdout, say so; that is the most useful finding in the book.</p>
 
 <h2 id="retro">5. Retrospective: what each choice bought</h2>
-<p>For each feature, write the measured effect from your weekly evals and one sentence on whether you would build it again.</p>
+<p>For each feature, write which of the six facts it answers, the measured effect from your weekly evals, and one sentence on whether you would build it again. If a feature answers a fact but showed no measured effect, ask whether the fact simply did not bite on your tasks (short sessions never hit fact 3) before deleting it.</p>
 <div class="tbl"><table>
   <tr><th>Chapter</th><th>Choice</th><th>Borrowed from</th><th>Measured effect</th><th>Keep?</th></tr>
   <tr><td>1</td><td>Step function loop</td><td>eve</td><td></td><td></td></tr>

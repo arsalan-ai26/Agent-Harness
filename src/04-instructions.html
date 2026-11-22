@@ -1,6 +1,6 @@
 <div class="kicker">Stage 2 · Context · Chapter 4</div>
 <h1>Instructions and context assembly</h1>
-<p class="lede">Before the model acts, the harness decides what it sees: a system prompt, project instructions, environment facts and the names of available skills. This chapter compares how fx, Pi, eve and nanocode assemble that context, and shows the one rule all of them respect: never change the prefix mid-session. You build a context assembler that keeps the prefix stable and appends every change at the end.</p>
+<p class="lede">The model knows nothing about your project, your rules or today's date unless it is in the request (fact 2), and every request is paid for again (fact 4). So before the model acts, the harness decides what it sees: a system prompt, project instructions, environment facts and the names of available skills. This chapter compares how fx, Pi, eve and nanocode assemble that context, and shows the one rule all of them respect: never change the prefix mid-session. You build a context assembler that keeps the prefix stable and appends every change at the end.</p>
 <div class="meta">
   <span class="chip">Level: intermediate</span>
   <span class="chip">Time: about 20 hours with the build</span>
@@ -23,7 +23,9 @@
 </div>
 
 <h2 id="layers">1. The layers of context</h2>
-<p>A request is a stack. The top changes rarely, the bottom changes every step. Put things in the right layer and caching works for free.</p>
+<p>Derive the layout instead of memorizing it. Two facts pull in opposite directions. Fact 2 says the model must be told everything it needs on every call, so the request is large and mostly repeated. Fact 4 says repeated input is cheap only if it is an identical prefix: the provider caches the computation for the first N tokens and can reuse it only if those N tokens match exactly. A change at token 500 forces recomputing everything after token 500.</p>
+<p>The resolution is to sort content by how often it changes. What never changes in a session (core instructions, tool schemas) goes first. What changes once per session (project rules, environment facts) goes next. What changes every step goes last. Then each step adds new tokens only at the end and pays full price only for those. There is a second reason the tail is the right place for news: models attend most reliably to the start and the end of their input, so a fresh update at the end is both cheap and noticed.</p>
+<p>So a request is a stack. The top changes rarely, the bottom changes every step. Put things in the right layer and caching works for free. The rule "never edit the prefix mid-session; append the change instead" is not a style choice; it falls straight out of how the cache works.</p>
 <figure>
 <div class="svgwrap"><svg viewBox="0 0 760 300" width="760" style="max-width:100%;height:auto" role="img" aria-label="Context layers from stable prefix to changing tail">
   <rect x="24" y="16" width="520" height="40" rx="6" style="fill:var(--kv-s);stroke:var(--kv)"/><text x="36" y="41" style="fill:var(--ink);font-size:12px">1. Base system prompt: who the agent is, how it works</text>

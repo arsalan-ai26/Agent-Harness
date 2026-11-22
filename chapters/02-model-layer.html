@@ -15,7 +15,7 @@
 <main><article>
 <div class="kicker">Stage 1 · Foundations · Chapter 2</div>
 <h1>The model and provider layer</h1>
-<p class="lede">Every harness talks to models through a layer that hides wire formats, streams tokens, retries failures, counts cost and protects the prompt cache. Harnesses split on one question here: one neutral format for every model, or each model in the harness it was trained with? This chapter reads Pi's unified API, nanocode's per-vendor drivers, eve's retry and recovery code and fx's gateway, then builds a two-provider layer.</p>
+<p class="lede">The model is a remote service you pay per token (fact 4) over a network that fails (fact 6), and every vendor trained its model on a different text format. Every harness therefore talks to models through a layer that hides wire formats, streams tokens, retries failures, counts cost and protects the prompt cache. Harnesses split on one question here: one neutral format for every model, or each model in the harness it was trained with? This chapter reads Pi's unified API, nanocode's per-vendor drivers, eve's retry and recovery code and fx's gateway, then builds a two-provider layer.</p>
 <div class="meta">
   <span class="chip">Level: intermediate</span>
   <span class="chip">Time: about 20 hours with the build</span>
@@ -38,14 +38,14 @@
 </div>
 
 <h2 id="why">1. What this layer does</h2>
-<p>The loop from Chapter 1 called one SDK directly. Real harnesses need more:</p>
+<p>The loop from Chapter 1 called one SDK directly. Work out what a model call physically is and the extra jobs appear on their own.</p>
 <ul>
-  <li><strong>Translation.</strong> Each provider has its own message, tool and reasoning format. OpenAI chat completions, OpenAI Responses, Anthropic Messages, Google and Bedrock all differ.</li>
-  <li><strong>Streaming.</strong> Users must see text as it arrives. Tool-call arguments also stream in pieces that must be joined.</li>
-  <li><strong>Retries.</strong> Rate limits (429), overloads (529) and dropped connections are normal. Retry the transient ones, fail fast on the rest.</li>
-  <li><strong>Accounting.</strong> Input, cached input and output tokens, and dollars, per call and per session.</li>
-  <li><strong>Caching discipline.</strong> Requests built so each one shares the longest possible exact prefix with the last.</li>
-  <li><strong>Model choice.</strong> Switch model mid-session, or route cheap work to cheap models.</li>
+  <li><strong>Translation.</strong> Underneath, every API turns your messages into one long token sequence with special markers for roles and tool calls. Each vendor chose different markers and trained its model on them, so the JSON on the wire differs too: OpenAI chat completions, OpenAI Responses, Anthropic Messages, Google and Bedrock all disagree. The harness needs one internal shape and a translator per vendor.</li>
+  <li><strong>Streaming.</strong> The model emits one token at a time, so a long reply takes seconds to tens of seconds. Waiting for the end wastes the user's time and hides progress. Tool-call arguments also arrive token by token and must be joined before they are valid JSON.</li>
+  <li><strong>Retries.</strong> The model runs on shared GPUs behind a network (fact 6). Rate limits (429), overloads (529) and dropped connections are not bugs; they are the normal state of a shared resource. Retrying them is safe because a model call has no side effects of its own. Errors that mean "your request is wrong" will fail the same way again, so retrying those only wastes time.</li>
+  <li><strong>Accounting.</strong> Because the whole conversation is resent each step (fact 2) and paid for each time (fact 4), cost grows roughly with the square of the session length. You cannot manage what you do not count: input, cached input and output tokens, and dollars, per call and per session.</li>
+  <li><strong>Caching discipline.</strong> The provider can skip recomputing a prefix it has already processed, which is why cached input is so much cheaper. "Same prefix" means byte for byte, so any change near the top (a timestamp, a reordered tool list) throws the saving away. Build requests so each one shares the longest possible exact prefix with the last.</li>
+  <li><strong>Model choice.</strong> Different models trade price, speed and skill. Since the model holds no state (fact 2), you can switch it at any step boundary; the next model just reads the same history. That makes routing cheap work to cheap models possible.</li>
 </ul>
 <figure>
 <div class="svgwrap"><svg viewBox="0 0 760 250" width="760" style="max-width:100%;height:auto" role="img" aria-label="Provider layer: the harness speaks one internal format, adapters translate to each wire format">
@@ -82,7 +82,7 @@
   <tr><td>Caching</td><td>Automatic on exact prefixes; report in <code>prompt_tokens_details.cached_tokens</code></td><td>Explicit <code>cache_control</code> breakpoints; report in <code>cache_read_input_tokens</code></td></tr>
   <tr><td>Reasoning</td><td>Hidden or summarized, per model</td><td>Thinking blocks, which may carry a signature that must be sent back unchanged</td></tr>
 </table></div>
-<p>These are not cosmetic. Switching a conversation from one provider to another mid-session means converting thinking blocks, tool-call IDs and caching markers. Pi does this best-effort: Anthropic thinking becomes tagged text when the conversation moves to OpenAI.</p>
+<p>These are not cosmetic, because the model was trained on its own format. Each field becomes specific tokens in the sequence the model reads, and a model fed an unfamiliar arrangement behaves a little worse. Switching a conversation from one provider to another mid-session means converting thinking blocks, tool-call IDs and caching markers. Pi does this best-effort: Anthropic thinking becomes tagged text when the conversation moves to OpenAI.</p>
 
 <h2 id="tour">3. Code tour</h2>
 <h3>Pi: one API over everything</h3>

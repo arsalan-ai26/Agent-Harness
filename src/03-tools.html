@@ -1,6 +1,6 @@
 <div class="kicker">Stage 1 · Foundations · Chapter 3</div>
 <h1>Tools and the action interface</h1>
-<p class="lede">Tools are the only way a model touches the world, so their design decides what the agent can do, how often it fails, and how many tokens it burns. This chapter compares Pi's four tools, fx's toolbox with capability search, eve's sandboxed built-ins and nanocode's Code Mode, then builds a typed tool registry with validation, truncation, safe multi-edits and background jobs. It closes Stage 1: your harness is now a real coding agent.</p>
+<p class="lede">The model only writes text (fact 1). A tool is a contract that says which text the harness will turn into which action, so their design decides what the agent can do, how often it fails, and how many tokens it burns. This chapter compares Pi's four tools, fx's toolbox with capability search, eve's sandboxed built-ins and nanocode's Code Mode, then builds a typed tool registry with validation, truncation, safe multi-edits and background jobs. It closes Stage 1: your harness is now a real coding agent.</p>
 <div class="meta">
   <span class="chip">Level: intermediate</span>
   <span class="chip">Time: about 20 hours with the build</span>
@@ -23,12 +23,13 @@
 </div>
 
 <h2 id="aci">1. The agent-computer interface</h2>
-<p>In 2024 SWE-agent showed that the interface you give a model matters as much as the model. A raw Linux shell is designed for humans: it prints too much, fails silently and hides state. A good <strong>agent-computer interface (ACI)</strong> has simple actions, informative error messages and outputs sized for a context window.</p>
-<p>Every tool decision is a trade between three costs:</p>
+<p>Ask what the model actually perceives when it uses a tool. It sees a name, a description and a schema, all as text in its input. It writes a call as text. It then sees the result as text. It never sees the screen, the file system or the process; it sees only what the tool chose to print. So a tool is two things at once: an action in the world and the model's only sense organ for that action.</p>
+<p>That explains SWE-agent's 2024 finding that the interface you give a model matters as much as the model. A raw Linux shell was designed for humans who can scroll, glance and remember: it prints too much, fails silently and hides state. A model can do none of those things. A good <strong>agent-computer interface (ACI)</strong> has simple actions, informative error messages and outputs sized for a context window.</p>
+<p>Every tool decision is a trade between three costs, and each one comes straight from a fact:</p>
 <ul>
-  <li><strong>Context cost.</strong> Every tool schema is in every request. Playwright's MCP server alone is about 13.7k tokens of definitions.</li>
-  <li><strong>Error cost.</strong> A vague tool gets misused. An edit tool that silently changes the wrong line is worse than one that refuses.</li>
-  <li><strong>Round-trip cost.</strong> Each tool result is another model call. Ten reads in ten steps cost ten times the prefix.</li>
+  <li><strong>Context cost (facts 3 and 4).</strong> The model cannot use a tool it has not been told about, so every tool schema is in every request, paid for every time. Playwright's MCP server alone is about 13.7k tokens of definitions.</li>
+  <li><strong>Error cost (fact 5).</strong> The model picks a tool and writes arguments by sampling, so it will sometimes pick wrong. A vague tool gets misused more. An edit tool that silently changes the wrong line is worse than one that refuses, because a refusal is information the model can act on and a silent mistake is not.</li>
+  <li><strong>Round-trip cost (facts 2 and 4).</strong> The model only learns a result on its next call, and each call resends the whole history. Ten reads in ten steps cost ten times the prefix.</li>
 </ul>
 
 <h2 id="tour">2. Code tour</h2>

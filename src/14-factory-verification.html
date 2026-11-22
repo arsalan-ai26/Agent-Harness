@@ -1,6 +1,6 @@
 <div class="kicker">Stage 5 · Software factory · Chapter 14</div>
 <h1>Software factory II: verification gates and self-improvement</h1>
-<p class="lede">When agents write code faster than people can read it, verification becomes the bottleneck. This chapter covers the gates that let a factory ship safely: holdout scenarios the generator never sees, digital twins of outside services, review depth that grows with risk, and the light-versus-dark factory debate. Then it closes the loop: a harness that reads its own failed traces, proposes one change, and keeps it only if the eval says it helped.</p>
+<p class="lede">Generating code is a sample (fact 5), so its cost falls as models get faster and cheaper, while knowing whether it is right still needs an independent check. When agents write code faster than people can read it, verification becomes the bottleneck. This chapter covers the gates that let a factory ship safely: holdout scenarios the generator never sees, digital twins of outside services, review depth that grows with risk, and the light-versus-dark factory debate. Then it closes the loop: a harness that reads its own failed traces, proposes one change, and keeps it only if the eval says it helped.</p>
 <div class="meta">
   <span class="chip">Level: advanced</span>
   <span class="chip">Time: about 20 hours with the build</span>
@@ -23,6 +23,8 @@
 </div>
 
 <h2 id="bottleneck">1. The bottleneck moved</h2>
+<p>Start from what a check is. A check is useful only if it can disagree with the thing it checks. A test the implementer wrote can encode the same misunderstanding as the code. A test the implementer can see can be satisfied without solving the task, because the model optimizes for whatever signal it is given. So the strongest check is one the generator neither wrote nor saw: a holdout. Checks also cost something, so it is rational to spend them where a mistake costs most: deeper review where the blast radius is larger. Those two ideas, independence and proportion, explain every gate in this chapter.</p>
+<p>The same reasoning applies when the harness improves itself. An improvement loop is a generator of harness changes, and your eval is its check. If it can see the eval, it will eventually fit the eval rather than the problem. Hence the holdout again.</p>
 <p>In 2026 generation got cheap and review did not. One industry report found that with high AI adoption, PRs received 25% more review comments and 31.3% more PRs skipped review entirely (a slide shown at AI Engineer World's Fair 2026, <a href="https://www.ai.engineer/talks/Ib5GBkD555M-harness-engineering-is-not-enough-why-software">talk</a>). Qodo puts the conclusion plainly: a factory that builds fast without checking its own output only produces problems faster, and the quality layer that works is one the generator does not control (<a href="https://www.qodo.ai/?p=23009">Qodo</a>).</p>
 <figure>
 <div class="svgwrap"><svg viewBox="0 0 760 210" width="760" style="max-width:100%;height:auto" role="img" aria-label="Verification gates in order of cost">

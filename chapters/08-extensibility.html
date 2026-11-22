@@ -15,7 +15,7 @@
 <main><article>
 <div class="kicker">Stage 3 · Control · Chapter 8</div>
 <h1>Extensibility: skills, MCP and hooks</h1>
-<p class="lede">No harness ships every feature its users need. Extension points let people add knowledge (skills), connections (MCP), policy (hooks) and whole features (extensions) without forking the core. Each one has a context cost and a safety cost. This chapter reads Pi's code extensions and its new MCP client, eve's directory-as-contract and packaged extensions, fx's four hook kinds and nanocode's tool search, then builds skills with progressive disclosure, lifecycle hooks and a small MCP client.</p>
+<p class="lede">Anything the model should know or be able to do must be in its window (fact 2), but the window is finite and paid for every call (facts 3 and 4). So no harness can ship every feature its users need in the prompt. Extension points let people add knowledge (skills), connections (MCP), policy (hooks) and whole features (extensions) without forking the core. Each one has a context cost and a safety cost. This chapter reads Pi's code extensions and its new MCP client, eve's directory-as-contract and packaged extensions, fx's four hook kinds and nanocode's tool search, then builds skills with progressive disclosure, lifecycle hooks and a small MCP client.</p>
 <div class="meta">
   <span class="chip">Level: intermediate</span>
   <span class="chip">Time: about 20 hours with the build</span>
@@ -38,6 +38,8 @@
 </div>
 
 <h2 id="four">1. Four extension points, four jobs</h2>
+<p>Ask two questions of anything you want to add, and the four extension points fall out. First: does the model need to know about it to use it? If yes, it costs context, and the only way to make it cheap is to show a short name first and the full text only when the model asks (progressive disclosure). If no, it can run outside the model entirely and cost nothing. Second: must it happen every time, or only when the model decides? The model's decisions are samples (fact 5), so anything that must always happen (a formatter, a policy check, an audit log) cannot be left to the model to remember. It has to be code the harness runs at fixed points.</p>
+<p>Knowledge the model pulls in when needed: <strong>skills</strong>. Actions in outside systems the model calls: <strong>MCP tools</strong>. Rules that must run every time without asking the model: <strong>hooks</strong>. New harness behaviour that is not about the model at all: <strong>extensions</strong>.</p>
 <div class="tbl"><table>
   <tr><th>Point</th><th>Adds</th><th>Context cost</th><th>Runs</th></tr>
   <tr><td>Skills</td><td>Procedures and knowledge (Markdown plus files)</td><td>One line per skill until loaded</td><td>When the model chooses to load one</td></tr>

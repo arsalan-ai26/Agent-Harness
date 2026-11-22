@@ -1,6 +1,6 @@
 <div class="kicker">Stage 1 · Foundations · Chapter 0</div>
 <h1>What an agent harness is</h1>
-<p class="lede">A language model only writes text. Everything that turns that text into work, such as reading files, running commands, remembering, asking permission and checking results, is the harness. This chapter defines the harness from first principles, splits it into eleven components, shows why it matters as much as the model, and introduces the four open-source harnesses we read through the whole book.</p>
+<p class="lede">A language model only writes text. Everything that turns that text into work, such as reading files, running commands, remembering, asking permission and checking results, is the harness. This chapter starts from six plain facts about models and the world, derives the harness from them, splits it into eleven components, shows why it matters as much as the model, and introduces the four open-source harnesses we read through the whole book.</p>
 <div class="meta">
   <span class="chip">Level: beginner to intermediate</span>
   <span class="chip">Time: 4 to 5 hours with the reading lab</span>
@@ -26,8 +26,18 @@
 </div>
 
 <h2 id="why">1. Why a model is not an agent</h2>
-<p>Call a model API with a question and you get text back. That text cannot read your repository, run your tests or open a pull request. It cannot remember yesterday's conversation. It cannot stop itself from deleting a folder. It does not know whether its answer is correct.</p>
-<p>Something must sit between the model and the world. That something sends the model a prompt, reads its reply, runs the actions it asks for, feeds back the results, and repeats. It also decides what the model may do, what it remembers, and when the work is finished. This is the <strong>harness</strong>.</p>
+<p>Forget products and frameworks for a moment and look at what a model call actually is. You send a sequence of tokens. The model computes a probability for every possible next token, samples one, appends it and repeats until it emits a stop token. That is all. Everything else in this book follows from a few plain facts about that process and about the world the agent works in.</p>
+<div class="box def">
+  <span class="lbl">Six facts the rest of the book stands on</span>
+  <p><strong>Fact 1. The model only produces text.</strong> It can write <code>rm -rf build/</code>; it cannot run it. Any effect on the world needs code outside the model that reads the text and acts.</p>
+  <p><strong>Fact 2. The model keeps nothing between calls.</strong> The weights are fixed during use. If the model should know something on this call, it must be in this call's input. "Memory" is always the harness resending text.</p>
+  <p><strong>Fact 3. The input has a hard limit, and quality falls before the limit.</strong> The context window caps how much fits. Long before it fills, attention spreads thin and the model starts missing things in the middle.</p>
+  <p><strong>Fact 4. Every token costs money and time.</strong> Input is paid for on every call, again and again. A prefix the provider has already seen can be served from cache far cheaper, but only if it is byte-for-byte the same.</p>
+  <p><strong>Fact 5. The output is a sample, not a proof.</strong> It varies between runs, is sometimes wrong while sounding certain, and is shaped by everything in the input, including text written by an attacker. The model has no built-in way to tell your instructions from a web page's.</p>
+  <p><strong>Fact 6. The world is stateful, slow and fallible.</strong> Commands take minutes, networks fail, processes crash, laptops sleep, and some actions (a sent email, a force-push) cannot be undone.</p>
+</div>
+<p>Put facts 1 and 2 together and you get the first consequence. If the model cannot act and cannot remember, then something must sit between the model and the world: it sends the model a prompt, reads the reply, runs the actions the reply asks for, writes down what happened, and sends the updated record back on the next call. Add facts 3 to 6 and that something must also choose what to show, keep costs down, decide what the model may do, survive crashes and check results. That something is the <strong>harness</strong>.</p>
+<p>A useful way to read every design in this book: ask which fact forced it. A feature that answers none of them is decoration.</p>
 <p>The word comes from horse tack: the straps that connect a strong animal to the cart and let a driver steer it. The model provides the power. The harness turns that power into controlled, useful work. Chinese writers use exactly this picture: <em>马具</em>, horse tack, and translate harness engineering as <em>驾驭工程</em>, the engineering of driving and controlling.</p>
 <p>In 2026 this layer got its own name and its own discipline. Mitchell Hashimoto described the habit that defines it: every time an agent makes a mistake, engineer a permanent fix into its environment so that mistake cannot happen again. OpenAI, Anthropic, LangChain, Cursor and GitHub then published how their own harnesses work. This book builds one.</p>
 
@@ -43,6 +53,7 @@
         <span class="k">for</span> call <span class="k">in</span> reply.tool_calls:                    <span class="c"># 3. run each tool</span>
             output = run_bash(call.args[<span class="s">"command"</span>])
             messages.append(tool_result(call.id, output))  <span class="c"># 4. feed the result back</span></pre>
+<p>Why a loop and not a single call? Because of facts 1 and 2. The model needs to see the result of an action before it can choose the next one, and it can only see what the harness sends. So the harness must alternate: ask, act, append, ask again. The message list is the agent's whole working memory, and it grows by one action and one observation per step.</p>
 <p>This is the <strong>agent loop</strong>. It is the ReAct pattern from 2022: reason, act, observe, repeat. Every harness in this book runs a version of it. Thorsten Ball built a working coding agent in 315 lines of Go on this idea, and Chinese analyses note that the innermost loop can be about 200 lines.</p>
 
 <figure>
@@ -80,13 +91,13 @@
 <figcaption>The agent loop. The model (indigo) only decides. The harness (teal) builds every request and runs every action in the environment (amber). The loop ends when the model replies without a tool call.</figcaption>
 </figure>
 
-<p>The loop is easy. The hard questions start the moment you use it on real work:</p>
+<p>The loop is easy. The hard questions start the moment you use it on real work, and each one is a fact pushing back:</p>
 <ul>
-  <li>The test suite prints 40,000 lines. How much goes back to the model?</li>
-  <li>After two hours the conversation no longer fits the context window. What do you drop?</li>
-  <li>The model asks to run <code>rm -rf build/</code>. Do you run it? Who decides?</li>
-  <li>Your laptop sleeps in the middle of a task. Can the agent continue?</li>
-  <li>The model says "done". How do you know it is true?</li>
+  <li>The test suite prints 40,000 lines. How much goes back to the model? (Facts 3 and 4: every line costs money on every later call and dilutes attention.)</li>
+  <li>After two hours the conversation no longer fits the context window. What do you drop? (Fact 3, and fact 2: whatever you drop, the model has truly forgotten.)</li>
+  <li>The model asks to run <code>rm -rf build/</code>. Do you run it? Who decides? (Facts 5 and 6: the request may be wrong or injected, and the effect may be permanent.)</li>
+  <li>Your laptop sleeps in the middle of a task. Can the agent continue? (Fact 6, and fact 2: the model holds no state, so if the harness did not write it down, it is gone.)</li>
+  <li>The model says "done". How do you know it is true? (Fact 5: a claim is a sample, so only an outside check settles it.)</li>
 </ul>
 <p>Every answer is harness code. Community analysis of Claude Code's leaked source estimated that only about 1.6% of it is AI decision logic and 98.4% is operational infrastructure around the loop (<a href="https://arxiv.org/html/2604.14228v1">Dive into Claude Code</a>). The rest of this book is about that 98%.</p>
 
@@ -103,7 +114,7 @@
 <p>Two neighbouring terms. <strong>Prompt engineering</strong> asks how to phrase one request. <strong>Context engineering</strong> asks what the model should see in one window. <strong>Harness engineering</strong> asks what the whole system should allow, measure and correct across many windows over time. Each layer contains the one before it.</p>
 
 <h2 id="anatomy">4. Anatomy: eleven components</h2>
-<p>Every harness we read splits into the same eleven parts. Each chapter of this book takes one or two of them. Academic surveys reached similar lists: one formalizes a harness as a six-part tuple (execution loop, tool registry, context manager, state store, lifecycle hooks, evaluation interface); another uses a seven-layer taxonomy.</p>
+<p>Because the six facts are the same for every model, every harness ends up answering the same questions, and so every harness we read splits into the same eleven parts. The table names the fact behind each one; if you forget why a component exists, come back here. Each chapter of this book takes one or two of them. Academic surveys reached similar lists: one formalizes a harness as a six-part tuple (execution loop, tool registry, context manager, state store, lifecycle hooks, evaluation interface); another uses a seven-layer taxonomy.</p>
 
 <figure>
 <div class="svgwrap"><svg viewBox="0 0 760 420" width="760" style="max-width:100%;height:auto" role="img" aria-label="Eleven harness components around the agent loop">
@@ -167,17 +178,17 @@
 </figure>
 
 <div class="tbl"><table>
-  <tr><th>ID</th><th>Component</th><th>The question it answers</th><th>Chapter</th></tr>
-  <tr><td>A</td><td>Agent loop</td><td>When does a turn end, and who drives the loop?</td><td>1</td></tr>
-  <tr><td>K</td><td>Model and provider layer</td><td>How do we talk to many models, stream, retry and cache?</td><td>2</td></tr>
-  <tr><td>B</td><td>Tools</td><td>Which actions, how many, what output size, what edit format?</td><td>3</td></tr>
-  <tr><td>C</td><td>Instructions and context assembly</td><td>What does the model see before it acts?</td><td>4</td></tr>
-  <tr><td>D</td><td>Context management</td><td>What happens when the window is full?</td><td>5</td></tr>
-  <tr><td>E</td><td>State, sessions, memory</td><td>What survives a turn, a restart, a week?</td><td>6, 11</td></tr>
-  <tr><td>H</td><td>Safety</td><td>What may the agent do without asking?</td><td>7</td></tr>
-  <tr><td>I</td><td>Extensibility</td><td>How do others change the harness without forking it?</td><td>8</td></tr>
-  <tr><td>G, F</td><td>Subagents and planning</td><td>How is work split, and how does the agent stay on goal?</td><td>9</td></tr>
-  <tr><td>J</td><td>Verification and observability</td><td>How do we know the work is correct and the harness improved?</td><td>10, 14</td></tr>
+  <tr><th>ID</th><th>Component</th><th>The question it answers</th><th>Forced by</th><th>Chapter</th></tr>
+  <tr><td>A</td><td>Agent loop</td><td>When does a turn end, and who drives the loop?</td><td>Facts 1, 2</td><td>1</td></tr>
+  <tr><td>K</td><td>Model and provider layer</td><td>How do we talk to many models, stream, retry and cache?</td><td>Facts 4, 6</td><td>2</td></tr>
+  <tr><td>B</td><td>Tools</td><td>Which actions, how many, what output size, what edit format?</td><td>Facts 1, 3</td><td>3</td></tr>
+  <tr><td>C</td><td>Instructions and context assembly</td><td>What does the model see before it acts?</td><td>Facts 2, 4</td><td>4</td></tr>
+  <tr><td>D</td><td>Context management</td><td>What happens when the window is full?</td><td>Fact 3</td><td>5</td></tr>
+  <tr><td>E</td><td>State, sessions, memory</td><td>What survives a turn, a restart, a week?</td><td>Facts 2, 6</td><td>6, 11</td></tr>
+  <tr><td>H</td><td>Safety</td><td>What may the agent do without asking?</td><td>Facts 5, 6</td><td>7</td></tr>
+  <tr><td>I</td><td>Extensibility</td><td>How do others change the harness without forking it?</td><td>Fact 3 (load only what is needed)</td><td>8</td></tr>
+  <tr><td>G, F</td><td>Subagents and planning</td><td>How is work split, and how does the agent stay on goal?</td><td>Facts 3, 5</td><td>9</td></tr>
+  <tr><td>J</td><td>Verification and observability</td><td>How do we know the work is correct and the harness improved?</td><td>Fact 5</td><td>10, 14</td></tr>
 </table></div>
 
 <h2 id="history">5. A short history</h2>
@@ -193,7 +204,7 @@
 </table></div>
 
 <h2 id="evidence">6. Why the harness matters as much as the model</h2>
-<p>If the harness were plumbing, changing it would not change results. The evidence says otherwise.</p>
+<p>From the facts you can predict this before looking at data. The model only ever sees what the harness chose to send (fact 2), inside a limited window (fact 3), and only acts through the tools the harness offers (fact 1). So the harness controls the model's entire view of the problem and its entire reach. Two harnesses around the same weights are two different agents. The evidence agrees:</p>
 <ul>
   <li><strong>Same model, better harness.</strong> LangChain moved its coding agent from about Top 30 to Top 5 on Terminal Bench 2.0 by changing only the harness; self-verification and tracing helped most (<a href="https://langchain.com/blog/improving-deep-agents-with-harness-engineering">LangChain</a>).</li>
   <li><strong>Interfaces matter.</strong> SWE-agent's custom interface reached 12.5% on SWE-bench at a time when non-interactive approaches were far lower, with the same kind of model (<a href="https://arxiv.org/abs/2405.15793v2">SWE-agent</a>).</li>
@@ -248,7 +259,7 @@
 </svg></div>
 <figcaption>The author's placement, based on each project's code and docs. fx sits near the middle on core size: small binary, but web search, subagents, skills and MCP built in. Claude Code and Codex (grey) are the reference points. Our harness starts bottom left and moves up and right through the book.</figcaption>
 </figure>
-<p>Neither corner is correct. A small core is easy to read, cheap in tokens and easy to bend, but you build safety and planning yourself. Batteries included is safer for most users but hides context you cannot see. A durable service survives crashes and waits days for a human, but every step must be serializable and replay-safe. You will feel each trade-off when you build it.</p>
+<p>The two axes are two facts. Core size is a bet about fact 3: everything built in costs tokens on every call, so a small core keeps the window clear but leaves you to build what is missing. Durability is a bet about fact 6: if crashes and long waits are rare for your users, memory is enough; if they are normal, state must live outside the process. Neither corner is correct. A small core is easy to read, cheap in tokens and easy to bend, but you build safety and planning yourself. Batteries included is safer for most users but hides context you cannot see. A durable service survives crashes and waits days for a human, but every step must be serializable and replay-safe. You will feel each trade-off when you build it.</p>
 
 <h2 id="china">9. How Chinese teams see the harness</h2>
 <p>In China the harness became a strategy topic, not just an engineering one. Tencent Cloud's CEO Tang Daosheng wrote that AI has entered "the Harness era", and Alibaba, ByteDance and Tencent each paired a coding tool (Qoder, Trae, CodeBuddy) with a desktop agent and a skills marketplace (<a href="https://www.36kr.com/p/3777620397691911">36Kr</a>). Three ideas from Chinese writing are worth keeping:</p>
@@ -269,7 +280,7 @@
   <tr><td>4. Durability and surfaces</td><td>11 to 12</td><td>Survives <code>kill -9</code> mid-task</td></tr>
   <tr><td>5. Software factory</td><td>13 to 15</td><td>Issue in, draft pull request out</td></tr>
 </table></div>
-<p>Every chapter has the same five parts: the concept from first principles; a code tour of eve, fx, Pi and nanocode; a design-decision table with reasons and trade-offs; what research and Chinese teams say; and the build. Three rules guide the build:</p>
+<p>Every chapter has the same five parts: the concept, derived from the six facts above; a code tour of eve, fx, Pi and nanocode; a design-decision table with reasons and trade-offs; what research and Chinese teams say; and the build. Three rules guide the build:</p>
 <ol>
   <li><strong>Shape the loop for durability from day one.</strong> In Chapter 1 the loop body becomes a function <code>step(state) → (state, next)</code>, the shape eve uses, so Chapter 11 can make it durable without a rewrite.</li>
   <li><strong>Measure every change.</strong> From Chapter 1, a small set of test tasks runs every week. A change that does not move a number is a guess.</li>

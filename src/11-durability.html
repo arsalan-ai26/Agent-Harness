@@ -1,6 +1,6 @@
 <div class="kicker">Stage 4 · Durability and surfaces · Chapter 11</div>
 <h1>Durable execution</h1>
-<p class="lede">A terminal agent dies with its process. A durable agent survives crashes, redeploys and a laptop lid, and can wait days for a human. This is where eve, Pi Durable and nanocode converged independently in 2026, each in its own way. This chapter reads Pi Durable's 7,300-line specification, eve's workflow-backed sessions and nanocode's journaled runtime, then builds a SQLite journal with the "effect sandwich" and tests it by crashing the agent mid-task.</p>
+<p class="lede">Processes crash and machines sleep (fact 6), and the model holds none of the agent's state (fact 2), so a terminal agent dies with its process. A durable agent survives crashes, redeploys and a laptop lid, and can wait days for a human. This is where eve, Pi Durable and nanocode converged independently in 2026, each in its own way. This chapter reads Pi Durable's 7,300-line specification, eve's workflow-backed sessions and nanocode's journaled runtime, then builds a SQLite journal with the "effect sandwich" and tests it by crashing the agent mid-task.</p>
 <div class="meta">
   <span class="chip">Level: advanced</span>
   <span class="chip">Time: about 20 hours with the build</span>
@@ -23,6 +23,8 @@
 </div>
 
 <h2 id="problem">1. The problem in one picture</h2>
+<p>Reduce durability to its smallest question: after a crash, what does the new process need to continue exactly where the old one stopped? By fact 2 the model contributes nothing; any model can read the saved history and carry on. So the answer is only what the harness wrote down. If it wrote the message list after every step, the new process can rebuild the agent's mind. That part is easy.</p>
+<p>The hard part is the world (fact 6). Between "the model asked for <code>git push</code>" and "the result was appended", the push happens outside your process. A crash in that gap leaves a question that cannot be answered from the message list: did it run? Running it again might push twice or send a second email. Skipping it might lose the change. The only honest design is to write down your intent before the effect, write down the outcome after, and when you restart with an intent but no outcome, treat it as unknown: re-run it only if it is safe to repeat, otherwise ask or tell the model what is uncertain.</p>
 <figure>
 <div class="svgwrap"><svg viewBox="0 0 760 230" width="760" style="max-width:100%;height:auto" role="img" aria-label="The effect sandwich: commit intent, perform effect, commit outcome; a crash between them leaves an unknown outcome">
   <defs><marker id="g1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>

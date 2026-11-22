@@ -1,6 +1,6 @@
 <div class="kicker">Stage 4 · Durability and surfaces · Chapter 12</div>
 <h1>Surfaces: embedding, protocols and channels</h1>
-<p class="lede">The same harness can sit behind a terminal, an editor, a web app, Slack and a GitHub issue. Getting there means separating the harness from its front doors: a session API, an event stream, a protocol for editors, and channels that turn outside messages into sessions. This chapter reads how fx embeds itself in scripts, editors and apps, how eve's channels work, how nanocode runs one Rust core in many languages and how Pi exposes its modes, then builds a session server with a GitHub channel. It closes Stage 4.</p>
+<p class="lede">The model reads text and writes text; it has no idea whether a person typed in a terminal, clicked in an editor or commented on an issue. So the same harness can sit behind a terminal, an editor, a web app, Slack and a GitHub issue. Getting there means separating the harness from its front doors: a session API, an event stream, a protocol for editors, and channels that turn outside messages into sessions. This chapter reads how fx embeds itself in scripts, editors and apps, how eve's channels work, how nanocode runs one Rust core in many languages and how Pi exposes its modes, then builds a session server with a GitHub channel. It closes Stage 4.</p>
 <div class="meta">
   <span class="chip">Level: intermediate to advanced</span>
   <span class="chip">Time: about 20 hours with the build</span>
@@ -23,6 +23,8 @@
 </div>
 
 <h2 id="shape">1. Split the harness from its front doors</h2>
+<p>Derive the split. The model needs the same thing from every front door: text in, text out (fact 1). Each front door needs different things from the harness: a terminal wants a live stream, an editor wants file diffs and approvals, GitHub sends a webhook and waits hours for a reply. If each front door owned its own loop, you would build the harness again for each one, and their behaviour would drift.</p>
+<p>So put the boundary where the needs diverge. Behind it, one harness that only knows sessions, messages and events. In front of it, thin adapters that translate one surface's input into a message and the harness's events into that surface's output. Two more facts shape the API. A turn can take minutes or days (fact 6), so a front door cannot hold a request open waiting for the answer; it subscribes to an event stream and can reconnect from where it left off. And input from a public channel is untrusted text (fact 5), so deciding who may start or steer a session belongs at the door, before the text reaches the model.</p>
 <figure>
 <div class="svgwrap"><svg viewBox="0 0 760 260" width="760" style="max-width:100%;height:auto" role="img" aria-label="Several surfaces reach one harness through a session API and event log">
   <defs><marker id="h1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>

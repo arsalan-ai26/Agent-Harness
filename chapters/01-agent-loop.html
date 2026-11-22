@@ -15,7 +15,7 @@
 <main><article>
 <div class="kicker">Stage 1 · Foundations · Chapter 1</div>
 <h1>The agent loop</h1>
-<p class="lede">The loop is the smallest part of a harness and the one every other part plugs into. This chapter shows how four harnesses shape it, why eve does not loop at all, and how the shape you choose today decides whether your agent can become durable later. You end the chapter with a working 120-line agent and a baseline score.</p>
+<p class="lede">The loop exists because the model can neither act nor remember (facts 1 and 2 from Chapter 0), so something has to alternate between asking it and acting for it. It is the smallest part of a harness and the one every other part plugs into. This chapter shows how four harnesses shape it, why eve does not loop at all, and how the shape you choose today decides whether your agent can become durable later. You end the chapter with a working 120-line agent and a baseline score.</p>
 <div class="meta">
   <span class="chip">Level: intermediate</span>
   <span class="chip">Time: about 20 hours with the build</span>
@@ -38,7 +38,7 @@
 </div>
 
 <h2 id="vocab">1. Turn, step, run, session</h2>
-<p>The loop needs exact words, because harnesses save and resume at these boundaries.</p>
+<p>Start from fact 2: the model is stateless, so the only state an agent has is the message list the harness keeps. That list changes at exactly one kind of moment: after the model replies and its tool calls have run. Between those moments nothing new exists. So the natural unit of an agent is that change, and every other unit is a group of them. This is why harnesses save, resume and accept new input at these boundaries and nowhere else, and why the words need to be exact.</p>
 <div class="box def">
   <span class="lbl">Definitions</span>
   <p><strong>Step:</strong> one model call plus the tool calls it asks for. The smallest unit that changes the conversation.</p>
@@ -49,14 +49,14 @@
 </div>
 
 <h2 id="anatomy">2. What the loop must decide</h2>
-<p>The toy loop from Chapter 0 hides six decisions. Each harness answers them differently.</p>
+<p>The toy loop from Chapter 0 hides six decisions. You can derive each one, and the reasonable answers, from the facts.</p>
 <ol>
-  <li><strong>When to stop.</strong> Normally when the model replies without tool calls. Harnesses add step limits, token budgets, cancellation, and stop hooks that can push the agent to keep working (for example "tests still fail").</li>
-  <li><strong>How to run several tool calls.</strong> A model can ask for five reads at once. Run them in parallel (fast) or in order (safe when tools share state)?</li>
-  <li><strong>When new user input is seen.</strong> Interrupt now, or wait for the next step boundary?</li>
-  <li><strong>What happens between steps.</strong> Compaction, model switches, context updates and checkpoints all happen here.</li>
-  <li><strong>Where state lives.</strong> In memory (lost on crash) or written down after every step?</li>
-  <li><strong>Who calls whom.</strong> Does the loop call the model, or does an outside engine call the loop one step at a time?</li>
+  <li><strong>When to stop.</strong> The only signal the model can give is text, so "I am done" is a reply with no tool call. But that signal is a sample (fact 5): the model can stop too early or never stop. So the harness needs its own limits it does not delegate to the model: step limits, token budgets, cancellation, and stop hooks that check the world (for example "tests still fail") before accepting the stop.</li>
+  <li><strong>How to run several tool calls.</strong> A model can ask for five reads at once. Tools act on a stateful world (fact 6). Reads do not change it, so their order does not matter and running them in parallel only saves time. Writes do change it, so two writes to one file must run in order. The rule follows: parallel by default, sequential when tools share state.</li>
+  <li><strong>When new user input is seen.</strong> The model reads its input once, at the start of a call (fact 2). A message that arrives mid-call cannot reach it until the next call. So the only real choice is between cancelling the current step or queueing the message for the next step boundary.</li>
+  <li><strong>What happens between steps.</strong> The step boundary is the only moment the message list is complete and consistent, so it is the only safe moment to rewrite it. Compaction, model switches, context updates and checkpoints all happen here for that reason.</li>
+  <li><strong>Where state lives.</strong> All state is the message list plus side effects in the world. Processes crash (fact 6). If the list is only in memory, a crash erases the agent's entire mind, while the world keeps the half-finished changes. Writing it down after every step costs a little; not writing it down costs the whole turn.</li>
+  <li><strong>Who calls whom.</strong> If the loop owns the <code>while</code>, the process must stay alive until the turn ends. If an outside engine calls one step at a time and saves between calls, no single process has to live that long. This choice decides whether durability is easy later.</li>
 </ol>
 
 <h2 id="shapes">3. Three loop shapes</h2>
@@ -101,7 +101,7 @@
   <text x="626" y="196" text-anchor="middle" style="fill:var(--ink);font-size:11px">store: JSONL, SQL</text>
   <text x="528" y="236" style="fill:var(--good);font-size:11px">crash: finish from journal</text>
 </svg></div>
-<figcaption>Three shapes. A keeps everything in memory and is the easiest to read. B hands control to an engine after every step. C keeps a loop but writes every call to storage before moving on.</figcaption>
+<figcaption>Three shapes, three answers to "where does the state live between steps". A keeps everything in memory and is the easiest to read. B hands control to an engine after every step. C keeps a loop but writes every call to storage before moving on.</figcaption>
 </figure>
 
 <h2 id="tour">4. Code tour</h2>
@@ -128,7 +128,7 @@
 </table></div>
 <div class="box expert">
   <span class="lbl">Why this matters later</span>
-  <p>Making an in-memory loop durable after the fact is hard: you discover every hidden piece of state (an open file handle, a half-streamed reply, a background process). Writing the loop body as <code>step(state) → state</code> from the start forces all state into one object you can save. We do that now, and Chapter 11 adds the journal.</p>
+  <p>From fact 2, the agent's true state is small: the message list and a few counters. Any state the loop holds outside that object (an open file handle, a half-streamed reply, a background process) is state the model never sees and a crash will lose. Making an in-memory loop durable after the fact is hard because you have to discover all of that hidden state one bug at a time. Writing the loop body as <code>step(state) → state</code> from the start forces all state into one object you can save. We do that now, and Chapter 11 adds the journal.</p>
 </div>
 
 <h2 id="research">6. Research and how Chinese teams see the loop</h2>

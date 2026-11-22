@@ -15,7 +15,7 @@
 <main><article>
 <div class="kicker">Stage 3 · Control · Chapter 10</div>
 <h1>Verification, evals and observability</h1>
-<p class="lede">A harness change that is not measured is a guess. This chapter is about three feedback loops: the agent checking its own work before it stops, you checking whether a harness change helped, and everyone seeing where time, tokens and money went. It reads eve's eval framework, Pi's paired "lift" evals, fx's 2 ms performance gate and nanocode's cost fold, then builds tracing, a cost report and a paired A/B eval runner. It closes Stage 3.</p>
+<p class="lede">The model's output is a sample (fact 5): the same harness on the same task can pass today and fail tomorrow, and a confident "done" is not evidence. So a harness change that is not measured, many times, is a guess. This chapter is about three feedback loops: the agent checking its own work before it stops, you checking whether a harness change helped, and everyone seeing where time, tokens and money went. It reads eve's eval framework, Pi's paired "lift" evals, fx's 2 ms performance gate and nanocode's cost fold, then builds tracing, a cost report and a paired A/B eval runner. It closes Stage 3.</p>
 <div class="meta">
   <span class="chip">Level: intermediate</span>
   <span class="chip">Time: about 20 hours with the build</span>
@@ -38,6 +38,9 @@
 </div>
 
 <h2 id="loops">1. Three feedback loops</h2>
+<p>Fact 5 has three consequences, one per loop. First, within a turn: the model cannot verify its own claim by thinking harder, because the check would be another sample from the same model reading the same context. Only something outside the model (a test run, a type checker, a diff) adds new information. So the agent must run checks before it stops, and the harness should refuse a stop that skipped them.</p>
+<p>Second, across harness versions: if one run of a task is a coin flip with an unknown bias, one run tells you almost nothing. You need repeats, and you need to compare versions on the same tasks, because the differences between tasks are much larger than the difference you are trying to detect. That is why paired comparisons (same task, version A against version B) find real effects with far fewer runs than comparing two overall averages.</p>
+<p>Third, across operations: because cost and time grow with session length (facts 2 and 4), a harness can get worse in money and latency while its pass rate stays flat. You only see that if every step records what it spent.</p>
 <figure>
 <div class="svgwrap"><svg viewBox="0 0 760 220" width="760" style="max-width:100%;height:auto" role="img" aria-label="Three feedback loops: inside the turn, across harness versions, across operations">
   <rect x="24" y="30" width="220" height="150" rx="10" style="fill:var(--kv-s);stroke:var(--kv)"/>

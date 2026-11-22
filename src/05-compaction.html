@@ -1,6 +1,6 @@
 <div class="kicker">Stage 2 · Context · Chapter 5</div>
 <h1>Context management and compaction</h1>
-<p class="lede">Every long session eventually fills the context window. Compaction replaces old turns with a summary so the agent can keep working. It is also where harnesses quietly lose information. This chapter reads four real compactors with their exact thresholds, shows why fx verifies its own summaries and why Pi Durable compacts in the background, then builds a compactor with turn handles, a lint pass and recallable raw history.</p>
+<p class="lede">The window is finite (fact 3) and every step appends to it, so every long session eventually fills it. Compaction replaces old turns with a summary so the agent can keep working. It is also where harnesses quietly lose information. This chapter reads four real compactors with their exact thresholds, shows why fx verifies its own summaries and why Pi Durable compacts in the background, then builds a compactor with turn handles, a lint pass and recallable raw history.</p>
 <div class="meta">
   <span class="chip">Level: intermediate to advanced</span>
   <span class="chip">Time: about 20 hours with the build</span>
@@ -23,7 +23,8 @@
 </div>
 
 <h2 id="why">1. The problem</h2>
-<p>A coding agent's context grows with every tool result. Manus measured about 50 tool calls per task and about 100 input tokens for every output token. Long before the window is full, quality drops (often called context rot) and cost rises. The harness has four tools against this, in rising order of loss:</p>
+<p>Do the arithmetic first. Each step appends a model reply and a tool result, and the next step resends everything (fact 2). If a session has <em>n</em> steps of roughly equal size, the total tokens sent are about 1 + 2 + ... + <em>n</em>, which grows with <em>n</em>&sup2;. Manus measured about 50 tool calls per task and about 100 input tokens for every output token, which is exactly what that arithmetic predicts. Long before the hard limit, a second effect hits: attention is spread over every token in the window, so the more irrelevant tokens there are, the less weight the relevant ones get (often called context rot).</p>
+<p>So the window is a budget, and there are only two ways to stay inside a budget: spend less, or throw some away. Throwing away is dangerous because of fact 2: whatever leaves the window, the model has truly forgotten, and it does not know that it has forgotten. That gives the order of preference. The harness has four tools, in rising order of what is lost:</p>
 <ol>
   <li><strong>Bound tool output</strong> at the source (Chapter 3: 2,000 lines or 50 KB, full output saved to a file).</li>
   <li><strong>Offload</strong>: keep large content in files and keep only the path in context (Manus calls this restorable compression).</li>
@@ -45,7 +46,7 @@
   <rect x="88" y="170" width="450" height="30" rx="4" style="fill:none;stroke:var(--line);stroke-dasharray:4 3"/>
   <text x="100" y="190" style="fill:var(--ink2);font-size:11px">raw old turns archived on disk, recallable by handle</text>
 </svg></div>
-<figcaption>Compaction trades a long middle for a short checkpoint. The prefix stays cached; the raw history leaves the context but not the disk.</figcaption>
+<figcaption>Compaction trades a long middle for a short checkpoint. The summary is written by the model, so it is a sample (fact 5) and can drop or invent details; that is why the best compactors check it. The prefix stays cached; the raw history leaves the context but not the disk.</figcaption>
 </figure>
 
 <h2 id="tour">2. Four compactors, with their real numbers</h2>
