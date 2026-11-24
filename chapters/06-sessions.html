@@ -15,110 +15,646 @@
 <main><article>
 <div class="kicker">Stage 2 · Context · Chapter 6</div>
 <h1>Sessions, state and memory</h1>
-<p class="lede">The model forgets everything after each call (fact 2) and processes die (fact 6), so anything an agent "knows" over time is something the harness wrote down. A session is what lets you close the terminal and come back. State is what the agent knows is true right now. Memory is what it should still know next week. Harnesses mix these up at their cost. This chapter reads Pi's tree-shaped session files, fx's resumable sessions, eve's state and memory slots and nanocode's stores, then builds an append-only session tree with branching, resume and a memory slot that compaction can never touch. It closes Stage 2.</p>
+<p class="lede">The model keeps nothing between calls (fact 2), so everything an agent "remembers" is something the harness wrote down. The question is what to write, in what shape, for how long, and who reads it. This chapter separates three records that are easy to confuse (history, state and memory), derives the shape each should take, and walks through ten design decisions: append-only logs, trees and branches, what a session records besides messages, rewinding files as well as words, storage, typed state, and how cross-session memory is captured, recalled and kept safe. It ends with the session tree and memory slot you build.</p>
 <div class="meta">
   <span class="chip">Level: intermediate</span>
-  <span class="chip">Time: about 20 hours with the build</span>
-  <span class="chip">Needs: Chapters 4 and 5</span>
-  <span class="chip">Code read at: Pi fb248c7, eve 5c52fbf, fx cbe7daf, nanocode 015cbfa</span>
+  <span class="chip">Time: about 12 hours with the build</span>
+  <span class="chip">Needs: Chapters 1 to 5</span>
+  <span class="chip">Harnesses read: Pi, eve, fx, nanocode, Codex, Claude Code, Kimi Code, Qwen Code, Trae Agent</span>
 </div>
 
 <div class="box skip">
   <span class="lbl">Before you start: skip check</span>
   <ol>
-    <li>What is the difference between history and memory?</li>
-    <li>Why store a session as a tree instead of a list?</li>
-    <li>Why should memory stay outside the conversation history?</li>
+    <li>Why should the remaining budget or the list of running background jobs not live only in the message history?</li>
+    <li>Kimi Code undoes the last three messages without deleting anything. How?</li>
+    <li>Claude Code's rewind can restore code, conversation or both. Why can it not always restore a file that only a shell command changed?</li>
+    <li>Codex's memory folder is itself a git repository. What does that buy?</li>
   </ol>
   <details><summary>Answers</summary><ol>
-    <li>History is what happened in this session (messages, tool calls). Memory is selected knowledge that should carry into future sessions.</li>
-    <li>So you can go back to an earlier point and try another approach without deleting the first attempt or dragging its detours through the context.</li>
-    <li>If it lives in history, compaction may summarize it away or distort it. Outside, it is recalled fresh every turn.</li>
+    <li>Compaction summarises history, and a summary is a sample (fact 5): it can round a number or drop a job. Values the harness must get exactly right belong in typed state outside the messages.</li>
+    <li>It appends an undo record with a count. The conversation the model sees is computed from the log, and the record retracts the previous messages in that computation.</li>
+    <li>Checkpoints snapshot files the file-editing tools touched. A file changed only by a shell command was never snapshotted, so the documentation sends you to git for that case.</li>
+    <li>Every change the background pipeline makes to memory can be inspected and reverted, so a bad consolidation is not permanent.</li>
   </ol></details>
 </div>
 
-<h2 id="three">1. Three different things</h2>
-<p>Since the model remembers nothing, ask a sharper question: what does the harness need to write down, and for how long? There are three answers, and they differ in who reads the record and when.</p>
-<ul>
-  <li>To <strong>resume or audit</strong> a conversation, you need what actually happened, in order, unchanged. Anything else could be wrong. That is <strong>history</strong>, and the only safe operation on a record of the past is appending.</li>
-  <li>To <strong>keep working correctly</strong>, the harness needs some facts to be exact: the budget left, the plan, which background jobs are running. A summary written by the model (fact 5) might round a number or drop a job. So these live outside the message list as typed values. That is <strong>state</strong>.</li>
-  <li>To <strong>help next week</strong>, you need a small selection that is still true and still useful after the conversation is gone. A full history is too large to resend (fact 3), so something must choose. That is <strong>memory</strong>.</li>
-</ul>
-<p>Mixing them causes predictable failures: store state only in messages and compaction will paraphrase it away; store memory in history and it disappears when the session ends; edit history in place and you can no longer trust what happened.</p>
-<div class="tbl"><table>
-  <tr><th></th><th>History</th><th>State</th><th>Memory</th></tr>
-  <tr><td>What</td><td>Every message and tool call, in order</td><td>Typed values the harness tracks: plan, budget, task table, cwd</td><td>Facts and preferences selected to survive sessions</td></tr>
-  <tr><td>Lifetime</td><td>One session (archived forever)</td><td>One session</td><td>Many sessions</td></tr>
-  <tr><td>Changed by</td><td>Appending only</td><td>The harness and tools</td><td>Explicit save tools or a capture step</td></tr>
-  <tr><td>Compaction</td><td>Summarizes it</td><td>Must not touch it</td><td>Must not see it</td></tr>
-</table></div>
 
-<h2 id="tour">2. Code tour</h2>
-<h3>Pi: sessions are append-only trees</h3>
-<p>The comment on <code>SessionManager</code> in <code>packages/coding-agent/src/core/session-manager.ts</code> says it best: sessions are append-only trees stored in JSONL files; each entry has an <code>id</code> and <code>parentId</code>; a leaf pointer tracks the current position; appending creates a child of the leaf; branching moves the leaf to an earlier entry, so new branches never modify history. <code>buildSessionContext()</code> walks from the root to the leaf and applies compaction summaries on the way.</p>
-<p>The entry types show what a session must record beyond messages: <code>model_change</code>, <code>thinking_level_change</code>, <code>usage</code>, <code>compaction</code>, <code>branch_summary</code>, <code>label</code> (bookmarks), <code>custom</code> (extension state), <code>context_edit</code>. A version-1 to version-2 migration added the tree, a reminder that session formats need versioning. Users drive it with <code>/tree</code>, <code>/fork</code> and <code>/clone</code>, all branches in one file.</p>
-<h3>fx: resumable by project</h3>
-<p>fx saves conversations under <code>~/.fx/sessions/</code>; <code>fx -c</code> picks up the last session in the current project and <code>fx ask --resume</code> continues one from a script. When fx compacts, the full text stays on disk where the agent can look it up (<code>src/core/session/</code>, <code>src/core/session_manager/</code>, <code>src/core/compactor/records.zig</code>).</p>
-<h3>eve: session, turn, step; state; memory slots</h3>
-<p>eve nests work in session, turn and step, and stores typed session values with <code>defineState</code>. Memory is separate (<code>docs/memory/index.mdx</code>): each slot is a file in <code>agent/memory/</code> that names a provider (built-in file memory on Vercel Blob, or Supermemory, Upstash, your own) and a scope (for example per signed-in caller). On every turn eve resolves the scope, asks the provider to <em>recall</em>, gives the model the provider's tools as <code>&lt;slot&gt;__&lt;tool&gt;</code>, and asks it to <em>capture</em> after the turn. Recalled content enters as user messages labeled with the slot, never as system instructions, and the summarizer never sees it.</p>
-<h3>nanocode: stores you choose</h3>
-<p><code>crates/integrations/store-jsonl</code> writes one append-only file per session (the CLI default). <code>store-sql</code> runs the same records over SQLite, Postgres or a host's own database, and on WASM over Durable Objects or D1. Branches live in <code>crates/runtime/durability</code>. Content-addressed blobs (<code>crates/integrations/s3</code>) keep large payloads out of rows.</p>
+<h2 id="three">1. Three different records</h2>
+<p>Ask what the harness needs to write down and who will read it. Three different answers come out, and mixing them causes predictable failures.</p>
 
 <figure>
-<div class="svgwrap"><svg viewBox="0 0 760 220" width="760" style="max-width:100%;height:auto" role="img" aria-label="A session tree with two branches and a leaf pointer">
-  <g style="fill:none;stroke:var(--ink2);stroke-width:1.3">
-    <path d="M110 110H160"/><path d="M250 110H300"/><path d="M390 110C410 110 410 60 440 60"/><path d="M390 110C410 110 410 160 440 160"/><path d="M530 160H580"/>
-  </g>
-  <rect x="24" y="92" width="86" height="36" rx="6" style="fill:var(--panel2);stroke:var(--line)"/><text x="67" y="114" text-anchor="middle" style="fill:var(--ink);font-size:11px">session</text>
-  <rect x="160" y="92" width="90" height="36" rx="6" style="fill:var(--panel);stroke:var(--line)"/><text x="205" y="114" text-anchor="middle" style="fill:var(--ink);font-size:11px">user: fix bug</text>
-  <rect x="300" y="92" width="90" height="36" rx="6" style="fill:var(--panel);stroke:var(--line)"/><text x="345" y="114" text-anchor="middle" style="fill:var(--ink);font-size:11px">read files</text>
-  <rect x="440" y="42" width="90" height="36" rx="6" style="fill:var(--panel2);stroke:var(--line);stroke-dasharray:4 3"/><text x="485" y="64" text-anchor="middle" style="fill:var(--ink2);font-size:11px">approach A</text>
-  <rect x="440" y="142" width="90" height="36" rx="6" style="fill:var(--panel);stroke:var(--line)"/><text x="485" y="164" text-anchor="middle" style="fill:var(--ink);font-size:11px">approach B</text>
-  <rect x="580" y="142" width="96" height="36" rx="6" style="fill:var(--kv-s);stroke:var(--kv);stroke-width:2"/><text x="628" y="164" text-anchor="middle" style="fill:var(--ink);font-size:11px">tests pass</text>
-  <text x="686" y="164" style="fill:var(--kv);font-size:11px;font-weight:600">leaf</text>
-  <text x="440" y="100" style="fill:var(--ink2);font-size:10px">abandoned branch stays in the file</text>
-  <text x="24" y="206" style="fill:var(--ink2);font-size:11px">The model sees only the path from the root to the leaf. Every branch is kept.</text>
+<div class="svgwrap"><svg viewBox="0 0 760 186" width="760" style="max-width:100%;height:auto" role="img" aria-label="History, state and memory">
+  <defs><marker id="m1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <text x="10" y="18" text-anchor="start" style="fill:var(--ink);font-size:12px;font-weight:600">History</text>
+  <text x="10" y="34" text-anchor="start" style="fill:var(--ink2);font-size:10px">what happened, in order</text>
+  <rect x="10" y="44" width="238" height="86" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="129.0" y="76.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">every message, call and result;</text>
+  <text x="129.0" y="90.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">read to resume, audit or replay;</text>
+  <text x="129.0" y="104.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">only safe operation: append</text>
+  <rect x="10" y="142" width="238" height="34" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="129.0" y="162.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">compaction summarises it</text>
+  <text x="260" y="18" text-anchor="start" style="fill:var(--ink);font-size:12px;font-weight:600">State</text>
+  <text x="260" y="34" text-anchor="start" style="fill:var(--ink2);font-size:10px">what must be exact now</text>
+  <rect x="260" y="44" width="238" height="86" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="379.0" y="76.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">plan, budget, jobs, cwd,</text>
+  <text x="379.0" y="90.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">permission mode; typed values</text>
+  <text x="379.0" y="104.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">the harness owns</text>
+  <rect x="260" y="142" width="238" height="34" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="379.0" y="162.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">compaction must not touch it</text>
+  <text x="510" y="18" text-anchor="start" style="fill:var(--ink);font-size:12px;font-weight:600">Memory</text>
+  <text x="510" y="34" text-anchor="start" style="fill:var(--ink2);font-size:10px">what helps next week</text>
+  <rect x="510" y="44" width="238" height="86" rx="7" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="629.0" y="76.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">a small selection still true</text>
+  <text x="629.0" y="90.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">after the session ends;</text>
+  <text x="629.0" y="104.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">captured, recalled, pruned</text>
+  <rect x="510" y="142" width="238" height="34" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="629.0" y="162.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">compaction must not see it</text>
 </svg></div>
-<figcaption>Pi's session tree. Approach A failed; the user branched back and tried B. A stays on disk but never pollutes B's context.</figcaption>
+<figcaption>Figure 1. Three records, three lifetimes. Store state only in messages and compaction paraphrases it away; store memory only in history and it ends with the session; edit history and you can no longer trust it.</figcaption>
 </figure>
 
-<h3>Codex: rollouts, a state database and a two-phase memory</h3>
-<p>Codex writes each session as a "rollout": a JSONL file named <code>rollout-&lt;timestamp&gt;-&lt;uuid&gt;.jsonl</code>, optionally compressed to <code>.jsonl.zst</code> (<code>codex-rs/rollout/</code>), with a SQLite state database for indexing and search. The CLI has <code>resume</code>, <code>fork</code>, <code>archive</code> and <code>unarchive</code>. Memory is a separate background pipeline (<code>codex-rs/memories/README.md</code>). Phase 1 picks recent, idle sessions, asks a model to extract a raw memory and a short summary from each, and redacts secrets. Phase 2 takes a global lock, ranks memories by how often and how recently they were used, drops ones unused for too long, and consolidates them into files under <code>~/.codex/memories/</code>, which is itself a git repository so every change can be inspected and reverted.</p>
-<h3>Claude Code: append-only transcripts and file checkpoints</h3>
-<p>Per the paper, Claude Code keeps three records: append-only JSONL transcripts, a global prompt history, and separate "sidechain" transcripts for subagents. Compaction never rewrites a transcript; boundaries are recorded and the chain is patched when it is read. File-history checkpoints under <code>~/.claude/file-history/&lt;sessionId&gt;/</code> let a user rewind file changes, which the transcript alone cannot undo (fact 6). Memory is plain files; to recall, a model scans the headers of the memory files and picks up to five, with no embeddings.</p>
-<h3>Kimi Code: one log per agent, undo by appending</h3>
-<p>Kimi Code stores each agent's events in its own <code>agents/&lt;agentId&gt;/wire.jsonl</code>; the main agent is <code>agents/main/</code>. A parent's log holds only the subagent call and its result. Undo does not delete anything: a <code>context.undo</code> record with a count retracts the previous N messages, and compaction is a <code>context.apply_compaction</code> record. The log is the truth; the conversation the model sees is computed from it.</p>
-<h3>Qwen Code: sessions with sidecars</h3>
-<p>Qwen Code's <code>chatRecordingService.ts</code> records the conversation, and separate sidecar files store titles, branches, goals and artifact summaries (<code>session-branch-sidecar.ts</code>, <code>session-goal-sidecar.ts</code>), so a small change does not rewrite a large transcript. A writer lease (<code>session-writer-lease.ts</code>) makes sure only one process writes a session at a time, and file-history services keep backups of files the agent changed.</p>
-<h3>Trae Agent: a trajectory, not a session</h3>
-<p>Trae Agent records every step's model request, response and tool calls to a trajectory JSON file (<code>utils/trajectory_recorder.py</code>), but it has no resume. Each run is one task from start to finish, which is what a benchmark needs.</p>
-
-<h2 id="decisions">3. Design decisions compared</h2>
 <div class="tbl"><table>
-  <tr><th>Decision</th><th>Pi</th><th>fx</th><th>eve</th><th>nanocode</th></tr>
-  <tr><td>Shape</td><td>Tree in one JSONL file</td><td>Linear, resumable</td><td>Session, turn, step in a workflow</td><td>Log with branches</td></tr>
-  <tr><td>Storage</td><td>Local files</td><td>Local files</td><td>Workflow world (local, Vercel, Postgres)</td><td>JSONL, SQL, WASM hosts</td></tr>
-  <tr><td>Cross-session memory</td><td>AGENTS.md and extensions</td><td>AGENTS.md, skills</td><td>Memory slots with providers and scopes</td><td>AGENTS.md, host stores</td></tr>
-  <tr><td>Pro</td><td>Explore without polluting context</td><td>Simple</td><td>Scoped, multi-user memory</td><td>Same records everywhere</td></tr>
-  <tr><td>Con</td><td>Tree UI is harder</td><td>No branching</td><td>Needs a platform</td><td>Complex</td></tr>
-</table></div>
-<p>The same decisions in the five reference harnesses:</p>
-<div class="tbl"><table>
-  <tr><th>Decision</th><th>Codex</th><th>Claude Code</th><th>Kimi Code</th><th>Qwen Code</th><th>Trae Agent</th></tr>
-<tr><td>History format</td><td>JSONL rollout (optionally zstd) plus SQLite index</td><td>Append-only JSONL plus sidechains</td><td>Event log per agent</td><td>Recording plus sidecars</td><td>Trajectory JSON</td></tr>
-<tr><td>Branching</td><td><code>fork</code> command</td><td>Fork and resume</td><td>Undo by retraction records</td><td>Branch sidecar</td><td>None</td></tr>
-<tr><td>Memory</td><td>Two-phase extraction and consolidation into a git-tracked folder</td><td>Files; model picks up to 5 by header</td><td>AGENTS.md only; we found no separate memory store</td><td>Memory tools (<code>manage-memory</code>, <code>search-memory</code>)</td><td>None</td></tr>
-<tr><td>File undo</td><td>Turn diff tracker (diff per turn)</td><td>File-history checkpoints</td><td>Undo service</td><td>File-history backups</td><td>Git diff only</td></tr>
+  <tr><th></th><th>History</th><th>State</th><th>Memory</th></tr>
+  <tr><td>Lifetime</td><td>One session, archived</td><td>One session</td><td>Many sessions</td></tr>
+  <tr><td>Changed by</td><td>Appending only</td><td>The harness and its tools</td><td>A capture step or explicit save tools</td></tr>
+  <tr><td>Shape</td><td>Log (linear or tree)</td><td>Typed fields</td><td>Small files or a store, indexed</td></tr>
+  <tr><td>Main risk</td><td>Rewriting it</td><td>Losing it to a summary</td><td>Stale or poisoned entries</td></tr>
 </table></div>
 
-<h2 id="research">4. Research and the Chinese view</h2>
+<h2 id="decisions">2. The decisions, one at a time</h2>
+<h3 id="d-append">Decision 1. Is history ever rewritten?</h3>
+<p>No harness in this book rewrites history. Compaction, undo and branching are all new records, and the conversation the model sees is computed from the log when it is needed. This is the event-sourcing pattern: the log is the truth, the request is a projection.</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 200" width="760" style="max-width:100%;height:auto" role="img" aria-label="Log, projection, request">
+  <defs><marker id="m2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <text x="10" y="16" text-anchor="start" style="fill:var(--ink);font-size:11px;font-weight:600">Append-only log on disk</text>
+  <rect x="10" y="24" width="86" height="30" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="53.0" y="42.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">user</text>
+  <rect x="102" y="24" width="86" height="30" rx="7" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="145.0" y="42.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">call</text>
+  <rect x="194" y="24" width="86" height="30" rx="7" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="237.0" y="42.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">result</text>
+  <rect x="286" y="24" width="86" height="30" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="329.0" y="42.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">reply</text>
+  <rect x="378" y="24" width="86" height="30" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="421.0" y="42.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">user</text>
+  <rect x="470" y="24" width="86" height="30" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="513.0" y="42.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">compaction</text>
+  <rect x="562" y="24" width="86" height="30" rx="7" style="fill:var(--bad-s);stroke:var(--bad)"/>
+  <text x="605.0" y="42.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">undo 1</text>
+  <rect x="654" y="24" width="86" height="30" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="697.0" y="42.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">user</text>
+  <path d="M380 58V86" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m2)"/>
+  <rect x="140" y="90" width="480" height="34" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="380.0" y="110.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">projection: apply compaction and undo records, walk to the leaf</text>
+  <path d="M380 126V150" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m2)"/>
+  <rect x="250" y="154" width="260" height="30" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="380.0" y="172.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">messages sent to the model</text>
+</svg></div>
+<figcaption>Figure 2. Kimi Code records undo as a retraction with a count and compaction as an apply record; Claude Code records compact boundaries and patches the chain when it loads the transcript; Pi applies summaries while walking from root to leaf.</figcaption>
+</figure>
+
+<p>Why insist on this? Three reasons fall out of the facts. A resumed session must reproduce exactly what the model was shown, or the model's next step is based on a context it never saw. An audit or an eval (Chapter 10) needs the real sequence, not a cleaned-up one. And a crash mid-write (Chapter 11) can only corrupt the last line of an append-only file, never the history before it.</p>
+
+<h3 id="d-shape">Decision 2. A line or a tree?</h3>
+<p>A linear log is enough until the user wants to go back and try another approach. Then there are two choices: throw away the later part, or keep it and start a branch.</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 220" width="760" style="max-width:100%;height:auto" role="img" aria-label="Pi session tree">
+  <defs><marker id="m3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="20" y="85" width="100" height="30" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="70.0" y="103.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">session</text>
+  <rect x="130" y="85" width="100" height="30" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="180.0" y="103.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">user: fix bug</text>
+  <rect x="250" y="85" width="100" height="30" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="300.0" y="103.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">read files</text>
+  <rect x="380" y="35" width="100" height="30" rx="7" style="fill:var(--bad-s);stroke:var(--bad)"/>
+  <text x="430.0" y="53.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">approach A</text>
+  <rect x="500" y="35" width="100" height="30" rx="7" style="fill:var(--bad-s);stroke:var(--bad)"/>
+  <text x="550.0" y="53.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">tests fail</text>
+  <rect x="380" y="135" width="100" height="30" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="430.0" y="153.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">approach B</text>
+  <rect x="500" y="135" width="100" height="30" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="550.0" y="153.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">tests pass</text>
+  <rect x="620" y="135" width="100" height="30" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="670.0" y="153.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">leaf</text>
+  <path d="M120 100L128 100" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m3)"/>
+  <path d="M230 100L248 100" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m3)"/>
+  <path d="M350 100L378 50" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m3)"/>
+  <path d="M480 50L498 50" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m3)"/>
+  <path d="M350 100L378 150" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m3)"/>
+  <path d="M480 150L498 150" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m3)"/>
+  <path d="M600 150L618 150" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m3)"/>
+  <text x="470" y="22" text-anchor="start" style="fill:var(--ink2);font-size:10px">abandoned branch stays in the file</text>
+  <text x="10" y="200" text-anchor="start" style="fill:var(--ink2);font-size:10px">The model sees only the path from the root to the leaf. Moving to another branch can summarise the one you leave.</text>
+</svg></div>
+<figcaption>Figure 3. Pi stores each session as an append-only tree in one file: every entry has an ID and a parent, a leaf pointer marks the current position, and branching just moves the leaf.</figcaption>
+</figure>
+
+<div class="tbl"><table>
+  <tr><th>Shape</th><th>Who</th><th>Pro</th><th>Con</th></tr>
+  <tr><td>Tree in one file</td><td>Pi (tree, fork and clone commands)</td><td>Explore alternatives without polluting context; nothing lost</td><td>Harder UI; every reader must understand parent links</td></tr>
+  <tr><td>Linear log + fork into a new session</td><td>Codex, Claude Code (fork, branch), Qwen Code (branch sidecar)</td><td>Each session stays simple</td><td>Related attempts live in separate files</td></tr>
+  <tr><td>Linear log + retraction records</td><td>Kimi Code</td><td>Undo without losing the record</td><td>No side-by-side branches</td></tr>
+  <tr><td>Trajectory, no resume</td><td>Trae Agent</td><td>One run, one file: ideal for benchmarks</td><td>Cannot continue a session</td></tr>
+</table></div>
+
+<h3 id="d-what">Decision 3. What does a session record besides messages?</h3>
+<p>To replay a session exactly, the log must hold everything that changed what the model saw or how it was called. Pi's entry types are a good checklist.</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 150" width="760" style="max-width:100%;height:auto" role="img" aria-label="Pi entry types">
+  <defs><marker id="m4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="14" width="140" height="34" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="80.0" y="34.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">message</text>
+  <rect x="160" y="14" width="140" height="34" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="230.0" y="34.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">model change</text>
+  <rect x="310" y="14" width="140" height="34" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="380.0" y="34.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">thinking level</text>
+  <rect x="460" y="14" width="140" height="34" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="530.0" y="34.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">usage</text>
+  <rect x="610" y="14" width="140" height="34" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="680.0" y="34.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">compaction</text>
+  <rect x="10" y="58" width="140" height="34" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="80.0" y="78.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">branch summary</text>
+  <rect x="160" y="58" width="140" height="34" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="230.0" y="78.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">label</text>
+  <rect x="310" y="58" width="140" height="34" rx="7" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="380.0" y="78.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">custom</text>
+  <rect x="460" y="58" width="140" height="34" rx="7" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="530.0" y="78.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">custom message</text>
+  <rect x="610" y="58" width="140" height="34" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="680.0" y="78.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">context edit</text>
+  <text x="10" y="120" text-anchor="start" style="fill:var(--ink2);font-size:10px">A format change from version 1 (linear) to version 2 (tree) came with a migration: session formats need versions.</text>
+</svg></div>
+<figcaption>Figure 4. If the model switched or the reasoning level changed, the log must say so, or a replay will not match. System prompt changes travel as system messages (Chapter 4).</figcaption>
+</figure>
+
+<p>Codex goes further on the same idea: each piece of model-visible state is saved with a snapshot of what the model was last told (Chapter 4), so a resumed session knows which updates the model already has. Claude Code keeps three records per the paper: an append-only transcript, a global prompt history, and separate "sidechain" transcripts for subagents. Kimi Code gives every agent its own log; a parent's log holds only the subagent call and its result.</p>
+
+<h3 id="d-files">Decision 4. Can you rewind the files, not just the words?</h3>
+<p>Fact 6: the world is stateful. Rewinding the conversation does not un-write a file. A harness that offers undo must snapshot files separately.</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 234" width="760" style="max-width:100%;height:auto" role="img" aria-label="Claude Code rewind">
+  <defs><marker id="m5" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <text x="10" y="16" text-anchor="start" style="fill:var(--ink);font-size:11px;font-weight:600">Claude Code: a checkpoint before each prompt that starts a turn</text>
+  <rect x="10" y="28" width="108" height="30" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="64.0" y="46.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">prompt 1</text>
+  <circle cx="64" cy="70" r="5" style="fill:var(--kv)"/>
+  <rect x="130" y="28" width="108" height="30" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="184.0" y="46.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">prompt 2</text>
+  <circle cx="184" cy="70" r="5" style="fill:var(--kv)"/>
+  <rect x="250" y="28" width="108" height="30" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="304.0" y="46.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">prompt 3</text>
+  <circle cx="304" cy="70" r="5" style="fill:var(--kv)"/>
+  <rect x="370" y="28" width="108" height="30" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="424.0" y="46.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">prompt 4</text>
+  <circle cx="424" cy="70" r="5" style="fill:var(--kv)"/>
+  <text x="10" y="92" text-anchor="start" style="fill:var(--ink2);font-size:10px">teal dots: file snapshots; the last 100 checkpoints keep</text>
+  <text x="10" y="108" text-anchor="start" style="fill:var(--ink2);font-size:10px">snapshots, swept about 30 days later by default</text>
+  <rect x="500" y="24" width="250" height="110" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="625.0" y="54.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Rewind menu</text>
+  <text x="625.0" y="68.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">restore code and conversation</text>
+  <text x="625.0" y="82.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">restore conversation only</text>
+  <text x="625.0" y="96.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">restore code only</text>
+  <text x="625.0" y="110.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">summarise from or up to here</text>
+  <rect x="10" y="150" width="740" height="70" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="380.0" y="174.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Not restored: files changed only by shell commands; most subagent edits; edits by other sessions or by hand;</text>
+  <text x="380.0" y="188.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">symlinked and hard-linked files. The documentation calls checkpoints session-level recovery and points to git for history.</text>
+  <text x="380.0" y="202.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Others: Codex tracks a diff per turn; Qwen Code and Kimi Code keep file-history backups; Trae Agent relies on git.</text>
+</svg></div>
+<figcaption>Figure 5. Code and conversation are separate axes. Being able to restore either alone is the useful part: keep the conversation but undo a bad edit, or keep the code but drop a confusing detour.</figcaption>
+</figure>
+
+<h3 id="d-store">Decision 5. Where are sessions stored?</h3>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 186" width="760" style="max-width:100%;height:auto" role="img" aria-label="Session storage">
+  <defs><marker id="m6" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <text x="10" y="18" text-anchor="start" style="fill:var(--ink);font-size:12px;font-weight:600">Local JSONL</text>
+  <text x="10" y="34" text-anchor="start" style="fill:var(--ink2);font-size:10px">Pi, fx, Kimi Code, Claude Code</text>
+  <rect x="10" y="44" width="238" height="86" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="129.0" y="76.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">one append-only file per</text>
+  <text x="129.0" y="90.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">session (Kimi: per agent);</text>
+  <text x="129.0" y="104.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">easy to read, grep, copy</text>
+  <rect x="10" y="142" width="238" height="34" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="129.0" y="162.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">no index; search is a scan</text>
+  <text x="260" y="18" text-anchor="start" style="fill:var(--ink);font-size:12px;font-weight:600">JSONL + an index</text>
+  <text x="260" y="34" text-anchor="start" style="fill:var(--ink2);font-size:10px">Codex, Qwen Code</text>
+  <rect x="260" y="44" width="238" height="86" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="379.0" y="76.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Codex: rollout files, optionally</text>
+  <text x="379.0" y="90.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">zstd-compressed, + SQLite index;</text>
+  <text x="379.0" y="104.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Qwen: sidecars + writer lease</text>
+  <rect x="260" y="142" width="238" height="34" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="379.0" y="162.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">two places to keep in step</text>
+  <text x="510" y="18" text-anchor="start" style="fill:var(--ink);font-size:12px;font-weight:600">Pluggable stores</text>
+  <text x="510" y="34" text-anchor="start" style="fill:var(--ink2);font-size:10px">nanocode, eve</text>
+  <rect x="510" y="44" width="238" height="86" rx="7" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="629.0" y="76.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">nanocode: JSONL, SQL, Durable</text>
+  <text x="629.0" y="90.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Objects, D1; blobs by hash;</text>
+  <text x="629.0" y="104.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">eve: the workflow's own store</text>
+  <rect x="510" y="142" width="238" height="34" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="629.0" y="162.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">needs an abstraction layer</text>
+</svg></div>
+<figcaption>Figure 6. Local files suit a CLI; a server or multi-user product needs a database or the platform's durable store (Chapter 11).</figcaption>
+</figure>
+
+<p>Two details deserve copying. Qwen Code stores titles, branches, goals and artifact summaries in small sidecar files next to the transcript, so changing a title does not rewrite a large file, and a writer lease ensures only one process writes a session at a time. nanocode stores large payloads as content-addressed blobs, so a 5 MB tool result is written once and referenced by its hash.</p>
+
+<h3 id="d-state">Decision 6. Where does exact state live?</h3>
+<p>A plan, a budget, a task table, the working directory, the permission mode: values the harness must not get wrong. They live as typed values outside the message list, and the model sees a rendering of them.</p>
 <ul>
-  <li><strong>Persistence is open research.</strong> The Dive into Claude Code paper lists memory and long-term human-agent relationships among its six open directions (<a href="https://arxiv.org/html/2604.14228v1">arXiv 2604.14228</a>).</li>
-  <li><strong>Artifacts beat chat history.</strong> Anthropic's long-running harness persists progress in <code>claude-progress.txt</code>, a feature list and git commits, so each new session can rebuild state without the old conversation.</li>
-  <li><strong>Chinese framing.</strong> OpenHarness's code walkthrough splits a harness into Brain (model calls), Hands (tools) and Session (memory) layers (<a href="https://gitcode.csdn.net/69fa8ce60a2f6a37c5a7ff6c.html">CSDN</a>); the Code as Agent Harness survey counts repository state and commit history as part of the harness's stateful medium.</li>
+  <li><strong>eve</strong> stores typed session values declared by the agent author, alongside its session, turn and step nesting.</li>
+  <li><strong>Codex</strong> keeps each model-visible section's snapshot with the session, as Chapter 4 described.</li>
+  <li><strong>Todo and plan tools</strong> (Codex's plan tool, Claude Code's task tools, Kimi Code's and Qwen Code's todo tools) keep the plan as data the harness can show in the UI and re-inject after compaction, instead of trusting a summary to carry it.</li>
 </ul>
 
-<h2 id="build">5. Build: a session tree and a memory slot</h2>
+<h3 id="d-capture">Decision 7. How is memory captured?</h3>
+<p>Memory is selection: out of everything that happened, what is still true and useful next week? Three answers exist.</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 176" width="760" style="max-width:100%;height:auto" role="img" aria-label="Memory capture">
+  <defs><marker id="m7" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <text x="10" y="18" text-anchor="start" style="fill:var(--ink);font-size:12px;font-weight:600">The user writes it</text>
+  <text x="10" y="34" text-anchor="start" style="fill:var(--ink2);font-size:10px">every harness</text>
+  <rect x="10" y="44" width="238" height="76" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="129.0" y="71.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">AGENTS.md, CLAUDE.md,</text>
+  <text x="129.0" y="85.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">QWEN.md (Chapter 4);</text>
+  <text x="129.0" y="99.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">explicit and reviewed</text>
+  <rect x="10" y="132" width="238" height="34" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="129.0" y="152.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">only what someone wrote down</text>
+  <text x="260" y="18" text-anchor="start" style="fill:var(--ink);font-size:12px;font-weight:600">The model saves it</text>
+  <text x="260" y="34" text-anchor="start" style="fill:var(--ink2);font-size:10px">Claude Code, Qwen Code, eve</text>
+  <rect x="260" y="44" width="238" height="76" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="379.0" y="71.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">the agent writes notes</text>
+  <text x="379.0" y="85.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">with memory tools or files</text>
+  <text x="379.0" y="99.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">during or after a turn</text>
+  <rect x="260" y="132" width="238" height="34" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="379.0" y="152.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">quality depends on the model</text>
+  <text x="510" y="18" text-anchor="start" style="fill:var(--ink);font-size:12px;font-weight:600">A background pipeline</text>
+  <text x="510" y="34" text-anchor="start" style="fill:var(--ink2);font-size:10px">Codex</text>
+  <rect x="510" y="44" width="238" height="76" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="629.0" y="71.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">extract from idle sessions,</text>
+  <text x="629.0" y="85.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">redact, consolidate,</text>
+  <text x="629.0" y="99.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">rank and prune</text>
+  <rect x="510" y="132" width="238" height="34" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="629.0" y="152.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">more machinery to trust</text>
+</svg></div>
+<figcaption>Figure 7. From most to least human control. Most harnesses combine the first with one of the others.</figcaption>
+</figure>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 200" width="760" style="max-width:100%;height:auto" role="img" aria-label="Codex two-phase memory">
+  <defs><marker id="m8" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="16" width="134" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="77.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">pick recent,</text>
+  <text x="77.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">idle sessions</text>
+  <rect x="161" y="16" width="134" height="50" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="228.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">model extracts raw</text>
+  <text x="228.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">memory + summary</text>
+  <path d="M146 41.0H158" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m8)"/>
+  <rect x="312" y="16" width="134" height="50" rx="7" style="fill:var(--bad-s);stroke:var(--bad)"/>
+  <text x="379.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">redact</text>
+  <text x="379.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">secrets</text>
+  <path d="M297 41.0H309" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m8)"/>
+  <rect x="463" y="16" width="134" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="530.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">global lock;</text>
+  <text x="530.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">rank by use, recency</text>
+  <path d="M448 41.0H460" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m8)"/>
+  <rect x="614" y="16" width="134" height="50" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="681.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">consolidate into a</text>
+  <text x="681.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">git-tracked folder</text>
+  <path d="M599 41.0H611" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m8)"/>
+  <text x="10" y="96" text-anchor="start" style="fill:var(--ink2);font-size:10px">Phase 1 (per session): pick sessions that are recent and no longer active, extract, redact.</text>
+  <text x="10" y="112" text-anchor="start" style="fill:var(--ink2);font-size:10px">Phase 2 (global): one worker at a time ranks memories by how often and how recently they were used,</text>
+  <text x="10" y="128" text-anchor="start" style="fill:var(--ink2);font-size:10px">drops ones unused for too long, and writes consolidated files. The folder is a git repository,</text>
+  <text x="10" y="144" text-anchor="start" style="fill:var(--ink2);font-size:10px">so every change can be inspected and reverted.</text>
+</svg></div>
+<figcaption>Figure 8. Codex's memory pipeline. It runs in the background, after sessions end, so it never slows a turn.</figcaption>
+</figure>
+
+<h3 id="d-recall">Decision 8. How is memory recalled?</h3>
+<p>Recall has the same problem as tools (Chapter 3): everything loaded costs context on every step. So harnesses load an index and fetch details on demand.</p>
+<ul>
+  <li><strong>Claude Code</strong> loads the first 200 lines or 25 KB of its MEMORY.md index at the start of a session; topic files are read on demand. Per the paper, a model scans memory file headers and picks up to five, with no embeddings.</li>
+  <li><strong>eve</strong> uses memory slots: each slot names a provider (built-in file memory, or third-party services) and a scope (for example per signed-in caller). Each turn it resolves the scope, asks the provider to recall, gives the model the provider's tools, and asks it to capture after the turn.</li>
+  <li><strong>Qwen Code</strong> gives the model memory tools to manage and search memory, and marks a memory catalog snapshot in the turn so it can be recognised as injected context (Chapter 4).</li>
+  <li><strong>Kimi Code</strong> relies on AGENTS.md; we found no separate memory store. <strong>Trae Agent</strong> has none, by design.</li>
+</ul>
+
+<h3 id="d-safe">Decision 9. How is memory kept safe?</h3>
+<p>Memory is text the model will read in future sessions. Anything wrong or malicious in it becomes a standing instruction.</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 130" width="760" style="max-width:100%;height:auto" role="img" aria-label="Memory safety">
+  <defs><marker id="m9" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <text x="10" y="18" text-anchor="start" style="fill:var(--ink);font-size:12px;font-weight:600">Recall as content, not rules</text>
+  <text x="10" y="34" text-anchor="start" style="fill:var(--ink2);font-size:10px">eve</text>
+  <rect x="10" y="44" width="238" height="76" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="129.0" y="71.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">recalled memory enters as</text>
+  <text x="129.0" y="85.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">labelled user messages,</text>
+  <text x="129.0" y="99.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">never as system text</text>
+  <text x="260" y="18" text-anchor="start" style="fill:var(--ink);font-size:12px;font-weight:600">Keep it out of summaries</text>
+  <text x="260" y="34" text-anchor="start" style="fill:var(--ink2);font-size:10px">eve</text>
+  <rect x="260" y="44" width="238" height="76" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="379.0" y="71.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">the compactor never sees</text>
+  <text x="379.0" y="85.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">memory, so it cannot</text>
+  <text x="379.0" y="99.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">paraphrase or drop it</text>
+  <text x="510" y="18" text-anchor="start" style="fill:var(--ink);font-size:12px;font-weight:600">Redact and version</text>
+  <text x="510" y="34" text-anchor="start" style="fill:var(--ink2);font-size:10px">Codex</text>
+  <rect x="510" y="44" width="238" height="76" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="629.0" y="71.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">secrets redacted at</text>
+  <text x="629.0" y="85.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">extraction; git history</text>
+  <text x="629.0" y="99.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">makes every change reversible</text>
+</svg></div>
+<figcaption>Figure 9. Three defences. A poisoned page the agent read once should not become a rule it follows forever (Chapter 7).</figcaption>
+</figure>
+
+<h3 id="d-handoff">Decision 10. Chat history or artifacts?</h3>
+<p>For work that spans many sessions, a growing chat log is the wrong carrier. Anthropic's harness for long-running agents has each new session read a progress file, a feature list and the git log, and leave them updated for the next one. The model reads a few short, current documents instead of a long, stale conversation. This is memory as artifacts, and it composes with everything above: the session log is still kept for audit, but the next session starts from the artifacts.</p>
+
+<h2 id="harnesses">3. Sessions and memory in each harness</h2>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 116" width="760" style="max-width:100%;height:auto" role="img" aria-label="Pi">
+  <defs><marker id="m10" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="16" width="134" height="50" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="77.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">append-only tree</text>
+  <text x="77.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">in one file</text>
+  <rect x="161" y="16" width="134" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="228.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">leaf pointer</text>
+  <path d="M146 41.0H158" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m10)"/>
+  <rect x="312" y="16" width="134" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="379.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">root to leaf</text>
+  <text x="379.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">projection</text>
+  <path d="M297 41.0H309" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m10)"/>
+  <rect x="463" y="16" width="134" height="50" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="530.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">tree, fork,</text>
+  <text x="530.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">clone commands</text>
+  <path d="M448 41.0H460" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m10)"/>
+  <rect x="614" y="16" width="134" height="50" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="681.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">memory: AGENTS.md</text>
+  <text x="681.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">+ extensions</text>
+  <path d="M599 41.0H611" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m10)"/>
+  <text x="10" y="98" text-anchor="start" style="fill:var(--ink2);font-size:10px">Entry types include model change, thinking level, usage, compaction, branch summary, labels and extension data.</text>
+</svg></div>
+<figcaption>Figure 10. Pi. The most complete history design here.</figcaption>
+</figure>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 116" width="760" style="max-width:100%;height:auto" role="img" aria-label="eve">
+  <defs><marker id="m11" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="16" width="134" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="77.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">session, turn,</text>
+  <text x="77.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">step</text>
+  <rect x="161" y="16" width="134" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="228.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">typed state</text>
+  <path d="M146 41.0H158" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m11)"/>
+  <rect x="312" y="16" width="134" height="50" rx="7" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="379.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">memory slots:</text>
+  <text x="379.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">provider + scope</text>
+  <path d="M297 41.0H309" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m11)"/>
+  <rect x="463" y="16" width="134" height="50" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="530.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">recall as labelled</text>
+  <text x="530.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">user messages</text>
+  <path d="M448 41.0H460" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m11)"/>
+  <rect x="614" y="16" width="134" height="50" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="681.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">capture after</text>
+  <text x="681.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">the turn</text>
+  <path d="M599 41.0H611" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m11)"/>
+  <text x="10" y="98" text-anchor="start" style="fill:var(--ink2);font-size:10px">History lives in the durable workflow store (Chapter 11).</text>
+</svg></div>
+<figcaption>Figure 11. eve. Memory designed for multi-user products: scoped per caller.</figcaption>
+</figure>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 116" width="760" style="max-width:100%;height:auto" role="img" aria-label="fx">
+  <defs><marker id="m12" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="16" width="134" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="77.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">session per</text>
+  <text x="77.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">project</text>
+  <rect x="161" y="16" width="134" height="50" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="228.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">resume last,</text>
+  <text x="228.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">or by ID</text>
+  <path d="M146 41.0H158" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m12)"/>
+  <rect x="312" y="16" width="134" height="50" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="379.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">full text kept</text>
+  <text x="379.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">after compaction</text>
+  <path d="M297 41.0H309" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m12)"/>
+  <rect x="463" y="16" width="134" height="50" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="530.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">handles to look</text>
+  <text x="530.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">things up</text>
+  <path d="M448 41.0H460" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m12)"/>
+  <text x="10" y="98" text-anchor="start" style="fill:var(--ink2);font-size:10px">Resume from the command line or from a script.</text>
+</svg></div>
+<figcaption>Figure 12. fx. Linear and resumable, with compaction that keeps everything reachable.</figcaption>
+</figure>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 116" width="760" style="max-width:100%;height:auto" role="img" aria-label="nanocode">
+  <defs><marker id="m13" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="16" width="134" height="50" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="77.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">append-only</text>
+  <text x="77.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">records</text>
+  <rect x="161" y="16" width="134" height="50" rx="7" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="228.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">JSONL, SQL,</text>
+  <text x="228.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Durable Objects, D1</text>
+  <path d="M146 41.0H158" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m13)"/>
+  <rect x="312" y="16" width="134" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="379.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">branches in the</text>
+  <text x="379.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">durability layer</text>
+  <path d="M297 41.0H309" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m13)"/>
+  <rect x="463" y="16" width="134" height="50" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="530.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">blobs by hash</text>
+  <path d="M448 41.0H460" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m13)"/>
+  <text x="10" y="98" text-anchor="start" style="fill:var(--ink2);font-size:10px">The same records run on a laptop, a server database or an edge platform.</text>
+</svg></div>
+<figcaption>Figure 13. nanocode. Storage is a plug-in.</figcaption>
+</figure>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 116" width="760" style="max-width:100%;height:auto" role="img" aria-label="Codex">
+  <defs><marker id="m14" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="16" width="134" height="50" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="77.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">rollout file</text>
+  <text x="77.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">(optionally zstd)</text>
+  <rect x="161" y="16" width="134" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="228.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">SQLite index</text>
+  <path d="M146 41.0H158" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m14)"/>
+  <rect x="312" y="16" width="134" height="50" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="379.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">resume, fork,</text>
+  <text x="379.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">archive</text>
+  <path d="M297 41.0H309" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m14)"/>
+  <rect x="463" y="16" width="134" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="530.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">section snapshots</text>
+  <text x="530.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">for state</text>
+  <path d="M448 41.0H460" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m14)"/>
+  <rect x="614" y="16" width="134" height="50" rx="7" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="681.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">two-phase memory,</text>
+  <text x="681.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">git-tracked</text>
+  <path d="M599 41.0H611" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m14)"/>
+  <text x="10" y="98" text-anchor="start" style="fill:var(--ink2);font-size:10px">A diff is tracked per turn for file changes.</text>
+</svg></div>
+<figcaption>Figure 14. Codex. The most elaborate memory pipeline here.</figcaption>
+</figure>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 116" width="760" style="max-width:100%;height:auto" role="img" aria-label="Claude Code">
+  <defs><marker id="m15" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="16" width="134" height="50" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="77.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">append-only</text>
+  <text x="77.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">transcript</text>
+  <rect x="161" y="16" width="134" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="228.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">sidechains for</text>
+  <text x="228.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">subagents</text>
+  <path d="M146 41.0H158" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m15)"/>
+  <rect x="312" y="16" width="134" height="50" rx="7" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="379.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">checkpoint per</text>
+  <text x="379.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">prompt</text>
+  <path d="M297 41.0H309" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m15)"/>
+  <rect x="463" y="16" width="134" height="50" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="530.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">rewind code and/or</text>
+  <text x="530.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">conversation</text>
+  <path d="M448 41.0H460" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m15)"/>
+  <rect x="614" y="16" width="134" height="50" rx="7" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="681.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">MEMORY.md index,</text>
+  <text x="681.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">topics on demand</text>
+  <path d="M599 41.0H611" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m15)"/>
+  <text x="10" y="98" text-anchor="start" style="fill:var(--ink2);font-size:10px">Sessions can be continued, resumed by ID, branched or forked.</text>
+</svg></div>
+<figcaption>Figure 15. Claude Code. Separate undo axes for code and conversation.</figcaption>
+</figure>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 116" width="760" style="max-width:100%;height:auto" role="img" aria-label="Kimi Code">
+  <defs><marker id="m16" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="16" width="134" height="50" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="77.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">one log per</text>
+  <text x="77.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">agent</text>
+  <rect x="161" y="16" width="134" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="228.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">undo as a</text>
+  <text x="228.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">retraction record</text>
+  <path d="M146 41.0H158" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m16)"/>
+  <rect x="312" y="16" width="134" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="379.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">compaction as an</text>
+  <text x="379.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">apply record</text>
+  <path d="M297 41.0H309" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m16)"/>
+  <rect x="463" y="16" width="134" height="50" rx="7" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="530.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">file undo</text>
+  <text x="530.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">service</text>
+  <path d="M448 41.0H460" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m16)"/>
+  <text x="10" y="98" text-anchor="start" style="fill:var(--ink2);font-size:10px">The conversation the model sees is always computed from the log.</text>
+</svg></div>
+<figcaption>Figure 16. Kimi Code. Event sourcing in its plainest form.</figcaption>
+</figure>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 116" width="760" style="max-width:100%;height:auto" role="img" aria-label="Qwen Code">
+  <defs><marker id="m17" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="16" width="134" height="50" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="77.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">recording</text>
+  <rect x="161" y="16" width="134" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="228.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">sidecars: title,</text>
+  <text x="228.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">branch, goal</text>
+  <path d="M146 41.0H158" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m17)"/>
+  <rect x="312" y="16" width="134" height="50" rx="7" style="fill:var(--bad-s);stroke:var(--bad)"/>
+  <text x="379.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">writer lease</text>
+  <path d="M297 41.0H309" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m17)"/>
+  <rect x="463" y="16" width="134" height="50" rx="7" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="530.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">file-history</text>
+  <text x="530.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">backups</text>
+  <path d="M448 41.0H460" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m17)"/>
+  <rect x="614" y="16" width="134" height="50" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="681.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">memory tools</text>
+  <path d="M599 41.0H611" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m17)"/>
+  <text x="10" y="98" text-anchor="start" style="fill:var(--ink2);font-size:10px">Small changes never rewrite the large transcript.</text>
+</svg></div>
+<figcaption>Figure 17. Qwen Code. Engineering for long-lived sessions edited from several places.</figcaption>
+</figure>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 116" width="760" style="max-width:100%;height:auto" role="img" aria-label="Trae Agent">
+  <defs><marker id="m18" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="16" width="134" height="50" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="77.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">trajectory JSON:</text>
+  <text x="77.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">every request</text>
+  <rect x="161" y="16" width="134" height="50" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="228.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">no resume</text>
+  <path d="M146 41.0H158" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m18)"/>
+  <rect x="312" y="16" width="134" height="50" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="379.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">no memory</text>
+  <path d="M297 41.0H309" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m18)"/>
+  <text x="10" y="98" text-anchor="start" style="fill:var(--ink2);font-size:10px">One run, one task, one file to analyse.</text>
+</svg></div>
+<figcaption>Figure 18. Trae Agent. A recorder, not a session store.</figcaption>
+</figure>
+
+<h2 id="compare">4. All nine in one table</h2>
+<div class="tbl"><table>
+  <tr><th>Harness</th><th>History shape</th><th>Storage</th><th>Branch or undo</th><th>File rewind</th><th>Cross-session memory</th></tr>
+  <tr><td>Pi</td><td>Append-only tree</td><td>JSONL file</td><td>Tree, fork, clone</td><td>Not described here</td><td>AGENTS.md, extensions</td></tr>
+  <tr><td>eve</td><td>Session, turn, step</td><td>Workflow store</td><td>Not described here</td><td>Sandbox</td><td>Memory slots with providers and scopes</td></tr>
+  <tr><td>fx</td><td>Linear</td><td>Local files</td><td>Resume</td><td>Not described here</td><td>AGENTS.md, skills</td></tr>
+  <tr><td>nanocode</td><td>Log with branches</td><td>JSONL, SQL, edge stores</td><td>Branches</td><td>Not described here</td><td>AGENTS.md, host stores</td></tr>
+  <tr><td>Codex</td><td>Rollout</td><td>JSONL (zstd) + SQLite</td><td>Resume, fork, archive</td><td>Diff per turn</td><td>Two-phase pipeline, git-tracked</td></tr>
+  <tr><td>Claude Code</td><td>Transcript + sidechains</td><td>JSONL</td><td>Continue, resume, branch, fork</td><td>Checkpoint per prompt</td><td>CLAUDE.md + auto memory</td></tr>
+  <tr><td>Kimi Code</td><td>Event log per agent</td><td>JSONL</td><td>Retraction records</td><td>Undo service</td><td>AGENTS.md</td></tr>
+  <tr><td>Qwen Code</td><td>Recording + sidecars</td><td>Files + lease</td><td>Branch sidecar</td><td>File-history backups</td><td>Memory tools</td></tr>
+  <tr><td>Trae Agent</td><td>Trajectory</td><td>JSON file</td><td>None</td><td>Git</td><td>None</td></tr>
+</table></div>
+
+<h2 id="choose">5. Choosing a session and memory design</h2>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 274" width="760" style="max-width:100%;height:auto" role="img" aria-label="Choosing sessions and memory">
+  <defs><marker id="m19" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="10" width="280" height="52" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="150.0" y="32.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Will users try several</text>
+  <text x="150.0" y="46.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">approaches?</text>
+  <rect x="340" y="10" width="410" height="52" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="545.0" y="32.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Branches (a tree, or fork into new sessions);</text>
+  <text x="545.0" y="46.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">summarise the branch you leave</text>
+  <path d="M292 36H336" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m19)"/>
+  <text x="300" y="30" text-anchor="start" style="fill:var(--ink2);font-size:10px">yes</text>
+  <rect x="10" y="76" width="280" height="52" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="150.0" y="105.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Does the agent edit files?</text>
+  <rect x="340" y="76" width="410" height="52" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="545.0" y="98.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Snapshot files before each turn; offer code and</text>
+  <text x="545.0" y="112.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">conversation rewind separately</text>
+  <path d="M292 102H336" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m19)"/>
+  <text x="300" y="96" text-anchor="start" style="fill:var(--ink2);font-size:10px">yes</text>
+  <rect x="10" y="142" width="280" height="52" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="150.0" y="171.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Many users or a server?</text>
+  <rect x="340" y="142" width="410" height="52" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="545.0" y="164.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">A database or durable store with a writer lease;</text>
+  <text x="545.0" y="178.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">memory scoped per user</text>
+  <path d="M292 168H336" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m19)"/>
+  <text x="300" y="162" text-anchor="start" style="fill:var(--ink2);font-size:10px">yes</text>
+  <rect x="10" y="208" width="280" height="52" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="150.0" y="230.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Should it learn across</text>
+  <text x="150.0" y="244.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">sessions automatically?</text>
+  <rect x="340" y="208" width="410" height="52" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="545.0" y="230.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Background extraction with redaction, ranking</text>
+  <text x="545.0" y="244.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">and a versioned store; recall as content</text>
+  <path d="M292 234H336" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m19)"/>
+  <text x="300" y="228" text-anchor="start" style="fill:var(--ink2);font-size:10px">yes</text>
+</svg></div>
+<figcaption>Figure 19. Start with an append-only tree and AGENTS.md; add automatic memory only with the safety pieces.</figcaption>
+</figure>
+
+<p>This book's design: an append-only tree in one JSONL file with Pi-style entry types, a projection that walks root to leaf, file snapshots before each turn, and one memory slot that recalls as labelled user content and is never shown to the compactor.</p>
+
+<h2 id="research">6. Research and the Chinese view</h2>
+<ul>
+  <li><strong>Persistence is open research.</strong> The Dive into Claude Code paper lists memory and long-term human-agent relationships among its open directions.</li>
+  <li><strong>Artifacts beat chat history</strong> for multi-session work, per Anthropic's long-running harness: a progress file, a feature list and git commits.</li>
+  <li><strong>Chinese framing.</strong> OpenHarness's walkthrough splits a harness into Brain (model calls), Hands (tools) and Session (memory) layers; the Code as Agent Harness survey counts repository state and commit history as part of the harness's memory. Kimi Code's per-agent logs with retraction records are the clearest event-sourcing design read for this book.</li>
+</ul>
+
+<h2 id="build">7. Build: a session tree and a memory slot</h2>
 <pre>&quot;&quot;&quot;Sessions as append-only JSONL trees (Pi&#x27;s design), plus a memory slot that lives outside history (eve&#x27;s design).&quot;&quot;&quot;
 import json, os, time, uuid
 from pathlib import Path
@@ -239,31 +775,36 @@ class FileMemory:
   <li>Tell the agent a preference in one session ("use pytest -q"). Start a new session and check it follows it without being told.</li>
 </ol>
 
-<h2 id="exercises">6. Exercises</h2>
+
+<h2 id="exercises">8. Exercises</h2>
 <ol>
-  <li>Add a <code>version</code> field to the session header and write a migration, as Pi did from v1 to v2.</li>
-  <li>Export a session path as Markdown for a blog post.</li>
-  <li>Scope memory per repository instead of per user. When is each scope right?</li>
+  <li><strong>Replay test.</strong> Rebuild the exact request of step 30 of a saved session from the log alone. Diff it against what was actually sent. Any difference is a missing entry type.</li>
+  <li><strong>Branch and summarise.</strong> Add a command that moves the leaf to an earlier entry and appends a short summary of the branch you left. Does the model avoid repeating the failed approach?</li>
+  <li><strong>File checkpoints.</strong> Snapshot every file the edit tools touch before each turn. Implement "restore code only" and "restore conversation only".</li>
+  <li><strong>Exact state.</strong> Move the plan and remaining budget out of messages into typed state rendered at the tail. Compact twice and check they survive unchanged.</li>
+  <li><strong>Memory with a pipeline.</strong> After each session, extract at most three memories, redact anything that looks like a secret, and commit them to a git-tracked folder. Recall by header, at most five.</li>
 </ol>
 
-<h2 id="quiz">7. Check yourself</h2>
+<h2 id="quiz">9. Check yourself</h2>
 <div class="widget quiz" data-quiz="qz6"></div>
 <script type="application/json" id="qz6">[
-{"q":"In Pi's session tree, what does branching do?","o":["Deletes later entries","Moves the leaf pointer to an earlier entry; later entries stay in the file","Copies the file","Starts a new session"],"a":1,"e":"History is append-only; branching just changes where the next entry attaches."},
-{"q":"Which messages does the model see in a tree session?","o":["All entries in the file","The path from the root to the current leaf, applying compaction summaries","Only the last 20 entries","The longest branch"],"a":1,"e":"buildSessionContext() follows the path to the leaf."},
-{"q":"How does eve add recalled memory to a turn?","o":["As system instructions","As user messages labeled with the slot","Into the compaction summary","It does not recall memory"],"a":1,"e":"Labeled user messages, never system instructions, and the summarizer never sees them."},
-{"q":"Why does Pi's session format include model_change and usage entries?","o":["For billing only","Because reconstructing and auditing a session needs more than messages","They are required by providers","To speed up loading"],"a":1,"e":"Model switches, thinking levels, usage and labels all affect how a session is rebuilt and understood."},
-{"q":"Where does nanocode store sessions by default in the CLI?","o":["Postgres","One append-only JSONL file per session","In memory only","S3"],"a":1,"e":"store-jsonl is the CLI default; store-sql covers SQLite, Postgres and host databases."}
+{"q":"Why must exact values like the budget live outside the message history?","o":["Messages are slow","Compaction summarises history, and a summary can round or drop them","Providers forbid numbers","For the UI"],"a":1,"e":"State is typed and owned by the harness."},
+{"q":"How does Pi branch a session?","o":["It copies the file","It moves the leaf pointer to an earlier entry; new entries become children of it, and nothing is modified","It deletes later entries","It starts a new process"],"a":1,"e":"The model sees only the path from root to leaf."},
+{"q":"How does Kimi Code undo messages?","o":["Deletes lines","Appends a retraction record with a count; the visible conversation is computed from the log","Restarts the session","Edits the transcript"],"a":1,"e":"The log is the truth; the request is a projection."},
+{"q":"Which changes does Claude Code's rewind not restore?","o":["Edits by its file tools","Files changed only by shell commands, most subagent edits and edits by other sessions","The conversation","Any file at all"],"a":1,"e":"Its documentation points to git for those."},
+{"q":"What happens in phase 2 of Codex's memory pipeline?","o":["Secrets are extracted","Under a global lock, memories are ranked by use and recency, stale ones dropped, and the rest consolidated into a git-tracked folder","Sessions are deleted","The model is fine-tuned"],"a":1,"e":"Phase 1 extracts and redacts per session."},
+{"q":"How does Claude Code start a session with auto memory?","o":["Loads every memory file","Loads the first 200 lines or 25 KB of the MEMORY.md index; topic files are read on demand","Uses embeddings","Loads nothing"],"a":1,"e":"An index plus on-demand detail, the same pattern as deferred tools."},
+{"q":"Why does eve recall memory as labelled user messages rather than system text?","o":["It is cheaper","So remembered content is treated as information, not as rules with system authority","Providers require it","To hide it"],"a":1,"e":"A poisoned memory should not become a standing instruction."},
+{"q":"Why does Qwen Code keep titles and branches in sidecar files?","o":["For security","So a small change does not rewrite a large transcript","For compression","Because JSON cannot hold them"],"a":1,"e":"A writer lease also ensures one process writes a session at a time."}
 ]</script>
 
-<h2 id="refs">8. References</h2>
+<h2 id="refs">10. References</h2>
 <ul>
-  <li>Pi: <code>packages/coding-agent/src/core/session-manager.ts</code>.</li>
-  <li>fx: <code>README.md</code> (sessions), <code>src/core/session/</code>.</li>
-  <li>eve: <code>docs/memory/index.mdx</code>, <code>docs/concepts/state.md</code>.</li>
-  <li>nanocode: <code>crates/README.md</code> (store-jsonl, store-sql, durability).</li>
-  <li><a href="https://anthropic.com/engineering/effective-harnesses-for-long-running-agents">Effective harnesses for long-running agents</a>, Anthropic, Nov 2025.</li>
-  <li><a href="https://lucumr.pocoo.org/2026/1/31/pi/">Pi: The Minimal Agent Within OpenClaw</a> (session trees), Armin Ronacher, Jan 2026.</li>
+  <li>Pi: <a href="https://github.com/earendil-works/pi">github.com/earendil-works/pi</a> (fb248c7). eve: <a href="https://github.com/vercel/eve">github.com/vercel/eve</a> (5c52fbf), memory documentation. fx: <a href="https://github.com/vercel-labs/fx">github.com/vercel-labs/fx</a> (cbe7daf). nanocode: <a href="https://github.com/gakonst/nanocode">github.com/gakonst/nanocode</a> (015cbfa).</li>
+  <li>Codex CLI: <a href="https://github.com/openai/codex">github.com/openai/codex</a> (50aeac2), including its memories design notes.</li>
+  <li>Claude Code: <a href="https://code.claude.com/docs/en/checkpointing">Checkpointing</a> and <a href="https://code.claude.com/docs/en/memory">memory</a> documentation, checked 24 Nov 2026; Dive into Claude Code, arXiv 2604.14228.</li>
+  <li>Kimi Code: <a href="https://github.com/MoonshotAI/kimi-code">github.com/MoonshotAI/kimi-code</a> (111aae2). Qwen Code: <a href="https://github.com/QwenLM/qwen-code">github.com/QwenLM/qwen-code</a> (c56424fc). Trae Agent: <a href="https://github.com/bytedance/trae-agent">github.com/bytedance/trae-agent</a> (e839e55).</li>
+  <li>Anthropic, Effective harnesses for long-running agents, Nov 2025.</li>
 </ul>
 
 <div class="navfoot"></div>
