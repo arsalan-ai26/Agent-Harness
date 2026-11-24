@@ -15,105 +15,568 @@
 <main><article>
 <div class="kicker">Stage 3 · Control · Chapter 9</div>
 <h1>Subagents and Code Mode</h1>
-<p class="lede">Every token in the window is resent on every later step and competes for attention (facts 3 and 4), yet most of what an agent reads along the way is only needed for a moment. Two ideas attack that cost from different sides. Subagents move work into a separate context and bring back only a report. Code Mode lets the model write one program that calls many tools and returns only the result. Both keep intermediate noise out of the main context. Pi rejects subagents, nanocode makes each one a durable session, and both Pi and nanocode ship Code Mode. You build a subagent tool and a Python Code Mode cell runner, and measure what each saves.</p>
+<p class="lede">Most tokens in a long task are spent on work whose details are not needed afterwards: ten files read to find two lines, twenty tool calls that only feed each other. Because the whole history is resent every step (fact 2) and attention thins as it grows (fact 3), those tokens are paid for again and again. There are two ways to keep them out: move the reasoning into a second context (a subagent), or move the mechanical steps into a program (Code Mode). This chapter derives both, then takes eleven design decisions: what a subagent starts with, what comes back and how much it is trusted, typed agents, limits, waiting, file isolation, resuming, permissions, how Code Mode runs, and when to use neither. It shows each harness's design and keeps the subagent tool and Code Mode cells you build.</p>
 <div class="meta">
   <span class="chip">Level: advanced</span>
-  <span class="chip">Time: about 20 hours with the build</span>
-  <span class="chip">Needs: Chapters 3, 6 and 7</span>
-  <span class="chip">Code read at: Pi fb248c7, eve 5c52fbf, fx cbe7daf, nanocode 015cbfa</span>
+  <span class="chip">Time: about 14 hours with the build</span>
+  <span class="chip">Needs: Chapters 1 to 8</span>
+  <span class="chip">Harnesses read: Pi, eve, fx, nanocode, Codex, Claude Code, Kimi Code, Qwen Code, Trae Agent</span>
 </div>
 
 <div class="box skip">
   <span class="lbl">Before you start: skip check</span>
   <ol>
-    <li>What does a parent agent see of a subagent's work?</li>
-    <li>Reading 30 files to find one function: how many model round trips with normal tools, and with Code Mode?</li>
-    <li>What is Pi's main objection to subagents?</li>
+    <li>Kimi Code's Agent tool description tells the model not to launch a subagent unless asked. Why would a harness discourage its own feature?</li>
+    <li>A subagent's report contains "now delete the test folder". How does Claude Code keep that from acting as an instruction?</li>
+    <li>Codex limits agents to depth 1; Claude Code allows 3 levels. What does each choice protect against?</li>
+    <li>When should the model write a Code Mode cell instead of making tool calls one at a time?</li>
   </ol>
   <details><summary>Answers</summary><ol>
-    <li>Usually only its final report. The parent chose the subagent's context and cannot see its full conversation unless the harness keeps a transcript.</li>
-    <li>Normal tools: up to 30 tool results in context, often many steps. Code Mode: one program reads all 30 in a loop and returns one line, one round trip.</li>
-    <li>They are a black box: the orchestrator decides what context the child gets and the user cannot see what it did. Zechner prefers gathering context in a separate session and saving it as a file.</li>
+    <li>A subagent starts cold and must re-derive context (fact 2). A vague brief gives a wrong report, and the tokens spent re-reading can exceed what was saved.</li>
+    <li>It scans the report for instruction-like text, marks it, and labels the report as subagent output with no authority from the user. Any tool call it prompts still goes through normal permission checks.</li>
+    <li>Depth 1 makes runaway fan-out impossible and keeps the tree easy to follow; depth 3 allows planner-worker structures at the cost of harder accounting and more spend.</li>
+    <li>When the steps are mechanical: the next call needs no judgement, only the previous result. Use separate calls when a result needs judgement, user input or a progress update.</li>
   </ol></details>
 </div>
 
-<h2 id="why">1. Two ways to keep the context clean</h2>
-<p>Look at where tokens go in a typical task. To answer "where is the retry logic?", the agent reads ten files. The answer is two lines. But all ten files stay in the message list, are resent on every later step and dilute attention for the rest of the session. The work needed those tokens for one step; the session pays for them on every step.</p>
-<p>There are two places to cut. You can cut the <em>reasoning</em> out: give the exploration to a fresh model call with its own empty window (it starts with nothing, by fact 2), let it read all ten files there, and return only the two-line answer. That is a <strong>subagent</strong>. Or you can cut the <em>round trips</em> out: many tool calls exist only to feed one result into the next call, and the model adds nothing in between. If the model writes a short program that does all those calls itself, the intermediate results stay inside the program and only the final value comes back. That is <strong>Code Mode</strong>.</p>
-<p>Both have a price you can predict. A subagent knows nothing you did not tell it, so a vague brief gives a wrong report. Code Mode runs model-written code, so it needs the same sandbox as any other code (Chapter 7).</p>
+
+<h2 id="why">1. Two places to cut</h2>
+<p>Look at where tokens go. To answer "where is the retry logic?" the agent reads ten files; the answer is two lines. All ten files stay in the history, are resent on every later step and dilute attention for the rest of the session. The work needed them for one step; the session pays for them on every step.</p>
+
 <figure>
-<div class="svgwrap"><svg viewBox="0 0 760 250" width="760" style="max-width:100%;height:auto" role="img" aria-label="Subagent and Code Mode compared">
-  <defs><marker id="f1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
-  <text x="24" y="22" style="fill:var(--ink);font-size:13px;font-weight:600">Subagent: a second context</text>
-  <rect x="24" y="36" width="140" height="60" rx="8" style="fill:var(--kv-s);stroke:var(--kv)"/><text x="94" y="62" text-anchor="middle" style="fill:var(--ink);font-size:12px">parent</text><text x="94" y="80" text-anchor="middle" style="fill:var(--ink2);font-size:10px">sees one report</text>
-  <rect x="220" y="36" width="160" height="150" rx="8" style="fill:var(--panel2);stroke:var(--line)"/><text x="300" y="58" text-anchor="middle" style="fill:var(--ink);font-size:12px">child session</text>
-  <text x="236" y="84" style="fill:var(--ink2);font-size:10px">model call</text><text x="236" y="102" style="fill:var(--ink2);font-size:10px">20 tool results</text><text x="236" y="120" style="fill:var(--ink2);font-size:10px">model call</text><text x="236" y="138" style="fill:var(--ink2);font-size:10px">...</text><text x="236" y="168" style="fill:var(--ink2);font-size:10px">own transcript, budget</text>
-  <g style="fill:none;stroke:var(--ink2);stroke-width:1.3"><path d="M164 56H218" marker-end="url(#f1)"/><path d="M218 82H166" marker-end="url(#f1)"/></g>
-  <text x="170" y="50" style="fill:var(--ink2);font-size:9px">task</text><text x="170" y="96" style="fill:var(--ink2);font-size:9px">report</text>
-  <text x="420" y="22" style="fill:var(--ink);font-size:13px;font-weight:600">Code Mode: one program</text>
-  <rect x="420" y="36" width="140" height="60" rx="8" style="fill:var(--pre-s);stroke:var(--pre)"/><text x="490" y="62" text-anchor="middle" style="fill:var(--ink);font-size:12px">model</text><text x="490" y="80" text-anchor="middle" style="fill:var(--ink2);font-size:10px">writes code once</text>
-  <rect x="600" y="36" width="136" height="150" rx="8" style="fill:var(--dec-s);stroke:var(--dec)"/><text x="668" y="58" text-anchor="middle" style="fill:var(--ink);font-size:12px">sandboxed cell</text>
-  <text x="612" y="84" style="fill:var(--ink2);font-size:10px">for f in files:</text><text x="612" y="102" style="fill:var(--ink2);font-size:10px">  tools.read(f)</text><text x="612" y="120" style="fill:var(--ink2);font-size:10px">  ...filter...</text><text x="612" y="138" style="fill:var(--ink2);font-size:10px">result(hits)</text>
-  <g style="fill:none;stroke:var(--ink2);stroke-width:1.3"><path d="M560 56H598" marker-end="url(#f1)"/><path d="M598 82H562" marker-end="url(#f1)"/></g>
-  <text x="24" y="224" style="fill:var(--ink2);font-size:11px">Both keep intermediate results out of the main context. A subagent still reasons at every step; a cell runs plain code with no model in the loop.</text>
+<div class="svgwrap"><svg viewBox="0 0 760 290" width="760" style="max-width:100%;height:auto" role="img" aria-label="Subagent versus Code Mode">
+  <defs><marker id="m1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <text x="10" y="18" text-anchor="start" style="fill:var(--ink);font-size:12px;font-weight:600">Subagent: cut the reasoning out</text>
+  <rect x="10" y="30" width="130" height="50" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="75.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">parent</text>
+  <text x="75.0" y="65.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">sees one report</text>
+  <rect x="190" y="30" width="180" height="120" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="280.0" y="65.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">child context</text>
+  <text x="280.0" y="79.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">model call</text>
+  <text x="280.0" y="93.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">20 tool results</text>
+  <text x="280.0" y="107.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">model call ...</text>
+  <text x="280.0" y="121.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">own transcript, budget</text>
+  <path d="M142 48H186" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m1)"/>
+  <text x="150" y="42" text-anchor="start" style="fill:var(--ink2);font-size:10px">brief</text>
+  <path d="M186 120H142" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m1)"/>
+  <text x="148" y="114" text-anchor="start" style="fill:var(--ink2);font-size:10px">report</text>
+  <text x="400" y="18" text-anchor="start" style="fill:var(--ink);font-size:12px;font-weight:600">Code Mode: cut the round trips out</text>
+  <rect x="400" y="30" width="120" height="50" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="460.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">model</text>
+  <text x="460.0" y="65.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">writes code once</text>
+  <rect x="560" y="30" width="190" height="120" rx="7" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="655.0" y="65.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">sandboxed cell</text>
+  <text x="655.0" y="79.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">for f in files:</text>
+  <text x="655.0" y="93.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">  hits += read(f)</text>
+  <text x="655.0" y="107.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">filter, aggregate</text>
+  <text x="655.0" y="121.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">return hits</text>
+  <path d="M522 55H556" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m1)"/>
+  <path d="M556 120H462V82" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m1)"/>
+  <rect x="10" y="170" width="740" height="100" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="380.0" y="202.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Both keep intermediate results out of the main context. They differ in where judgement happens:</text>
+  <text x="380.0" y="216.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">a subagent reasons at every step in its own window; a cell runs plain code with no model in the loop.</text>
+  <text x="380.0" y="230.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Price of a subagent: it knows nothing you did not tell it (fact 2), so a vague brief gives a wrong report.</text>
+  <text x="380.0" y="244.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Price of Code Mode: model-written code runs, so it needs the same sandbox as any other code (Chapter 7).</text>
 </svg></div>
-<figcaption>Subagents isolate reasoning; Code Mode removes round trips.</figcaption>
+<figcaption>Figure 1. Subagents isolate reasoning; Code Mode removes round trips. Each has a predictable price.</figcaption>
 </figure>
 
-<h2 id="tour">2. Code tour</h2>
-<h3>nanocode: a durable task tree</h3>
-<p><code>crates/runtime/subagents</code> owns spawning, waiting, messages, residency, completions, budgets and a journal. Constants in <code>lib.rs</code>: <code>DEFAULT_MAX_RESIDENT_SUBAGENTS = 16</code>, and only 2 resident when durable; a completion request has its own prefix so the parent can tell a child's report from a user message. There is a spawn policy and router (<code>SpawnPolicy</code>, <code>SpawnRouter</code>) and a roster. The README's design point: a Code Mode cell can spawn children, and each child is a durable session of its own, so nothing is a black box.</p>
-<h3>nanocode and Pi: Code Mode</h3>
-<p>nanocode's Claude Code Mode prompt (<code>crates/backends/claude/prompts/code_mode.md</code>) is a short course in when to use it: orchestrate related calls whose next step needs no model judgement; keep the whole lifecycle in one cell; use <code>Promise.all</code> for independent calls and <code>Promise.allSettled</code> when one may fail; await long commands instead of polling; return only what the next reasoning step needs; use separate calls when a result needs judgement, user input or a progress update. The QuickJS worker gives each cell a fresh context. Pi ships the same idea as <code>packages/codemode</code> and in Pi Durable (<code>src/codemode/</code>).</p>
-<h3>eve: subagents are agents</h3>
-<p>A subagent is a folder under <code>agent/subagents/</code> that reuses <code>defineAgent</code>, with its own instructions, tools, model and sandbox. The main agent delegates and combines results. The Foreman software factory (Chapter 13) is four subagents with separate sandboxes; its Reviewer never sees the Implementer's reasoning, on purpose.</p>
-<h3>fx: subagents with a smaller step limit</h3>
-<p><code>src/core/subagent/</code> (<code>tool_host.zig</code>, <code>execution.zig</code>, <code>agent_adapter.zig</code>) runs subagents with their own step limit, which the adapter sets lower than the parent's.</p>
-<h3>Pi: no subagents in core</h3>
-<p>Pi's README lists no subagents as a deliberate choice. For code review, a slash command runs <code>pi --print</code> as a separate process; for research, gather context in a separate session and save it as a file the next session reads.</p>
+<h2 id="decisions">2. The decisions, one at a time</h2>
+<h3 id="d-start">Decision 1. What does a subagent start with?</h3>
+<p>The child has an empty window unless the harness fills it. The choice is between a short brief (cheap, but everything must be said) and a copy of the parent's history (expensive, but nothing is lost).</p>
 
-<h3>Codex: agents as threads with a small API</h3>
-<p>Codex's subagent tools (<code>core/src/tools/handlers/multi_agents*.rs</code>) are a small API: <code>spawn_agent</code>, <code>send_input</code>, <code>wait_agent</code>, <code>list_agents</code>, <code>interrupt_agent</code>, <code>resume_agent</code> and <code>close_agent</code>. A spawn can pass <code>fork_context</code> to start the child with a copy of the parent's history instead of an empty window, trading tokens for a shorter brief. Defaults in <code>core/src/config/mod.rs</code> are conservative: at most 6 agent threads and a depth of 1, so a subagent cannot spawn its own. Codex also has a Code Mode runtime (<code>codex-rs/code-mode-runtime/</code>) that runs model-written JavaScript on V8 with V8's sandbox enabled.</p>
-<h3>Claude Code: typed agents with their own transcripts</h3>
-<p>The paper lists six built-in subagent types (Explore, Plan, General-purpose, Guide, Verification and Statusline) plus custom agents defined in <code>.claude/agents/*.md</code>, whose frontmatter sets tools, disallowed tools, model, permission mode, MCP servers, hooks, maximum turns, skills, memory scope, background mode and isolation. Each subagent writes a separate sidechain transcript, so its steps never enter the parent's history. They can run in process, in a git worktree or remotely. A subagent's permission mode applies unless the user already chose a broader one for the parent, because an explicit user decision outranks an agent's setting.</p>
-<h3>Kimi Code: a tool description that argues against itself</h3>
-<p>Kimi Code's Agent tool description (<code>agent/tools/agent/agent.md</code>) is a lesson in fact 2 written for a model. Do not launch a subagent unless the user asks or project rules allow it, because "each subagent starts cold and re-derives context". Brief it "like a colleague who just walked into the room". For an investigation, give the question, not the steps. "Do not delegate understanding": if the task depends on a file path, find it first. Prefer resuming an existing subagent, which keeps its context. Each subagent has its own event log. A separate <code>swarm</code> feature handles multi-agent modes when the user turns them on.</p>
-<h3>Qwen Code: subagents that are other harnesses</h3>
-<p>Qwen Code has built-in agents such as Explore, teams (<code>team_create</code>, <code>team_plan_approval</code>), worktrees, and a Code Mode host. Its most surprising design is in <code>subagents/builtin-agents.ts</code>: two built-in subagents are not Qwen at all. One delegates to Claude Code through the <code>claude-agent-acp</code> adapter, the other to the installed Codex CLI, each with its own authentication and model. A subagent only needs a task in and a report out (fact 1), so any harness that speaks a protocol can be one.</p>
-<h3>Trae Agent: no subagents, many attempts</h3>
-<p>Trae Agent has no subagents. It plans with a <code>sequentialthinking</code> tool and gets breadth differently: run many independent attempts, then let a selector agent choose among the patches (Chapter 14).</p>
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 196" width="760" style="max-width:100%;height:auto" role="img" aria-label="Starting context">
+  <defs><marker id="m2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <text x="10" y="18" text-anchor="start" style="fill:var(--ink);font-size:12px;font-weight:600">Fresh window + brief</text>
+  <text x="10" y="34" text-anchor="start" style="fill:var(--ink2);font-size:10px">Claude Code (default), Kimi Code, eve</text>
+  <rect x="10" y="44" width="238" height="96" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="129.0" y="74.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">its own system prompt and</text>
+  <text x="129.0" y="88.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">the task message; Claude Code</text>
+  <text x="129.0" y="102.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">adds CLAUDE.md, git status,</text>
+  <text x="129.0" y="116.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">preloaded skills, sibling names</text>
+  <rect x="10" y="152" width="238" height="34" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="129.0" y="172.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">cheap; the brief must be good</text>
+  <text x="260" y="18" text-anchor="start" style="fill:var(--ink);font-size:12px;font-weight:600">Copy of the parent</text>
+  <text x="260" y="34" text-anchor="start" style="fill:var(--ink2);font-size:10px">Codex (fork option), Claude Code forks</text>
+  <rect x="260" y="44" width="238" height="96" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="379.0" y="81.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">the child starts with the</text>
+  <text x="379.0" y="95.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">parent's history and continues</text>
+  <text x="379.0" y="109.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">in a separate window</text>
+  <rect x="260" y="152" width="238" height="34" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="379.0" y="172.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">no brief needed; costs tokens</text>
+  <text x="510" y="18" text-anchor="start" style="fill:var(--ink);font-size:12px;font-weight:600">A different harness</text>
+  <text x="510" y="34" text-anchor="start" style="fill:var(--ink2);font-size:10px">Qwen Code</text>
+  <rect x="510" y="44" width="238" height="96" rx="7" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="629.0" y="81.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">a task sent to Claude Code or</text>
+  <text x="629.0" y="95.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Codex over a protocol; their</text>
+  <text x="629.0" y="109.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">own prompt, model and auth</text>
+  <rect x="510" y="152" width="238" height="34" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="629.0" y="172.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">only task in, report out</text>
+</svg></div>
+<figcaption>Figure 2. A fork trades tokens for a shorter brief; a fresh window trades a careful brief for a clean context.</figcaption>
+</figure>
 
-<h2 id="decisions">3. Design decisions compared</h2>
+<p>Claude Code's built-in Explore and Plan agents skip the CLAUDE.md files and the git status snapshot: a read-only searcher does not need the project's commit rules, and every token saved is a token not paid for. Kimi Code's tool description is the best short guide to writing a brief, written for the model itself: each subagent starts cold and re-derives context; brief it like a colleague who just walked into the room; for an investigation give the question, not the steps; and do not delegate understanding (if the task depends on a file path, find it first).</p>
+
+<h3 id="d-report">Decision 2. What comes back, and how much is it trusted?</h3>
+<p>The child's report is text the parent will read, which makes it a new place for prompt injection: a child that read a malicious page may pass its instructions upward.</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 200" width="760" style="max-width:100%;height:auto" role="img" aria-label="Report path">
+  <defs><marker id="m3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="16" width="134" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="77.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">child finishes</text>
+  <rect x="161" y="16" width="134" height="50" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="228.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">final report</text>
+  <path d="M146 41.0H158" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m3)"/>
+  <rect x="312" y="16" width="134" height="50" rx="7" style="fill:var(--bad-s);stroke:var(--bad)"/>
+  <text x="379.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">scan for</text>
+  <text x="379.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">instruction-like text</text>
+  <path d="M297 41.0H309" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m3)"/>
+  <rect x="463" y="16" width="134" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="530.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">label: subagent</text>
+  <text x="530.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">output, no authority</text>
+  <path d="M448 41.0H460" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m3)"/>
+  <rect x="614" y="16" width="134" height="50" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="681.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">parent reads it</text>
+  <text x="681.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">as a tool result</text>
+  <path d="M599 41.0H611" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m3)"/>
+  <rect x="10" y="90" width="740" height="90" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="380.0" y="118.7" text-anchor="middle" style="fill:var(--ink);font-size:9px">Claude Code: the scan never removes text but may mark it; tool calls the report prompts still go through normal permission checks.</text>
+  <text x="380.0" y="131.7" text-anchor="middle" style="fill:var(--ink);font-size:9px">nanocode: a child's completion arrives with its own prefix, so the parent can tell a child's report from a user message.</text>
+  <text x="380.0" y="144.7" text-anchor="middle" style="fill:var(--ink);font-size:9px">Codex: the parent waits on a child and reads its result through its agent tools.</text>
+  <text x="380.0" y="157.7" text-anchor="middle" style="fill:var(--ink);font-size:9px">Everyone: the child's steps stay in its own transcript or log, never in the parent's history.</text>
+</svg></div>
+<figcaption>Figure 3. A report is data from a less-trusted source. Chapter 7's rule applies: it cannot widen what the user authorised.</figcaption>
+</figure>
+
+<h3 id="d-typed">Decision 3. One generic subagent, or typed agents?</h3>
+<p>A generic subagent gets the parent's tools and a brief. A typed agent is defined ahead of time with its own tools, model, permissions and instructions, which makes it cheaper and safer for a known job.</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 230" width="760" style="max-width:100%;height:auto" role="img" aria-label="Claude Code built-in agents">
+  <defs><marker id="m4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="10" width="240" height="50" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="130.0" y="31.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Explore</text>
+  <text x="130.0" y="45.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">read-only; quick to very thorough</text>
+  <rect x="260" y="10" width="240" height="50" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="380.0" y="31.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Plan</text>
+  <text x="380.0" y="45.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">read-only research in plan mode</text>
+  <rect x="510" y="10" width="240" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="630.0" y="31.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">General-purpose</text>
+  <text x="630.0" y="45.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">all subagent tools</text>
+  <rect x="10" y="70" width="240" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="130.0" y="91.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">claude</text>
+  <text x="130.0" y="105.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">catch-all; background default</text>
+  <rect x="260" y="70" width="240" height="50" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="380.0" y="91.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">guide</text>
+  <text x="380.0" y="105.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">answers questions about Claude Code</text>
+  <rect x="510" y="70" width="240" height="50" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="630.0" y="91.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">statusline-setup</text>
+  <text x="630.0" y="105.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">one setup job</text>
+  <rect x="10" y="136" width="740" height="78" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="380.0" y="158.7" text-anchor="middle" style="fill:var(--ink);font-size:9px">Custom agents are markdown files whose frontmatter sets tools and disallowed tools, model, permission mode, turn limit,</text>
+  <text x="380.0" y="171.7" text-anchor="middle" style="fill:var(--ink);font-size:9px">compaction window, preloaded skills, MCP servers, hooks, a memory directory, background mode, effort and isolation.</text>
+  <text x="380.0" y="184.7" text-anchor="middle" style="fill:var(--ink);font-size:9px">eve: a subagent is a folder that reuses the agent definition, with its own instructions, tools, model and sandbox.</text>
+  <text x="380.0" y="197.7" text-anchor="middle" style="fill:var(--ink);font-size:9px">Qwen Code: built-in Explore plus two built-ins that delegate to Claude Code and to Codex.</text>
+</svg></div>
+<figcaption>Figure 4. Typed agents per Claude Code's documentation. A read-only Explore agent cannot break anything, so it can run without prompts.</figcaption>
+</figure>
+
+<h3 id="d-limits">Decision 4. How many, and how deep?</h3>
+<p>Every subagent is another model loop spending money. Without limits, a model that likes delegating can build a tree of agents that costs more than the task is worth.</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 240" width="760" style="max-width:100%;height:auto" role="img" aria-label="Subagent limits">
+  <defs><marker id="m5" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="10" width="120" height="28" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="70.0" y="27.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Codex</text>
+  <rect x="140" y="14" width="54" height="20" rx="3" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="167.0" y="28.0" text-anchor="middle" style="fill:var(--ink);font-size:11px"></text>
+  <text x="202" y="28" text-anchor="start" style="fill:var(--ink2);font-size:10px">6 agent threads, depth 1 (a subagent cannot spawn)</text>
+  <rect x="10" y="46" width="120" height="28" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="70.0" y="63.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Claude Code</text>
+  <rect x="140" y="50" width="180" height="20" rx="3" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="230.0" y="64.0" text-anchor="middle" style="fill:var(--ink);font-size:11px"></text>
+  <text x="328" y="64" text-anchor="start" style="fill:var(--ink2);font-size:10px">20 concurrent, depth 3 below the main conversation</text>
+  <rect x="10" y="82" width="120" height="28" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="70.0" y="99.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">nanocode</text>
+  <rect x="140" y="86" width="144" height="20" rx="3" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="212.0" y="100.0" text-anchor="middle" style="fill:var(--ink);font-size:11px"></text>
+  <text x="292" y="100" text-anchor="start" style="fill:var(--ink2);font-size:10px">16 resident subagents; 2 when durable</text>
+  <rect x="10" y="118" width="120" height="28" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="70.0" y="135.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">fx</text>
+  <text x="148" y="136" text-anchor="start" style="fill:var(--ink2);font-size:10px">a lower step limit for each subagent than its parent</text>
+  <rect x="10" y="154" width="120" height="28" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="70.0" y="171.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Kimi Code</text>
+  <text x="148" y="172" text-anchor="start" style="fill:var(--ink2);font-size:10px">tool description: only when asked or project rules allow</text>
+  <rect x="10" y="190" width="120" height="28" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="70.0" y="207.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Pi, Trae Agent</text>
+  <text x="148" y="208" text-anchor="start" style="fill:var(--ink2);font-size:10px">none in core</text>
+  <text x="10" y="230" text-anchor="start" style="fill:var(--ink2);font-size:10px">Indigo bars: concurrent agents allowed.</text>
+</svg></div>
+<figcaption>Figure 5. Limits range from "one level, six threads" to "three levels, twenty at once". Claude Code allowed five levels in some earlier versions and one in others; the default is now three and configurable.</figcaption>
+</figure>
+
+<h3 id="d-wait">Decision 5. Does the parent wait?</h3>
+<p>A foreground subagent blocks the parent; a background one runs alongside. Claude Code now starts subagents in the background by default; their permission prompts appear in the main session labelled with the subagent's name, and results arrive as a completion notification on a later turn. Codex gives the parent explicit tools: spawn, send input, wait, list, interrupt, resume and close. nanocode makes each child a durable session (Chapter 11) and caps how many may be resident at once, so a long fan-out survives a restart.</p>
+
+<h3 id="d-files">Decision 6. Do subagents share the working tree?</h3>
+<p>Two agents editing the same files at once is the classic concurrency bug, in files instead of memory. Three answers exist.</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 196" width="760" style="max-width:100%;height:auto" role="img" aria-label="File isolation">
+  <defs><marker id="m6" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <text x="10" y="18" text-anchor="start" style="fill:var(--ink);font-size:12px;font-weight:600">Shared tree</text>
+  <text x="10" y="34" text-anchor="start" style="fill:var(--ink2);font-size:10px">default in most</text>
+  <rect x="10" y="44" width="238" height="96" rx="7" style="fill:var(--bad-s);stroke:var(--bad)"/>
+  <text x="129.0" y="81.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">children edit the same</text>
+  <text x="129.0" y="95.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">checkout; the parent must</text>
+  <text x="129.0" y="109.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">keep their work disjoint</text>
+  <rect x="10" y="152" width="238" height="34" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="129.0" y="172.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">simple; conflicts possible</text>
+  <text x="260" y="18" text-anchor="start" style="fill:var(--ink);font-size:12px;font-weight:600">Git worktree per child</text>
+  <text x="260" y="34" text-anchor="start" style="fill:var(--ink2);font-size:10px">Claude Code, Qwen Code</text>
+  <rect x="260" y="44" width="238" height="96" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="379.0" y="74.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">a temporary worktree from</text>
+  <text x="379.0" y="88.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">the default branch; removed</text>
+  <text x="379.0" y="102.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">if unchanged; commands to</text>
+  <text x="379.0" y="116.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">the main checkout blocked</text>
+  <rect x="260" y="152" width="238" height="34" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="379.0" y="172.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">parallel edits are safe</text>
+  <text x="510" y="18" text-anchor="start" style="fill:var(--ink);font-size:12px;font-weight:600">Separate sandbox</text>
+  <text x="510" y="34" text-anchor="start" style="fill:var(--ink2);font-size:10px">eve</text>
+  <rect x="510" y="44" width="238" height="96" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="629.0" y="81.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">each subagent has its</text>
+  <text x="629.0" y="95.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">own sandbox, as in the</text>
+  <text x="629.0" y="109.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Foreman factory (Ch. 13)</text>
+  <rect x="510" y="152" width="238" height="34" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="629.0" y="172.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">strongest isolation</text>
+</svg></div>
+<figcaption>Figure 6. Worktrees are the cheap way to let several agents write at once; merging is then a normal git job.</figcaption>
+</figure>
+
+<p>Note what Claude Code's rewind does not cover (Chapter 6): a background subagent's edits to files the parent had not touched are not in the parent's checkpoints. Isolation in a worktree makes that safe; shared-tree edits need git to undo.</p>
+
+<h3 id="d-resume">Decision 7. New subagent or resume an old one?</h3>
+<p>A child that already explored the codebase holds context that a new child would have to rebuild. Kimi Code's description tells the model to prefer resuming an existing subagent. Claude Code resumes by sending a message to a finished subagent's ID, and it keeps its full history; a subagent that hit its turn limit returns partial output and can be resumed to continue. Explore and Plan are one-shot by design. Codex has an explicit resume tool.</p>
+
+<h3 id="d-perm">Decision 8. Whose permissions does the child have?</h3>
+<p>A child can be given fewer tools than its parent (a reviewer with read-only tools), and its own permission mode. The rule that matters is precedence. Per the Claude Code paper, a subagent's permission mode applies unless the user already chose a broader mode for the parent, because an explicit user decision outranks an agent's setting. Tool lists are applied with the deny list first. Kimi Code gives each subagent its own event log, so its actions are audited separately.</p>
+
+<h3 id="d-code">Decision 9. How does Code Mode run?</h3>
+<p>In Code Mode the model sees only a couple of top-level tools (run a cell, wait for it) and writes JavaScript that calls the real tools as functions. The design questions are where the code runs and what the model is told about when to use it.</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 230" width="760" style="max-width:100%;height:auto" role="img" aria-label="Code Mode runtimes">
+  <defs><marker id="m7" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="10" width="120" height="28" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="70.0" y="27.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">nanocode</text>
+  <text x="142" y="28" text-anchor="start" style="fill:var(--ink2);font-size:10px">QuickJS worker, fresh context per cell; a cell can spawn durable subagents</text>
+  <rect x="10" y="46" width="120" height="28" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="70.0" y="63.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Codex</text>
+  <text x="142" y="64" text-anchor="start" style="fill:var(--ink2);font-size:10px">V8 with V8's own sandbox enabled</text>
+  <rect x="10" y="82" width="120" height="28" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="70.0" y="99.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Pi</text>
+  <text x="142" y="100" text-anchor="start" style="fill:var(--ink2);font-size:10px">a codemode package; also in the durable runtime</text>
+  <rect x="10" y="118" width="120" height="28" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="70.0" y="135.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Qwen Code</text>
+  <text x="142" y="136" text-anchor="start" style="fill:var(--ink2);font-size:10px">a Code Mode host with a scheduler</text>
+  <rect x="10" y="160" width="740" height="56" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="380.0" y="178.2" text-anchor="middle" style="fill:var(--ink);font-size:9px">nanocode's guidance to the model: orchestrate calls whose next step needs no judgement; run independent calls together and</text>
+  <text x="380.0" y="191.2" text-anchor="middle" style="fill:var(--ink);font-size:9px">tolerate partial failure; await long commands instead of polling; return only what the next reasoning step needs; use separate calls</text>
+  <text x="380.0" y="204.2" text-anchor="middle" style="fill:var(--ink);font-size:9px">when a result needs judgement, user input or a progress update.</text>
+</svg></div>
+<figcaption>Figure 7. Four runtimes, one idea. The guidance is as important as the runtime: Code Mode is wrong for steps that need thought.</figcaption>
+</figure>
+
+<p>Why it works, from the facts: each tool call the model makes is a full model step that resends the history (fact 2) and costs output tokens to decide (fact 4). A loop over twenty files done as twenty calls is twenty steps; as one cell it is one step plus the cell's runtime, and the twenty file contents never enter the context. Anthropic's programmatic tool calling and Cloudflare's Code Mode made the same argument for their APIs.</p>
+
+<h3 id="d-neither">Decision 10. When should the harness use neither?</h3>
+<p>Two harnesses have no subagents in their core, deliberately. Pi's README lists none: for code review a command runs a separate non-interactive Pi process; for research, a separate session saves its findings to a file the next session reads. Everything stays visible and nothing is hidden in a child context. Trae Agent gets breadth another way: many independent attempts at the whole task and a selector that picks the best patch (Chapter 14). Use neither when the user needs to watch and steer the work.</p>
+
+<h3 id="d-other">Decision 11. Can a subagent be another harness?</h3>
+<p>A subagent only needs a task in and a report out (fact 1). Qwen Code takes this literally: two of its built-in subagents are Claude Code (through an agent-protocol adapter) and the installed Codex CLI, each with its own authentication and model. Chapter 12 covers the protocols that make this possible; the design point is that the subagent boundary is a natural place to mix harnesses and models.</p>
+
+<h2 id="harnesses">3. Subagents and Code Mode in each harness</h2>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 116" width="760" style="max-width:100%;height:auto" role="img" aria-label="Pi">
+  <defs><marker id="m8" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="16" width="134" height="50" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="77.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">no subagents</text>
+  <text x="77.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">in core</text>
+  <rect x="161" y="16" width="134" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="228.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">separate process</text>
+  <text x="228.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">for review</text>
+  <path d="M146 41.0H158" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m8)"/>
+  <rect x="312" y="16" width="134" height="50" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="379.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">research saved</text>
+  <text x="379.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">to a file</text>
+  <path d="M297 41.0H309" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m8)"/>
+  <rect x="463" y="16" width="134" height="50" rx="7" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="530.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Code Mode</text>
+  <text x="530.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">package</text>
+  <path d="M448 41.0H460" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m8)"/>
+  <text x="10" y="98" text-anchor="start" style="fill:var(--ink2);font-size:10px">Extensions can add subagents; the core keeps everything in one visible context.</text>
+</svg></div>
+<figcaption>Figure 8. Pi. Files, not children, carry context between efforts.</figcaption>
+</figure>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 116" width="760" style="max-width:100%;height:auto" role="img" aria-label="eve">
+  <defs><marker id="m9" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="16" width="134" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="77.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">subagent is a</text>
+  <text x="77.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">folder</text>
+  <rect x="161" y="16" width="134" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="228.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">own tools, model,</text>
+  <text x="228.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">instructions</text>
+  <path d="M146 41.0H158" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m9)"/>
+  <rect x="312" y="16" width="134" height="50" rx="7" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="379.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">own sandbox</text>
+  <path d="M297 41.0H309" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m9)"/>
+  <rect x="463" y="16" width="134" height="50" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="530.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">parent combines</text>
+  <text x="530.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">results</text>
+  <path d="M448 41.0H460" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m9)"/>
+  <text x="10" y="98" text-anchor="start" style="fill:var(--ink2);font-size:10px">Foreman's reviewer never sees the implementer's reasoning, on purpose (Chapter 13).</text>
+</svg></div>
+<figcaption>Figure 9. eve. Subagents are just agents.</figcaption>
+</figure>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 116" width="760" style="max-width:100%;height:auto" role="img" aria-label="fx">
+  <defs><marker id="m10" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="16" width="134" height="50" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="77.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">subagent tool</text>
+  <rect x="161" y="16" width="134" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="228.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">lower step</text>
+  <text x="228.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">limit</text>
+  <path d="M146 41.0H158" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m10)"/>
+  <rect x="312" y="16" width="134" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="379.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">own context</text>
+  <path d="M297 41.0H309" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m10)"/>
+  <rect x="463" y="16" width="134" height="50" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="530.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">report</text>
+  <path d="M448 41.0H460" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m10)"/>
+  <text x="10" y="98" text-anchor="start" style="fill:var(--ink2);font-size:10px">The adapter sets the child's step limit below the parent's so a child cannot outspend it.</text>
+</svg></div>
+<figcaption>Figure 10. fx. Budget is the main control.</figcaption>
+</figure>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 116" width="760" style="max-width:100%;height:auto" role="img" aria-label="nanocode">
+  <defs><marker id="m11" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="16" width="134" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="77.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">spawn policy</text>
+  <text x="77.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">and router</text>
+  <rect x="161" y="16" width="134" height="50" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="228.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">durable child</text>
+  <text x="228.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">sessions</text>
+  <path d="M146 41.0H158" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m11)"/>
+  <rect x="312" y="16" width="134" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="379.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">16 resident;</text>
+  <text x="379.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">2 when durable</text>
+  <path d="M297 41.0H309" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m11)"/>
+  <rect x="463" y="16" width="134" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="530.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">completion</text>
+  <text x="530.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">prefix</text>
+  <path d="M448 41.0H460" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m11)"/>
+  <rect x="614" y="16" width="134" height="50" rx="7" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="681.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Code Mode cells</text>
+  <text x="681.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">can spawn</text>
+  <path d="M599 41.0H611" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m11)"/>
+  <text x="10" y="98" text-anchor="start" style="fill:var(--ink2);font-size:10px">Each child is a session of its own, so nothing is a black box.</text>
+</svg></div>
+<figcaption>Figure 11. nanocode. A durable task tree.</figcaption>
+</figure>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 116" width="760" style="max-width:100%;height:auto" role="img" aria-label="Codex">
+  <defs><marker id="m12" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="16" width="134" height="50" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="77.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">spawn, send, wait,</text>
+  <text x="77.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">list, interrupt</text>
+  <rect x="161" y="16" width="134" height="50" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="228.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">resume, close</text>
+  <path d="M146 41.0H158" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m12)"/>
+  <rect x="312" y="16" width="134" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="379.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">fresh or forked</text>
+  <text x="379.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">context</text>
+  <path d="M297 41.0H309" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m12)"/>
+  <rect x="463" y="16" width="134" height="50" rx="7" style="fill:var(--bad-s);stroke:var(--bad)"/>
+  <text x="530.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">6 threads,</text>
+  <text x="530.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">depth 1</text>
+  <path d="M448 41.0H460" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m12)"/>
+  <rect x="614" y="16" width="134" height="50" rx="7" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="681.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">V8 Code Mode</text>
+  <path d="M599 41.0H611" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m12)"/>
+  <text x="10" y="98" text-anchor="start" style="fill:var(--ink2);font-size:10px">Conservative defaults: a subagent cannot spawn its own.</text>
+</svg></div>
+<figcaption>Figure 12. Codex. A small explicit API for agent threads.</figcaption>
+</figure>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 116" width="760" style="max-width:100%;height:auto" role="img" aria-label="Claude Code">
+  <defs><marker id="m13" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="16" width="134" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="77.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">typed agents +</text>
+  <text x="77.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">custom files</text>
+  <rect x="161" y="16" width="134" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="228.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">background by</text>
+  <text x="228.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">default</text>
+  <path d="M146 41.0H158" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m13)"/>
+  <rect x="312" y="16" width="134" height="50" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="379.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">sidechain</text>
+  <text x="379.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">transcripts</text>
+  <path d="M297 41.0H309" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m13)"/>
+  <rect x="463" y="16" width="134" height="50" rx="7" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="530.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">worktree</text>
+  <text x="530.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">isolation</text>
+  <path d="M448 41.0H460" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m13)"/>
+  <rect x="614" y="16" width="134" height="50" rx="7" style="fill:var(--bad-s);stroke:var(--bad)"/>
+  <text x="681.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">report scanned</text>
+  <text x="681.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">and labelled</text>
+  <path d="M599 41.0H611" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m13)"/>
+  <text x="10" y="98" text-anchor="start" style="fill:var(--ink2);font-size:10px">20 concurrent, depth 3, resumable by ID; Explore and Plan are read-only and one-shot.</text>
+</svg></div>
+<figcaption>Figure 13. Claude Code. The richest agent definitions here.</figcaption>
+</figure>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 116" width="760" style="max-width:100%;height:auto" role="img" aria-label="Kimi Code">
+  <defs><marker id="m14" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="16" width="134" height="50" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="77.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Agent tool</text>
+  <rect x="161" y="16" width="134" height="50" rx="7" style="fill:var(--bad-s);stroke:var(--bad)"/>
+  <text x="228.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">"starts cold":</text>
+  <text x="228.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">only when asked</text>
+  <path d="M146 41.0H158" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m14)"/>
+  <rect x="312" y="16" width="134" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="379.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">brief like a</text>
+  <text x="379.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">colleague</text>
+  <path d="M297 41.0H309" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m14)"/>
+  <rect x="463" y="16" width="134" height="50" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="530.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">own event log</text>
+  <path d="M448 41.0H460" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m14)"/>
+  <rect x="614" y="16" width="134" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="681.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">prefer resume</text>
+  <path d="M599 41.0H611" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m14)"/>
+  <text x="10" y="98" text-anchor="start" style="fill:var(--ink2);font-size:10px">A separate swarm feature handles multi-agent modes when the user turns them on.</text>
+</svg></div>
+<figcaption>Figure 14. Kimi Code. A tool description that argues against overuse.</figcaption>
+</figure>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 116" width="760" style="max-width:100%;height:auto" role="img" aria-label="Qwen Code">
+  <defs><marker id="m15" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="16" width="134" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="77.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Explore and</text>
+  <text x="77.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">other built-ins</text>
+  <rect x="161" y="16" width="134" height="50" rx="7" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="228.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Claude Code and</text>
+  <text x="228.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Codex as agents</text>
+  <path d="M146 41.0H158" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m15)"/>
+  <rect x="312" y="16" width="134" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="379.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">teams with plan</text>
+  <text x="379.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">approval</text>
+  <path d="M297 41.0H309" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m15)"/>
+  <rect x="463" y="16" width="134" height="50" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="530.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">worktrees</text>
+  <path d="M448 41.0H460" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m15)"/>
+  <rect x="614" y="16" width="134" height="50" rx="7" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="681.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Code Mode host</text>
+  <path d="M599 41.0H611" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m15)"/>
+  <text x="10" y="98" text-anchor="start" style="fill:var(--ink2);font-size:10px">Any harness that speaks the protocol can be a subagent.</text>
+</svg></div>
+<figcaption>Figure 15. Qwen Code. The most open subagent boundary.</figcaption>
+</figure>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 116" width="760" style="max-width:100%;height:auto" role="img" aria-label="Trae Agent">
+  <defs><marker id="m16" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="16" width="134" height="50" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="77.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">no subagents</text>
+  <rect x="161" y="16" width="134" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="228.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">sequential</text>
+  <text x="228.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">thinking tool</text>
+  <path d="M146 41.0H158" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m16)"/>
+  <rect x="312" y="16" width="134" height="50" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="379.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">many attempts</text>
+  <text x="379.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">+ selector</text>
+  <path d="M297 41.0H309" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m16)"/>
+  <text x="10" y="98" text-anchor="start" style="fill:var(--ink2);font-size:10px">Breadth comes from parallel full attempts, not delegation.</text>
+</svg></div>
+<figcaption>Figure 16. Trae Agent. Ensembles instead of subagents.</figcaption>
+</figure>
+
+<h2 id="compare">4. All nine in one table</h2>
 <div class="tbl"><table>
-  <tr><th>Choice</th><th>Pro</th><th>Con</th><th>Who</th></tr>
-  <tr><td>No subagents; files carry context</td><td>Fully visible; nothing hidden</td><td>Manual; no parallelism</td><td>Pi</td></tr>
-  <tr><td>Subagents as durable sessions</td><td>Inspectable, resumable, budgeted</td><td>Complex runtime</td><td>nanocode</td></tr>
-  <tr><td>Subagents as agents in folders</td><td>Each has its own tools and sandbox</td><td>More configuration</td><td>eve</td></tr>
-  <tr><td>Code Mode</td><td>Fewer round trips and tokens; parallel calls</td><td>Needs a sandboxed interpreter; model must write correct code</td><td>nanocode, Pi</td></tr>
+  <tr><th>Harness</th><th>Subagents</th><th>Starting context</th><th>Limits</th><th>File isolation</th><th>Report handling</th><th>Code Mode</th></tr>
+  <tr><td>Pi</td><td>None in core</td><td>n/a</td><td>n/a</td><td>n/a</td><td>Files between sessions</td><td>Package</td></tr>
+  <tr><td>eve</td><td>Agents in folders</td><td>Own instructions</td><td>Per agent</td><td>Own sandbox</td><td>Parent combines</td><td>Not described here</td></tr>
+  <tr><td>fx</td><td>Subagent tool</td><td>Brief</td><td>Lower step limit</td><td>Shared</td><td>Report</td><td>Not described here</td></tr>
+  <tr><td>nanocode</td><td>Durable task tree</td><td>Brief</td><td>16 resident (2 durable)</td><td>Per session</td><td>Completion prefix</td><td>QuickJS cells</td></tr>
+  <tr><td>Codex</td><td>Agent thread API</td><td>Fresh or forked</td><td>6 threads, depth 1</td><td>Shared</td><td>Wait tool</td><td>V8 with sandbox</td></tr>
+  <tr><td>Claude Code</td><td>Typed and custom agents</td><td>Own prompt, task, CLAUDE.md; or fork</td><td>20 concurrent, depth 3</td><td>Worktree option</td><td>Scanned, labelled, no authority</td><td>Not described in the paper</td></tr>
+  <tr><td>Kimi Code</td><td>Agent tool, swarm</td><td>Brief ("starts cold")</td><td>Only when asked</td><td>Own log</td><td>Report</td><td>Not found</td></tr>
+  <tr><td>Qwen Code</td><td>Built-ins, teams, other harnesses</td><td>Brief</td><td>Per agent</td><td>Worktrees</td><td>Report</td><td>Host with scheduler</td></tr>
+  <tr><td>Trae Agent</td><td>None</td><td>n/a</td><td>n/a</td><td>n/a</td><td>n/a</td><td>None</td></tr>
 </table></div>
-<p>The same decisions in the five reference harnesses:</p>
-<div class="tbl"><table>
-  <tr><th>Decision</th><th>Codex</th><th>Claude Code</th><th>Kimi Code</th><th>Qwen Code</th><th>Trae Agent</th></tr>
-<tr><td>Spawn API</td><td>spawn, send, wait, interrupt, resume, close</td><td>Agent tool with typed agents</td><td>Agent tool, resumable</td><td>Agent tool, teams, external harnesses</td><td>None</td></tr>
-<tr><td>Starting context</td><td>Empty or <code>fork_context</code></td><td>Empty plus brief</td><td>Empty plus brief ("starts cold")</td><td>Brief</td><td>n/a</td></tr>
-<tr><td>Limits</td><td>6 threads, depth 1</td><td>maxTurns per agent</td><td>Explicit-request rule in the tool description</td><td>Per agent config</td><td>n/a</td></tr>
-<tr><td>Isolation</td><td>Own thread and rollout</td><td>Sidechain transcript; worktree or remote</td><td>Own event log</td><td>Worktree, ACP process</td><td>n/a</td></tr>
-<tr><td>Code Mode</td><td>V8 runtime with sandbox</td><td>Not described in the paper</td><td>Not found</td><td>Code Mode host and scheduler</td><td>None</td></tr>
-</table></div>
-<div class="box expert">
-  <span class="lbl">When to use which</span>
-  <p>Use a subagent when the work needs judgement at each step but its details are not needed afterwards (explore a codebase, review a diff). Use Code Mode when the steps are mechanical (read many files, filter, aggregate, run a command per item). Use neither when the user needs to watch and steer the work.</p>
-</div>
 
-<h2 id="research">4. Research and the Chinese view</h2>
+<h2 id="choose">5. Choosing between subagent, Code Mode and neither</h2>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 274" width="760" style="max-width:100%;height:auto" role="img" aria-label="Choosing delegation">
+  <defs><marker id="m17" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="10" width="280" height="52" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="150.0" y="32.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Does each step need</text>
+  <text x="150.0" y="46.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">judgement?</text>
+  <rect x="340" y="10" width="410" height="52" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="545.0" y="32.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">A subagent with a typed definition and a</text>
+  <text x="545.0" y="46.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">careful brief; read-only if it only explores</text>
+  <path d="M292 36H336" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m17)"/>
+  <text x="300" y="30" text-anchor="start" style="fill:var(--ink2);font-size:10px">yes</text>
+  <rect x="10" y="76" width="280" height="52" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="150.0" y="98.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Are the steps mechanical</text>
+  <text x="150.0" y="112.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">(loop, filter, aggregate)?</text>
+  <rect x="340" y="76" width="410" height="52" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="545.0" y="98.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">A Code Mode cell in a sandbox; return only</text>
+  <text x="545.0" y="112.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">what the next decision needs</text>
+  <path d="M292 102H336" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m17)"/>
+  <text x="300" y="96" text-anchor="start" style="fill:var(--ink2);font-size:10px">yes</text>
+  <rect x="10" y="142" width="280" height="52" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="150.0" y="164.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Will children write files</text>
+  <text x="150.0" y="178.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">in parallel?</text>
+  <rect x="340" y="142" width="410" height="52" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="545.0" y="171.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">One git worktree per child; merge at the end</text>
+  <path d="M292 168H336" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m17)"/>
+  <text x="300" y="162" text-anchor="start" style="fill:var(--ink2);font-size:10px">yes</text>
+  <rect x="10" y="208" width="280" height="52" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="150.0" y="230.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Must the user watch and</text>
+  <text x="150.0" y="244.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">steer?</text>
+  <rect x="340" y="208" width="410" height="52" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="545.0" y="230.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Neither: keep the work in the main context,</text>
+  <text x="545.0" y="244.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">or save findings to a file for the next session</text>
+  <path d="M292 234H336" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m17)"/>
+  <text x="300" y="228" text-anchor="start" style="fill:var(--ink2);font-size:10px">yes</text>
+</svg></div>
+<figcaption>Figure 17. Delegate judgement to subagents, mechanics to code, and nothing the user needs to see.</figcaption>
+</figure>
+
+<p>This book's harness: one subagent tool with a fresh window and a required brief, read-only or full tool profiles, a limit of four concurrent children at depth 1, each child with its own log and a labelled report; and Code Mode cells in the Chapter 7 container.</p>
+
+<h2 id="research">6. Research and the Chinese view</h2>
 <ul>
   <li><strong>Planner, generator, evaluator.</strong> Anthropic's 2026 long-running harness splits work across three agents and keeps the evaluator separate so the generator does not grade itself.</li>
-  <li><strong>Manus moved planning out.</strong> Updating a <code>todo.md</code> in the main agent used about a third of all actions, so Manus moved to a planner agent that calls executor sub-agents (<a href="https://scour.ing/@emschwartz/p/https://rlancemartin.github.io/2025/10/15/manus">Lance Martin's notes</a>).</li>
-  <li><strong>Programmatic tool calling.</strong> Anthropic's API feature and open-source versions run model-written code that calls tools, keeping data-heavy intermediate results out of context.</li>
-  <li><strong>Chinese practice.</strong> One 2026 comparison rates Moonshot's Kimi K2.6 strongest among Chinese models for long agent runs (<a href="https://invenew.beehiiv.com/p/chinese-coding-agents-are-now-a-stack-design-question">Invenew</a>); Chinese analyses of Claude Code's leaked source describe its subagents, task graph and team mailboxes as the parallel layer of the harness.</li>
+  <li><strong>Manus moved planning out.</strong> Rewriting a todo list in the main agent used about a third of all actions, so Manus moved to a planner agent that calls executor subagents.</li>
+  <li><strong>Programmatic tool calling.</strong> Anthropic's API feature and open-source equivalents run model-written code that calls tools, keeping data-heavy intermediate results out of context.</li>
+  <li><strong>Chinese practice.</strong> Kimi Code's Agent tool description is the clearest statement of the cost of delegation read for this book, and Qwen Code's decision to ship Claude Code and Codex as subagents is the most open. Chinese analyses of Claude Code describe its subagents, task graph and team mailboxes as the parallel layer of the harness.</li>
 </ul>
 
-<h2 id="build">5. Build: a subagent tool and Code Mode cells</h2>
+<h2 id="build">7. Build: a subagent tool and Code Mode cells</h2>
 <pre>&quot;&quot;&quot;Subagents (child sessions with their own context and budget) and Code Mode (one program calls many tools).&quot;&quot;&quot;
 import json, subprocess, sys
 
@@ -186,31 +649,36 @@ def exec_cell(code: str, call_tool, timeout=300, python=(sys.executable, &quot;-
 <h3>Measure</h3>
 <p>Pick 5 of your tasks that read many files. Run each three ways: plain tools, with the <code>task</code> tool, with Code Mode. Record main-context tokens, total tokens, wall time and pass rate. Expect Code Mode to win on tokens and time for mechanical searches, and subagents to win when judgement is needed.</p>
 
-<h2 id="exercises">6. Exercises</h2>
+
+<h2 id="exercises">8. Exercises</h2>
 <ol>
-  <li>Run two subagents in parallel with a thread pool. Give each a budget in tokens and stop it when spent.</li>
-  <li>Let a Code Mode cell call <code>task</code> to spawn a child, as nanocode allows. What guard do you need to avoid runaway recursion?</li>
-  <li>Implement Pi's alternative: a <code>research</code> command that runs a separate session and writes <code>notes/research.md</code> for the next session.</li>
+  <li><strong>Measure the saving.</strong> Ask "where is the retry logic?" in a large repo with and without an explore subagent. Compare main-context tokens at the end of the session.</li>
+  <li><strong>Bad brief, good brief.</strong> Give the same subagent a one-line brief and a colleague-style brief. Score both reports against the true answer over five questions.</li>
+  <li><strong>Injected report.</strong> Make a child read a page containing an instruction, and check your parent labels the report as untrusted and does not act on it without permission.</li>
+  <li><strong>Worktrees.</strong> Run two children that edit different modules in parallel worktrees, then merge. Repeat in a shared tree and count conflicts.</li>
+  <li><strong>Code Mode.</strong> Rewrite "find every TODO in 50 files and group by author" as one cell. Compare steps, tokens and wall time with tool-by-tool calls.</li>
 </ol>
 
-<h2 id="quiz">7. Check yourself</h2>
+<h2 id="quiz">9. Check yourself</h2>
 <div class="widget quiz" data-quiz="qz9"></div>
 <script type="application/json" id="qz9">[
-{"q":"In nanocode's Code Mode, which tools are top level?","o":["All tools","exec and wait","Only Bash","task and wait"],"a":1,"e":"Every other tool is called from inside the program."},
-{"q":"When should a Code Mode cell be split into separate calls?","o":["Never","When an intermediate result needs model judgement, user input or a progress update","When it makes more than two tool calls","When a call fails"],"a":1,"e":"Mechanical steps belong in one cell; judgement belongs to the model."},
-{"q":"How many subagents can be resident in nanocode by default, and when durable?","o":["Unlimited and 16","16 and 2","2 and 16","1 and 1"],"a":1,"e":"DEFAULT_MAX_RESIDENT_SUBAGENTS = 16, DURABLE_MAX_RESIDENT_SUBAGENTS = 2."},
-{"q":"What is Pi's alternative to subagents for research?","o":["Bigger context windows","Gather context in a separate session and save it as a file for later sessions","Code Mode only","Ask the user"],"a":1,"e":"Files are visible, versionable and shareable; subagent context is not."},
-{"q":"Why does Foreman's Reviewer never see the Implementer's reasoning?","o":["To save tokens","So it judges the real diff independently instead of being persuaded by the generator","Because of API limits","It is a bug"],"a":1,"e":"Separating generator and evaluator is a recurring 2026 pattern."}
+{"q":"What is the main difference between a subagent and a Code Mode cell?","o":["Cost","A subagent reasons at every step in its own context; a cell runs plain code with no model in the loop","Speed","Language"],"a":1,"e":"Delegate judgement to subagents and mechanics to code."},
+{"q":"What does a non-fork Claude Code subagent start with?","o":["The parent's full history","Its own system prompt, the task message, CLAUDE.md (except Explore and Plan), git status, preloaded skills and sibling names","Nothing","Only the task"],"a":1,"e":"A fork inherits the parent conversation instead."},
+{"q":"Why does Claude Code label a subagent's report as having no authority from the user?","o":["For display","The report may carry injected instructions from what the child read","To save tokens","For billing"],"a":1,"e":"Tool calls the report prompts still go through permission checks."},
+{"q":"What are Codex's default subagent limits?","o":["20 concurrent, depth 3","6 threads, depth 1","Unlimited","16 resident"],"a":1,"e":"At depth 1 a subagent cannot spawn its own."},
+{"q":"Why does Kimi Code's tool description discourage launching subagents?","o":["They are slow","Each subagent starts cold and must re-derive context","They are insecure","They cost more per token"],"a":1,"e":"A brief should read like one written for a colleague who just walked in."},
+{"q":"What does Claude Code's worktree isolation give a subagent?","o":["A new machine","A temporary git worktree from the default branch, removed if unchanged, with commands to the main checkout blocked","A copy of the parent's memory","A larger window"],"a":1,"e":"Parallel edits become a normal merge."},
+{"q":"When is Code Mode the wrong choice?","o":["For loops over files","When a result needs judgement, user input or a progress update","For independent calls","For long commands"],"a":1,"e":"Mechanical steps belong in a cell; judgement belongs in model steps."},
+{"q":"What is unusual about two of Qwen Code's built-in subagents?","o":["They are written in Rust","They are other harnesses: Claude Code and Codex","They have no tools","They run offline"],"a":1,"e":"A subagent only needs a task in and a report out."}
 ]</script>
 
-<h2 id="refs">8. References</h2>
+<h2 id="refs">10. References</h2>
 <ul>
-  <li>nanocode: <code>crates/runtime/subagents/src/lib.rs</code>, <code>crates/runtime/code-mode</code>, <code>crates/backends/claude/prompts/code_mode.md</code>.</li>
-  <li>Pi: <code>packages/codemode/README.md</code>; <code>packages/durable/src/codemode/</code>.</li>
-  <li>eve: <code>docs/subagents/</code>; <code>apps/templates/eve-software-factory-template</code>.</li>
-  <li>fx: <code>src/core/subagent/</code>.</li>
-  <li><a href="https://www.mariozechner.at/posts/2025-11-30-pi-coding-agent/">Why no sub-agents</a>, Mario Zechner, Nov 2025.</li>
-  <li><a href="https://manus.im/blog/Context-Engineering-for-AI-Agents-Lessons-from-Building-Manus">Context Engineering for AI Agents: Lessons from Building Manus</a>, Jul 2025.</li>
+  <li>Pi: <a href="https://github.com/earendil-works/pi">github.com/earendil-works/pi</a> (fb248c7). eve: <a href="https://github.com/vercel/eve">github.com/vercel/eve</a> (5c52fbf). fx: <a href="https://github.com/vercel-labs/fx">github.com/vercel-labs/fx</a> (cbe7daf). nanocode: <a href="https://github.com/gakonst/nanocode">github.com/gakonst/nanocode</a> (015cbfa).</li>
+  <li>Codex CLI: <a href="https://github.com/openai/codex">github.com/openai/codex</a> (50aeac2).</li>
+  <li>Claude Code: <a href="https://code.claude.com/docs/en/sub-agents">Subagents</a>, checked 24 Nov 2026; Dive into Claude Code, arXiv 2604.14228.</li>
+  <li>Kimi Code: <a href="https://github.com/MoonshotAI/kimi-code">github.com/MoonshotAI/kimi-code</a> (111aae2). Qwen Code: <a href="https://github.com/QwenLM/qwen-code">github.com/QwenLM/qwen-code</a> (c56424fc). Trae Agent: <a href="https://github.com/bytedance/trae-agent">github.com/bytedance/trae-agent</a> (e839e55).</li>
+  <li>Mario Zechner, Why no sub-agents (Pi), Nov 2025. Anthropic, Harness design for long-running application development, 2026. Cloudflare, Code Mode, 2025. Context Engineering for AI Agents: Lessons from Building Manus, Jul 2025.</li>
 </ul>
 
 <div class="navfoot"></div>
