@@ -15,91 +15,569 @@
 <main><article>
 <div class="kicker">Stage 3 · Control · Chapter 8</div>
 <h1>Extensibility: skills, MCP and hooks</h1>
-<p class="lede">Anything the model should know or be able to do must be in its window (fact 2), but the window is finite and paid for every call (facts 3 and 4). So no harness can ship every feature its users need in the prompt. Extension points let people add knowledge (skills), connections (MCP), policy (hooks) and whole features (extensions) without forking the core. Each one has a context cost and a safety cost. This chapter reads Pi's code extensions and its new MCP client, eve's directory-as-contract and packaged extensions, fx's four hook kinds and nanocode's tool search, then builds skills with progressive disclosure, lifecycle hooks and a small MCP client.</p>
+<p class="lede">No harness ships with everything a team needs: their deploy procedure, their issue tracker, their rule that every edit is formatted. So every harness has ways to add things. This chapter derives the four extension points from two questions (does the model need to know about it, and must it happen every time?), then takes seven design decisions: how skills load, how many MCP tools the model sees, what hooks may decide and what happens when they fail, how whole features are packaged, whether the agent may extend itself, and whether extensions move between harnesses. It shows each harness's extension surface and keeps the skills, hooks and MCP client you build.</p>
 <div class="meta">
   <span class="chip">Level: intermediate</span>
-  <span class="chip">Time: about 20 hours with the build</span>
-  <span class="chip">Needs: Chapters 3 and 7</span>
-  <span class="chip">Code read at: Pi fb248c7, eve 5c52fbf, fx cbe7daf, nanocode 015cbfa</span>
+  <span class="chip">Time: about 14 hours with the build</span>
+  <span class="chip">Needs: Chapters 1 to 7</span>
+  <span class="chip">Harnesses read: Pi, eve, fx, nanocode, Codex, Claude Code, Kimi Code, Qwen Code, Trae Agent</span>
 </div>
 
 <div class="box skip">
   <span class="lbl">Before you start: skip check</span>
   <ol>
-    <li>What is progressive disclosure for skills?</li>
-    <li>Why put "run tests after every edit" in a hook instead of the system prompt?</li>
-    <li>Why did Pi first refuse MCP, and what changed?</li>
+    <li>Why is "always run the formatter after an edit" a hook and not a line in AGENTS.md?</li>
+    <li>A harness has 200 skills installed. How much context do they cost before any is used?</li>
+    <li>A pre-tool hook crashes. Should the tool call go ahead?</li>
+    <li>Why do Qwen Code's hook events use the same names as Claude Code's?</li>
   </ol>
   <details><summary>Answers</summary><ol>
-    <li>Only each skill's name and description go into the prompt. The model loads a skill's full procedure, and its supporting files, only when a task needs it.</li>
-    <li>A hook always runs; a prompt line runs only when the model remembers and agrees. Policy that must hold belongs in code.</li>
-    <li>MCP tool schemas cost context on every request (Playwright's server was about 13.7k tokens). Pi 1.0 added a small standalone MCP client, while still favouring CLIs and skills for most work.</li>
+    <li>The model's choices are samples (fact 5); a line in AGENTS.md is a suggestion it will sometimes forget. A hook is code the harness runs at a fixed point, every time.</li>
+    <li>One short listing entry each (name and description). Claude Code caps each entry at 1,536 characters; the body loads only when the skill is used.</li>
+    <li>It depends on what the hook guards, so the hook should say. Claude Code treats most errors as non-blocking unless the hook sets a block-on-failure option; Kimi Code makes each hook declare its failure policy. A safety hook should fail closed.</li>
+    <li>So users can move hooks between harnesses. Shared names, like the Agent Skills format and AGENTS.md, make extensions portable.</li>
   </ol></details>
 </div>
 
-<h2 id="four">1. Four extension points, four jobs</h2>
-<p>Ask two questions of anything you want to add, and the four extension points fall out. First: does the model need to know about it to use it? If yes, it costs context, and the only way to make it cheap is to show a short name first and the full text only when the model asks (progressive disclosure). If no, it can run outside the model entirely and cost nothing. Second: must it happen every time, or only when the model decides? The model's decisions are samples (fact 5), so anything that must always happen (a formatter, a policy check, an audit log) cannot be left to the model to remember. It has to be code the harness runs at fixed points.</p>
-<p>Knowledge the model pulls in when needed: <strong>skills</strong>. Actions in outside systems the model calls: <strong>MCP tools</strong>. Rules that must run every time without asking the model: <strong>hooks</strong>. New harness behaviour that is not about the model at all: <strong>extensions</strong>.</p>
-<div class="tbl"><table>
-  <tr><th>Point</th><th>Adds</th><th>Context cost</th><th>Runs</th></tr>
-  <tr><td>Skills</td><td>Procedures and knowledge (Markdown plus files)</td><td>One line per skill until loaded</td><td>When the model chooses to load one</td></tr>
-  <tr><td>MCP servers</td><td>Connections to outside systems as tools</td><td>Every tool schema, every request (unless searched)</td><td>When the model calls a tool</td></tr>
-  <tr><td>Hooks</td><td>Deterministic policy and automation</td><td>None, unless they append output</td><td>Always, at fixed lifecycle points</td></tr>
-  <tr><td>Extensions or plugins</td><td>Whole features: tools, UI, commands, state</td><td>Whatever they add</td><td>Inside the harness process</td></tr>
-</table></div>
-<p>A practitioner's rule for Claude Code captures the split: tools and MCP give new actions, skills give reusable methods, subagents isolate execution, hooks enforce constraints and collect audit signals, plugins distribute all of it.</p>
 
-<h2 id="tour">2. Code tour</h2>
-<h3>Pi: code extensions the agent can write</h3>
-<p><code>packages/coding-agent/src/core/extensions/</code> loads TypeScript extensions at runtime through <code>jiti</code> (<code>loader.ts</code>, <code>jiti-loader.ts</code>, <code>runner.ts</code>). Extensions can register tools, commands and UI, hook the lifecycle and persist state into the session. Because they are plain files, the agent can write and hot-reload its own; Armin Ronacher's daily extensions (<code>/answer</code>, <code>/todos</code>, <code>/review</code>) were all written by the agent. Pi 1.0 added <code>packages/mcp</code>: a small, standalone MCP client that does not depend on the official SDK, with stdio and Streamable HTTP transports. Its earlier stance remains in the docs: prefer CLI tools with READMEs that the agent reads on demand.</p>
-<h3>eve: the directory is the contract</h3>
-<p>Every extension point is a folder: <code>skills/</code>, <code>hooks/</code>, <code>connections/</code> (MCP and OAuth services), <code>tools/</code>, <code>channels/</code>. Skills follow the Agent Skills standard (<code>docs/skills.mdx</code>): a flat <code>name.md</code> or a directory with <code>SKILL.md</code> plus <code>references/</code>, <code>assets/</code>, <code>scripts/</code>; the model loads one with <code>eve__skill</code>; names are checked at build time. An eve <em>extension</em> (<code>docs/extensions/index.md</code>) is an npm package with the same layout that an agent mounts from <code>agent/extensions/</code>; the repo ships several, including <code>eve-git</code>, <code>eve-code</code>, <code>eve-recall</code>, <code>eve-self-improvement</code> and <code>eve-self-modification</code>.</p>
-<h3>fx: four hook kinds, skills and MCP</h3>
-<p><code>src/core/hooks/definitions.zig</code> defines exactly four <code>HookKind</code>s: <code>pre_tool_use</code> (can allow, block or change a call), <code>stop</code> (can refuse to let the turn end), <code>post_turn_end</code> and <code>attention_required</code> (the agent is waiting for you). Skills live in <code>src/core/skills/</code>, and the agent can search and install skills itself (<code>src/tools/skills/</code>). MCP tools are found through capability search instead of being listed up front.</p>
-<h3>nanocode: its own MCP client and BM25 search</h3>
-<p>nanocode replaces the common Rust MCP libraries with its own client (<code>crates/core/mcp</code>, <code>mcp-http</code>), and searches MCP tools with its own BM25 index (<code>crates/integrations/mcp-tools/src/SEARCH.md</code>), so many servers can be connected without filling the context.</p>
+<h2 id="four">1. Four extension points from two questions</h2>
+<p>Ask two questions of anything you want to add. First: does the model need to know about it to use it? If yes, it costs context, and the only way to make it cheap is to show a short name first and the full text only when the model asks. If no, it can run outside the model and cost nothing. Second: must it happen every time, or only when the model decides? Anything that must always happen cannot be left to the model (fact 5); it must be code the harness runs at fixed points.</p>
 
-<h3>Codex: skills, plugins, hooks and MCP</h3>
-<p>Codex has all four extension points. Skills are <code>SKILL.md</code> files with frontmatter (<code>codex-rs/skills/</code>), shipped with a built-in <code>skill-creator</code>. Plugins bundle skills and commands, and old custom commands are migrated into skills of at most 4,000 bytes. Hooks cover the lifecycle: <code>SessionStart</code>, <code>SessionEnd</code>, <code>UserPromptSubmit</code>, <code>PreToolUse</code>, <code>PermissionRequest</code>, <code>PostToolUse</code>, <code>PreCompact</code>, <code>PostCompact</code>, <code>SubagentStart</code>, <code>SubagentStop</code>, <code>Stop</code>, <code>Interrupt</code>, <code>PreModelRequest</code> and <code>PostModelRequest</code>. MCP tools can be found through a <code>tool_search</code> tool instead of all being listed.</p>
-<h3>Claude Code: four mechanisms at three points</h3>
-<p>The paper's framing is the clearest in this book: hooks, skills, plugins and MCP act at three points of the loop, namely what the model sees (assemble), which tools it may call (model) and whether an action runs (execute). It counts 27 hook events with four kinds of handler: a shell command, an LLM evaluation, a webhook and a subagent verifier. A plugin manifest can carry ten component types, from commands, agents, skills and hooks to MCP servers, LSP servers and output styles. A skill adds guidance to the current context; an agent moves work to another context.</p>
-<h3>Kimi Code: features as contributions</h3>
-<p>Kimi Code builds almost everything as a <em>feature</em> registered with a dependency-injection container (<code>agent-core-v2/src/features/</code>): skills, plan, goal, todo, cron, swarm, reminders, external hooks and more. Inside the core loop, hooks attach to named points such as <code>step.continuing</code>, and each declares what happens if it fails (<code>onFailure: 'block'</code>), so a broken hook cannot silently allow what it was meant to stop. MCP servers and plugins plug into the same registry.</p>
-<h3>Qwen Code: Claude-compatible hooks, curated skills, extensions</h3>
-<p>Qwen Code's hook events (<code>hooks/</code>) follow Claude Code's names closely: <code>PreToolUse</code>, <code>PostToolUse</code>, <code>PostToolUseFailure</code>, <code>PostToolBatch</code>, <code>UserPromptSubmit</code>, <code>SessionStart</code>, <code>SessionEnd</code>, <code>Stop</code>, <code>SubagentStart</code>, <code>SubagentStop</code>, <code>PreCompact</code>, <code>PostCompact</code> and others. Matching names lets users move hooks between harnesses. Skills come bundled and can be managed by a skill curator with rollback; extensions are packages with a <code>qwen-extension.json</code>; MCP servers share a transport pool.</p>
-<h3>Trae Agent: MCP only</h3>
-<p>Trae Agent's extension point is MCP (<code>utils/mcp_client.py</code>, <code>tools/mcp_tool.py</code>): add a server in the config and its tools appear. Anything else means editing the Python, which for a research codebase is the point.</p>
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 280" width="760" style="max-width:100%;height:auto" role="img" aria-label="Two questions, four extension points">
+  <defs><marker id="m1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <path d="M380 20V250" style="fill:none;stroke:var(--line);stroke-width:2"/>
+  <path d="M60 135H740" style="fill:none;stroke:var(--line);stroke-width:2"/>
+  <text x="220" y="16" text-anchor="middle" style="fill:var(--ink);font-size:11px;font-weight:600">model decides when</text>
+  <text x="560" y="16" text-anchor="middle" style="fill:var(--ink);font-size:11px;font-weight:600">harness runs it every time</text>
+  <text x="36" y="80" text-anchor="middle" style="fill:var(--ink2);font-size:10px">model</text>
+  <text x="36" y="94" text-anchor="middle" style="fill:var(--ink2);font-size:10px">must know</text>
+  <text x="36" y="190" text-anchor="middle" style="fill:var(--ink2);font-size:10px">model</text>
+  <text x="36" y="204" text-anchor="middle" style="fill:var(--ink2);font-size:10px">need not</text>
+  <text x="36" y="218" text-anchor="middle" style="fill:var(--ink2);font-size:10px">know</text>
+  <rect x="80" y="36" width="280" height="86" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="220.0" y="61.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Skills</text>
+  <text x="220.0" y="75.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">procedures and knowledge;</text>
+  <text x="220.0" y="89.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">a name up front, the body on demand</text>
+  <text x="220.0" y="103.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">MCP tools: actions in outside systems</text>
+  <rect x="400" y="36" width="330" height="86" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="565.0" y="68.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Hooks that add context</text>
+  <text x="565.0" y="82.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">inject text at fixed points (session start,</text>
+  <text x="565.0" y="96.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">after a tool), e.g. test results</text>
+  <rect x="80" y="148" width="280" height="86" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="220.0" y="180.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Extensions and plugins</text>
+  <text x="220.0" y="194.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">new commands, UI, providers,</text>
+  <text x="220.0" y="208.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">whole features in the harness</text>
+  <rect x="400" y="148" width="330" height="86" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="565.0" y="180.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Hooks that decide</text>
+  <text x="565.0" y="194.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">block, allow, modify or audit an action;</text>
+  <text x="565.0" y="208.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">format, lint, log; cost no context</text>
+  <text x="60" y="268" text-anchor="start" style="fill:var(--ink2);font-size:10px">Tools give actions, skills give methods, subagents isolate, hooks enforce, plugins distribute.</text>
+</svg></div>
+<figcaption>Figure 1. What the model must see costs context and is used when the model chooses; what must always happen is code at fixed points.</figcaption>
+</figure>
 
-<h2 id="decisions">3. Design decisions compared</h2>
-<div class="tbl"><table>
-  <tr><th>Decision</th><th>Pi</th><th>eve</th><th>fx</th><th>nanocode</th></tr>
-  <tr><td>Main extension unit</td><td>TypeScript extension file</td><td>Agent folder; npm extension package</td><td>Skills, MCP, hooks config</td><td>Rust crates, host integrations</td></tr>
-  <tr><td>MCP</td><td>Added in 1.0; CLIs preferred</td><td><code>connections/</code></td><td>Built in, found via search</td><td>Own client, BM25 search</td></tr>
-  <tr><td>Hooks</td><td>Extension lifecycle events</td><td><code>hooks/</code> for lifecycle and stream events</td><td>4 kinds</td><td>Event sinks</td></tr>
-  <tr><td>Self-modification</td><td>Agent writes extensions</td><td>Opt-in extensions</td><td>Agent installs skills</td><td>No</td></tr>
-</table></div>
-<p>The same decisions in the five reference harnesses:</p>
-<div class="tbl"><table>
-  <tr><th>Decision</th><th>Codex</th><th>Claude Code</th><th>Kimi Code</th><th>Qwen Code</th><th>Trae Agent</th></tr>
-<tr><td>Skills</td><td>SKILL.md; built-in skill-creator</td><td>SKILL.md, 15+ frontmatter fields</td><td>Skill feature</td><td>Bundled skills, curator with rollback</td><td>None</td></tr>
-<tr><td>Hooks</td><td>14 lifecycle events incl. model request</td><td>27 events, 4 handler kinds</td><td>Named loop points with failure policy</td><td>Claude-compatible event names</td><td>None</td></tr>
-<tr><td>MCP</td><td>Client plus tool search</td><td>Client; tools merged into the pool</td><td>Client and discovery</td><td>Client with transport pool</td><td>Client</td></tr>
-<tr><td>Packaging</td><td>Plugins</td><td>Plugins with 10 component types</td><td>Plugins and features</td><td>Extensions (<code>qwen-extension.json</code>)</td><td>Config file</td></tr>
-</table></div>
-<div class="box watch">
-  <span class="lbl">Risk</span>
-  <p>An agent that can install skills or write extensions can widen its own powers. Pair self-extension with a <code>pre_tool_use</code> hook that blocks writes to the harness's own config and extension folders unless the user approves.</p>
-</div>
+<p>The Claude Code paper adds a second map: extension mechanisms act at three points in the loop. Some change what the model sees (assembling the request), some change which tools it may call, and some decide whether an action runs.</p>
 
-<h2 id="research">4. Research and the Chinese view</h2>
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 170" width="760" style="max-width:100%;height:auto" role="img" aria-label="Three points in the loop">
+  <defs><marker id="m2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="16" width="200" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="110.0" y="37.5" text-anchor="middle" style="fill:var(--ink);font-size:11px">Assemble</text>
+  <text x="110.0" y="52.5" text-anchor="middle" style="fill:var(--ink);font-size:11px">the request</text>
+  <rect x="270" y="16" width="200" height="50" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="370.0" y="37.5" text-anchor="middle" style="fill:var(--ink);font-size:11px">Model</text>
+  <text x="370.0" y="52.5" text-anchor="middle" style="fill:var(--ink);font-size:11px">chooses</text>
+  <path d="M212 41.0H267" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m2)"/>
+  <rect x="530" y="16" width="200" height="50" rx="7" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="630.0" y="37.5" text-anchor="middle" style="fill:var(--ink);font-size:11px">Execute</text>
+  <text x="630.0" y="52.5" text-anchor="middle" style="fill:var(--ink);font-size:11px">the action</text>
+  <path d="M472 41.0H527" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m2)"/>
+  <rect x="10" y="86" width="200" height="50" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="110.0" y="107.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">skills listing, hook context,</text>
+  <text x="110.0" y="121.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">instruction files</text>
+  <path d="M110 68V84" style="fill:none;stroke:var(--ink2);stroke-width:1;stroke-dasharray:4 3"/>
+  <rect x="270" y="86" width="200" height="50" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="370.0" y="107.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">MCP tools, deferred tools,</text>
+  <text x="370.0" y="121.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">denied tools hidden</text>
+  <path d="M370 68V84" style="fill:none;stroke:var(--ink2);stroke-width:1;stroke-dasharray:4 3"/>
+  <rect x="530" y="86" width="200" height="50" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="630.0" y="107.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">pre and post tool hooks,</text>
+  <text x="630.0" y="121.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">permission hooks</text>
+  <path d="M630 68V84" style="fill:none;stroke:var(--ink2);stroke-width:1;stroke-dasharray:4 3"/>
+</svg></div>
+<figcaption>Figure 2. Each extension point acts at one or more of the three points. Hooks are the only one that can act at all three.</figcaption>
+</figure>
+
+<h2 id="decisions">2. The decisions, one at a time</h2>
+<h3 id="d-skills">Decision 1. How does a skill load?</h3>
+<p>A skill is a folder: a SKILL.md with a short frontmatter and instructions, plus optional reference files and scripts. The design problem is cost: a team may have hundreds. The answer every harness converged on is progressive disclosure in three levels.</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 230" width="760" style="max-width:100%;height:auto" role="img" aria-label="Progressive disclosure for skills">
+  <defs><marker id="m3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="10" width="300" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="160.0" y="31.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Level 1: listing</text>
+  <text x="160.0" y="45.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">name + description for every skill</text>
+  <text x="330" y="40" text-anchor="start" style="fill:var(--ink2);font-size:10px">always in context; Claude Code caps an entry at 1,536 characters</text>
+  <rect x="50" y="72" width="300" height="50" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="200.0" y="93.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Level 2: body</text>
+  <text x="200.0" y="107.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">SKILL.md loaded when used</text>
+  <text x="370" y="102" text-anchor="start" style="fill:var(--ink2);font-size:10px">advice: under 500 lines; stays in context after loading</text>
+  <rect x="90" y="134" width="300" height="50" rx="7" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="240.0" y="155.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Level 3: files</text>
+  <text x="240.0" y="169.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">references read, scripts run, as needed</text>
+  <text x="410" y="164" text-anchor="start" style="fill:var(--ink2);font-size:10px">scripts are executed, not loaded</text>
+  <text x="10" y="214" text-anchor="start" style="fill:var(--ink2);font-size:10px">After compaction Claude Code re-attaches recently used skills: up to 5,000 tokens each, 25,000 in total.</text>
+</svg></div>
+<figcaption>Figure 3. Two hundred skills cost two hundred short lines until one is used. LangChain calls this progressive disclosure.</figcaption>
+</figure>
+
+<p>The harnesses differ in who may trigger a skill and where it runs.</p>
 <ul>
-  <li><strong>Progressive disclosure</strong> is LangChain's name for loading only skill metadata up front, to protect against context rot (<a href="https://www.langchain.com/blog/the-anatomy-of-an-agent-harness">LangChain</a>).</li>
-  <li><strong>Skills marketplaces in China.</strong> In early 2026 Alibaba, ByteDance and Tencent all launched skills squares alongside their desktop agents; 36Kr summarizes the stack as coding builds tools, skills store experience, the harness governs the whole (<a href="https://www.36kr.com/p/3777620397691911">36Kr</a>).</li>
-  <li><strong>Cross-runtime skills.</strong> Codex reads <code>~/.agents/skills/</code>, a path shared with Copilot CLI and Gemini CLI, and eve's skills follow the Agent Skills standard, so one skill works in several harnesses.</li>
-  <li><strong>Natural-language harness modules.</strong> NLAH treats modules such as verifier, self-evolution and file-backed state as named natural-language sections, very close to skills (<a href="https://arxiv.org/html/2603.25723v1">NLAH</a>).</li>
+  <li><strong>Who invokes.</strong> Claude Code lets a skill be model-invoked (the default), user-only (left out of the listing, so it costs nothing and the model cannot trigger, say, a deploy) or model-only (hidden from the slash menu).</li>
+  <li><strong>Where it runs.</strong> A Claude Code skill can declare that it runs in a forked subagent: the body becomes the subagent's task and the main context sees only the result (Chapter 9). The documentation advises this only for skills with an explicit task, not for reference guidelines.</li>
+  <li><strong>How it is found.</strong> eve and fx load skills through catalog tools; fx's agent can search for and install skills itself. Codex ships a skill for creating skills, and migrated its older custom commands into skills of at most 4,000 bytes. Claude Code merged commands into skills: both create a slash command, and the skill wins on a name clash.</li>
+  <li><strong>How it is maintained.</strong> Qwen Code ships bundled skills and a curator that can roll back a change.</li>
 </ul>
 
-<h2 id="build">5. Build: skills, hooks and an MCP client</h2>
+<h3 id="d-mcp">Decision 2. How many MCP tools does the model see?</h3>
+<p>MCP lets any service expose tools to any harness. Every tool's schema costs context on every request (Chapter 3), and a few servers can bring hundreds of tools. Three answers exist.</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 176" width="760" style="max-width:100%;height:auto" role="img" aria-label="MCP tool exposure">
+  <defs><marker id="m4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <text x="10" y="18" text-anchor="start" style="fill:var(--ink);font-size:12px;font-weight:600">List them all</text>
+  <text x="10" y="34" text-anchor="start" style="fill:var(--ink2);font-size:10px">Trae Agent, smaller setups</text>
+  <rect x="10" y="44" width="238" height="76" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="129.0" y="78.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">every server's tools join</text>
+  <text x="129.0" y="92.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">the tool list at start</text>
+  <rect x="10" y="132" width="238" height="34" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="129.0" y="152.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">simple; cost grows per server</text>
+  <text x="260" y="18" text-anchor="start" style="fill:var(--ink);font-size:12px;font-weight:600">Search, then call</text>
+  <text x="260" y="34" text-anchor="start" style="fill:var(--ink2);font-size:10px">Codex, Claude Code, fx, others</text>
+  <rect x="260" y="44" width="238" height="76" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="379.0" y="71.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">a fixed tool list plus a</text>
+  <text x="379.0" y="85.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">search tool; schemas load</text>
+  <text x="379.0" y="99.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">when found (nanocode: BM25)</text>
+  <rect x="260" y="132" width="238" height="34" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="379.0" y="152.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">list never changes: cache safe</text>
+  <text x="510" y="18" text-anchor="start" style="fill:var(--ink);font-size:12px;font-weight:600">Prefer a CLI</text>
+  <text x="510" y="34" text-anchor="start" style="fill:var(--ink2);font-size:10px">Pi (stance)</text>
+  <rect x="510" y="44" width="238" height="76" rx="7" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="629.0" y="71.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">a command-line tool with a</text>
+  <text x="629.0" y="85.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">README the agent reads</text>
+  <text x="629.0" y="99.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">on demand; MCP optional</text>
+  <rect x="510" y="132" width="238" height="34" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="629.0" y="152.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">no schema cost at all</text>
+</svg></div>
+<figcaption>Figure 4. Searching keeps the request small and stable; a CLI with documentation is the same idea with the shell as the tool.</figcaption>
+</figure>
+
+<p>Two harnesses wrote their own MCP client rather than use the official SDK: Pi (a small standalone client with standard-input and streamable HTTP transports, added in its 1.0) and nanocode (its own client plus a BM25 search index over tool descriptions). The reason in both cases is control over a component every tool call passes through. Qwen Code pools transports so several servers share connections. Chapter 7's rule applies to all of them: a server configured by a repository must not start until the user trusts that repository.</p>
+
+<h3 id="d-hooks">Decision 3. Which lifecycle points get hooks?</h3>
+<p>A hook is code the harness runs at a named point. The set of points is the harness's real extension contract: whatever has no hook point cannot be customised without changing the harness.</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 250" width="760" style="max-width:100%;height:auto" role="img" aria-label="Hook points along a session">
+  <defs><marker id="m5" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <path d="M30 60H740" style="fill:none;stroke:var(--ink2);stroke-width:2"/>
+  <circle cx="50" cy="60" r="6" style="fill:var(--kv)"/>
+  <text x="50" y="44" text-anchor="middle" style="fill:var(--ink2);font-size:9px">session start</text>
+  <circle cx="130" cy="60" r="6" style="fill:var(--kv)"/>
+  <text x="130" y="44" text-anchor="middle" style="fill:var(--ink2);font-size:9px">user prompt</text>
+  <circle cx="220" cy="60" r="6" style="fill:var(--kv)"/>
+  <text x="220" y="44" text-anchor="middle" style="fill:var(--ink2);font-size:9px">model request</text>
+  <circle cx="310" cy="60" r="6" style="fill:var(--kv)"/>
+  <text x="310" y="44" text-anchor="middle" style="fill:var(--ink2);font-size:9px">pre tool</text>
+  <circle cx="400" cy="60" r="6" style="fill:var(--kv)"/>
+  <text x="400" y="44" text-anchor="middle" style="fill:var(--ink2);font-size:9px">permission</text>
+  <circle cx="490" cy="60" r="6" style="fill:var(--kv)"/>
+  <text x="490" y="44" text-anchor="middle" style="fill:var(--ink2);font-size:9px">post tool</text>
+  <circle cx="580" cy="60" r="6" style="fill:var(--kv)"/>
+  <text x="580" y="44" text-anchor="middle" style="fill:var(--ink2);font-size:9px">compact</text>
+  <circle cx="660" cy="60" r="6" style="fill:var(--kv)"/>
+  <text x="660" y="44" text-anchor="middle" style="fill:var(--ink2);font-size:9px">stop</text>
+  <circle cx="730" cy="60" r="6" style="fill:var(--kv)"/>
+  <text x="730" y="44" text-anchor="middle" style="fill:var(--ink2);font-size:9px">session end</text>
+  <rect x="10" y="84" width="110" height="26" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="65.0" y="100.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Claude Code</text>
+  <text x="130" y="101" text-anchor="start" style="fill:var(--ink2);font-size:10px">33 events, 5 handler types (shell command, HTTP, MCP tool, model prompt, agent)</text>
+  <rect x="10" y="116" width="110" height="26" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="65.0" y="132.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Codex</text>
+  <text x="130" y="133" text-anchor="start" style="fill:var(--ink2);font-size:10px">14 events, including before and after each model request, permission request, interrupt</text>
+  <rect x="10" y="148" width="110" height="26" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="65.0" y="164.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Qwen Code</text>
+  <text x="130" y="165" text-anchor="start" style="fill:var(--ink2);font-size:10px">Claude Code's names: pre and post tool, tool failure, tool batch, prompt submit, compact...</text>
+  <rect x="10" y="180" width="110" height="26" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="65.0" y="196.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Kimi Code</text>
+  <text x="130" y="197" text-anchor="start" style="fill:var(--ink2);font-size:10px">named points inside the loop (e.g. step continuing), each with a failure policy</text>
+  <rect x="10" y="212" width="110" height="26" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="65.0" y="228.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">fx</text>
+  <text x="130" y="229" text-anchor="start" style="fill:var(--ink2);font-size:10px">4 kinds: pre tool use, stop, post turn end, attention required</text>
+</svg></div>
+<figcaption>Figure 5. From four points to thirty-three. More points mean more control and a larger contract to keep stable.</figcaption>
+</figure>
+
+<p>fx's four are a minimal useful set worth studying: one to gate actions (pre tool use), one to keep the agent working when it should not stop yet (stop), one to react after a turn, and one to tell a person the agent is waiting. Claude Code's set covers the same ground and much more: model switches, file and directory changes, worktrees, task events, configuration changes, instruction loading. Codex is the one that hooks the model request itself, which is where a team would add logging or redaction of every prompt.</p>
+
+<h3 id="d-decide">Decision 4. What may a hook decide, and what if it fails?</h3>
+<p>A hook that can only observe is an audit log. A hook that can decide is part of the permission system (Chapter 7), and must have clear semantics.</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 230" width="760" style="max-width:100%;height:auto" role="img" aria-label="Claude Code pre-tool hook semantics">
+  <defs><marker id="m6" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="10" width="110" height="28" rx="7" style="fill:var(--bad-s);stroke:var(--bad)"/>
+  <text x="65.0" y="27.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">deny</text>
+  <text x="132" y="28" text-anchor="start" style="fill:var(--ink2);font-size:10px">block, with a reason shown to the model</text>
+  <rect x="10" y="46" width="110" height="28" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="65.0" y="63.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">allow</text>
+  <text x="132" y="64" text-anchor="start" style="fill:var(--ink2);font-size:10px">skip the prompt (cannot override a block)</text>
+  <rect x="10" y="82" width="110" height="28" rx="7" style="fill:var(--panel2);stroke:var(--line)"/>
+  <text x="65.0" y="99.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">ask</text>
+  <text x="132" y="100" text-anchor="start" style="fill:var(--ink2);font-size:10px">escalate to the user</text>
+  <rect x="10" y="118" width="110" height="28" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="65.0" y="135.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">modify</text>
+  <text x="132" y="136" text-anchor="start" style="fill:var(--ink2);font-size:10px">replace the tool's arguments</text>
+  <rect x="10" y="154" width="110" height="28" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="65.0" y="171.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">silence</text>
+  <text x="132" y="172" text-anchor="start" style="fill:var(--ink2);font-size:10px">normal permission flow; silence never approves</text>
+  <rect x="470" y="10" width="280" height="172" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="610.0" y="57.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Failure and limits (Claude Code docs)</text>
+  <text x="610.0" y="71.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">exit 2: block, stderr is the reason</text>
+  <text x="610.0" y="85.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">other non-zero: non-blocking,</text>
+  <text x="610.0" y="99.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">  unless the hook sets block on failure</text>
+  <text x="610.0" y="113.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">timeouts: 600 s for commands,</text>
+  <text x="610.0" y="127.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">  30 s for model prompts, 60 s for agents</text>
+  <text x="610.0" y="141.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">all matching hooks run in parallel</text>
+  <text x="10" y="212" text-anchor="start" style="fill:var(--ink2);font-size:10px">Kimi Code makes every hook declare its failure policy, so a broken hook cannot silently allow what it was meant to stop.</text>
+</svg></div>
+<figcaption>Figure 6. A deny can be expressed two ways; an allow cannot override a block; and silence is not consent.</figcaption>
+</figure>
+
+<p>Two lessons generalise. First, the asymmetry: a hook may tighten freely but loosening needs care, which is why an allow does not override another hook's block. Second, failure policy is per hook, not global: a formatter that crashes should not stop the agent, a secret scanner that crashes should. Claude Code's stop hook shows the other use of blocking: on the stop event, blocking keeps the agent working, which is how teams enforce "do not stop until the tests pass" (Chapter 14).</p>
+
+<h3 id="d-ext">Decision 5. How are whole features added?</h3>
+<p>Skills, MCP and hooks add behaviour at the edges. Some additions need to live inside the harness: a new provider, a UI panel, a command with state. Here the harnesses split by how much of themselves they open up.</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 196" width="760" style="max-width:100%;height:auto" role="img" aria-label="Extension models">
+  <defs><marker id="m7" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <text x="10" y="18" text-anchor="start" style="fill:var(--ink);font-size:12px;font-weight:600">Code loaded at runtime</text>
+  <text x="10" y="34" text-anchor="start" style="fill:var(--ink2);font-size:10px">Pi</text>
+  <rect x="10" y="44" width="238" height="96" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="129.0" y="74.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">TypeScript files that register</text>
+  <text x="129.0" y="88.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">tools, commands, UI and</text>
+  <text x="129.0" y="102.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">lifecycle handlers; hot reload;</text>
+  <text x="129.0" y="116.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">state saved in the session</text>
+  <rect x="10" y="152" width="238" height="34" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="129.0" y="172.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">the agent can write them</text>
+  <text x="260" y="18" text-anchor="start" style="fill:var(--ink);font-size:12px;font-weight:600">Same layout, as a package</text>
+  <text x="260" y="34" text-anchor="start" style="fill:var(--ink2);font-size:10px">eve, Qwen Code, Codex</text>
+  <rect x="260" y="44" width="238" height="96" rx="7" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="379.0" y="74.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">eve: an npm package with the</text>
+  <text x="379.0" y="88.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">agent's own folders; Qwen: a</text>
+  <text x="379.0" y="102.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">manifest; Codex: plugins</text>
+  <text x="379.0" y="116.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">bundling skills and commands</text>
+  <rect x="260" y="152" width="238" height="34" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="379.0" y="172.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">installable and versioned</text>
+  <text x="510" y="18" text-anchor="start" style="fill:var(--ink);font-size:12px;font-weight:600">Everything is a feature</text>
+  <text x="510" y="34" text-anchor="start" style="fill:var(--ink2);font-size:10px">Kimi Code</text>
+  <rect x="510" y="44" width="238" height="96" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="629.0" y="81.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">skills, plan, goal, todo, cron,</text>
+  <text x="629.0" y="95.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">swarm, reminders, hooks all</text>
+  <text x="629.0" y="109.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">register with one container</text>
+  <rect x="510" y="152" width="238" height="34" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="629.0" y="172.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">core and extensions alike</text>
+</svg></div>
+<figcaption>Figure 7. The more of the harness is built from its own extension points, the more a user can replace.</figcaption>
+</figure>
+
+<p>Claude Code's plugins, per the paper, bundle up to ten component types in one manifest: commands, agents, skills, hooks, MCP servers, LSP servers, output styles and more. eve takes the opposite route to the same goal: the agent's directory is the contract (skills, hooks, connections, tools and channels are folders), and an extension is just a package with the same folders. Kimi Code's design is the most uniform: its own planning, goals, scheduling and reminders are features registered the same way an extension would be.</p>
+
+<h3 id="d-self">Decision 6. May the agent extend itself?</h3>
+<p>Pi's extensions are plain files, so the agent can write and hot-reload its own; Armin Ronacher has described daily extensions (answer, todos, review) written entirely by the agent. fx's agent can search for and install skills. eve ships optional self-improvement and self-modification extensions.</p>
+<div class="box watch"><span class="lbl">Watch out</span><p>An agent that can install skills or write extensions can widen its own powers, and a prompt injection can ask it to (Chapter 7). Pair self-extension with a pre-tool hook that blocks writes to the harness's own configuration and extension folders unless the user approves, and load new extensions only after review.</p></div>
+
+<h3 id="d-port">Decision 7. Do extensions move between harnesses?</h3>
+<p>An extension written for one harness is worth more if it works in others. Three shared formats exist.</p>
+<ul>
+  <li><strong>Agent Skills.</strong> Claude Code's and eve's skills follow the open standard; outside Claude Code only six frontmatter fields are allowed (name, description, license, compatibility, metadata, allowed tools), so Claude-Code-only features do not travel. Codex reads a skills folder shared with other CLIs.</li>
+  <li><strong>Hook names.</strong> Qwen Code's events follow Claude Code's names closely, so hook scripts move between them.</li>
+  <li><strong>MCP</strong> itself, and AGENTS.md (Chapter 4).</li>
+</ul>
+
+<h2 id="harnesses">3. The extension surface of each harness</h2>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 120" width="760" style="max-width:100%;height:auto" role="img" aria-label="Pi">
+  <defs><marker id="m8" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <text x="10" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">skills</text>
+  <rect x="10" y="24" width="110" height="22" rx="4" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="65.0" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">skills listing</text>
+  <text x="132" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">MCP</text>
+  <rect x="132" y="24" width="124" height="22" rx="4" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="194.0" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">own client (1.0)</text>
+  <text x="268" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">hooks</text>
+  <rect x="268" y="24" width="124" height="22" rx="4" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="330.0" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">extension events</text>
+  <text x="404" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">extensions</text>
+  <rect x="404" y="24" width="124" height="22" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="466.0" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">TypeScript files</text>
+  <rect x="404" y="50" width="124" height="22" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="466.0" y="64.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">hot reload</text>
+  <rect x="404" y="76" width="124" height="22" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="466.0" y="90.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">agent-written</text>
+</svg></div>
+<figcaption>Figure 8. Pi. Extensions are the main unit; CLIs with READMEs are preferred to MCP.</figcaption>
+</figure>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 120" width="760" style="max-width:100%;height:auto" role="img" aria-label="eve">
+  <defs><marker id="m9" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <text x="10" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">skills</text>
+  <rect x="10" y="24" width="110" height="22" rx="4" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="65.0" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">skills/ folder</text>
+  <rect x="10" y="50" width="110" height="22" rx="4" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="65.0" y="64.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Agent Skills</text>
+  <text x="132" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">MCP</text>
+  <rect x="132" y="24" width="110" height="22" rx="4" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="187.0" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">connections/</text>
+  <text x="254" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">hooks</text>
+  <rect x="254" y="24" width="110" height="22" rx="4" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="309.0" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">hooks/ folder</text>
+  <text x="376" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">extensions</text>
+  <rect x="376" y="24" width="110" height="22" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="431.0" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">npm packages</text>
+  <rect x="376" y="50" width="110" height="22" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="431.0" y="64.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">same layout</text>
+  <text x="498" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">other</text>
+  <rect x="498" y="24" width="110" height="22" rx="4" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="553.0" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">tools/</text>
+  <rect x="498" y="50" width="110" height="22" rx="4" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="553.0" y="64.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">channels/</text>
+</svg></div>
+<figcaption>Figure 9. eve. The directory is the contract.</figcaption>
+</figure>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 140" width="760" style="max-width:100%;height:auto" role="img" aria-label="fx">
+  <defs><marker id="m10" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <text x="10" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">skills</text>
+  <rect x="10" y="24" width="117" height="22" rx="4" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="68.5" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">search, install</text>
+  <text x="139" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">MCP</text>
+  <rect x="139" y="24" width="117" height="22" rx="4" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="197.5" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">found by search</text>
+  <text x="268" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">hooks</text>
+  <rect x="268" y="24" width="138" height="22" rx="4" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="337.0" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">pre_tool_use</text>
+  <rect x="268" y="50" width="138" height="22" rx="4" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="337.0" y="64.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">stop</text>
+  <rect x="268" y="76" width="138" height="22" rx="4" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="337.0" y="90.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">post_turn_end</text>
+  <rect x="268" y="102" width="138" height="22" rx="4" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="337.0" y="116.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">attention_required</text>
+</svg></div>
+<figcaption>Figure 10. fx. Four hook kinds cover gate, persistence, reaction and notification.</figcaption>
+</figure>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 120" width="760" style="max-width:100%;height:auto" role="img" aria-label="nanocode">
+  <defs><marker id="m11" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <text x="10" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">MCP</text>
+  <rect x="10" y="24" width="110" height="22" rx="4" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="65.0" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">own client</text>
+  <rect x="10" y="50" width="110" height="22" rx="4" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="65.0" y="64.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">BM25 search</text>
+  <text x="132" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">hooks</text>
+  <rect x="132" y="24" width="110" height="22" rx="4" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="187.0" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">event sinks</text>
+  <text x="254" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">extensions</text>
+  <rect x="254" y="24" width="131" height="22" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="319.5" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Rust crates</text>
+  <rect x="254" y="50" width="131" height="22" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="319.5" y="64.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">host integrations</text>
+</svg></div>
+<figcaption>Figure 11. nanocode. Built to connect many servers without filling the context.</figcaption>
+</figure>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 120" width="760" style="max-width:100%;height:auto" role="img" aria-label="Codex">
+  <defs><marker id="m12" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <text x="10" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">skills</text>
+  <rect x="10" y="24" width="110" height="22" rx="4" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="65.0" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">SKILL.md</text>
+  <rect x="10" y="50" width="110" height="22" rx="4" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="65.0" y="64.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">skill-creator</text>
+  <text x="132" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">MCP</text>
+  <rect x="132" y="24" width="110" height="22" rx="4" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="187.0" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">tool_search</text>
+  <text x="254" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">hooks</text>
+  <rect x="254" y="24" width="145" height="22" rx="4" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="326.5" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">14 events</text>
+  <rect x="254" y="50" width="145" height="22" rx="4" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="326.5" y="64.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">incl. model request</text>
+  <text x="411" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">plugins</text>
+  <rect x="411" y="24" width="131" height="22" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="476.5" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">skills + commands</text>
+</svg></div>
+<figcaption>Figure 12. Codex. The only harness here with hooks around each model request.</figcaption>
+</figure>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 120" width="760" style="max-width:100%;height:auto" role="img" aria-label="Claude Code">
+  <defs><marker id="m13" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <text x="10" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">skills</text>
+  <rect x="10" y="24" width="110" height="22" rx="4" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="65.0" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">SKILL.md</text>
+  <rect x="10" y="50" width="110" height="22" rx="4" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="65.0" y="64.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">fork option</text>
+  <text x="132" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">MCP</text>
+  <rect x="132" y="24" width="110" height="22" rx="4" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="187.0" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">ToolSearch</text>
+  <text x="254" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">hooks</text>
+  <rect x="254" y="24" width="117" height="22" rx="4" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="312.5" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">33 events</text>
+  <rect x="254" y="50" width="117" height="22" rx="4" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="312.5" y="64.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">5 handler types</text>
+  <text x="383" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">plugins</text>
+  <rect x="383" y="24" width="117" height="22" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="441.5" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">up to 10</text>
+  <rect x="383" y="50" width="117" height="22" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="441.5" y="64.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">component types</text>
+</svg></div>
+<figcaption>Figure 13. Claude Code. The largest hook surface; skills and commands merged.</figcaption>
+</figure>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 120" width="760" style="max-width:100%;height:auto" role="img" aria-label="Kimi Code">
+  <defs><marker id="m14" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <text x="10" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">skills</text>
+  <rect x="10" y="24" width="110" height="22" rx="4" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="65.0" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">skill feature</text>
+  <text x="132" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">MCP</text>
+  <rect x="132" y="24" width="131" height="22" rx="4" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="197.5" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">client, discovery</text>
+  <text x="275" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">hooks</text>
+  <rect x="275" y="24" width="131" height="22" rx="4" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="340.5" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">named loop points</text>
+  <rect x="275" y="50" width="131" height="22" rx="4" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="340.5" y="64.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">failure policy</text>
+  <text x="418" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">features</text>
+  <rect x="418" y="24" width="124" height="22" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="480.0" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">plan, goal, todo</text>
+  <rect x="418" y="50" width="124" height="22" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="480.0" y="64.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">cron, swarm</text>
+  <rect x="418" y="76" width="124" height="22" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="480.0" y="90.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">reminders</text>
+</svg></div>
+<figcaption>Figure 14. Kimi Code. Built-in features use the same registry as extensions.</figcaption>
+</figure>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 120" width="760" style="max-width:100%;height:auto" role="img" aria-label="Qwen Code">
+  <defs><marker id="m15" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <text x="10" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">skills</text>
+  <rect x="10" y="24" width="131" height="22" rx="4" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="75.5" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">bundled</text>
+  <rect x="10" y="50" width="131" height="22" rx="4" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="75.5" y="64.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">curator, rollback</text>
+  <text x="153" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">MCP</text>
+  <rect x="153" y="24" width="110" height="22" rx="4" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="208.0" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">transport pool</text>
+  <text x="275" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">hooks</text>
+  <rect x="275" y="24" width="110" height="22" rx="4" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="330.0" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Claude Code</text>
+  <rect x="275" y="50" width="110" height="22" rx="4" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="330.0" y="64.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">event names</text>
+  <text x="397" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">extensions</text>
+  <rect x="397" y="24" width="110" height="22" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="452.0" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">manifest</text>
+  <rect x="397" y="50" width="110" height="22" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="452.0" y="64.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">packages</text>
+</svg></div>
+<figcaption>Figure 15. Qwen Code. Compatible with Claude Code where it can be.</figcaption>
+</figure>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 120" width="760" style="max-width:100%;height:auto" role="img" aria-label="Trae Agent">
+  <defs><marker id="m16" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <text x="10" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">MCP</text>
+  <rect x="10" y="24" width="131" height="22" rx="4" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="75.5" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">servers in config</text>
+  <text x="153" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">everything else</text>
+  <rect x="153" y="24" width="117" height="22" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="211.5" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">edit the Python</text>
+</svg></div>
+<figcaption>Figure 16. Trae Agent. For a research codebase, source changes are the extension mechanism.</figcaption>
+</figure>
+
+<h2 id="compare">4. All nine in one table</h2>
+<div class="tbl"><table>
+  <tr><th>Harness</th><th>Skills</th><th>MCP exposure</th><th>Hook points</th><th>Hook failure policy</th><th>Packaging</th><th>Self-extension</th></tr>
+  <tr><td>Pi</td><td>Listing + body</td><td>Own client; CLIs preferred</td><td>Extension lifecycle events</td><td>In extension code</td><td>TypeScript files</td><td>Agent writes extensions</td></tr>
+  <tr><td>eve</td><td>Agent Skills, catalog tool</td><td>Connections, deferred</td><td>Lifecycle and stream</td><td>Not described here</td><td>npm packages</td><td>Opt-in extensions</td></tr>
+  <tr><td>fx</td><td>Search and install</td><td>Search</td><td>4 kinds</td><td>Not described here</td><td>Config</td><td>Installs skills</td></tr>
+  <tr><td>nanocode</td><td>Vendor's</td><td>Own client, BM25</td><td>Event sinks</td><td>Not described here</td><td>Crates</td><td>No</td></tr>
+  <tr><td>Codex</td><td>SKILL.md, creator skill</td><td>Tool search</td><td>14 events</td><td>Not described here</td><td>Plugins</td><td>Creates skills on request</td></tr>
+  <tr><td>Claude Code</td><td>3 levels, invocation control, fork</td><td>ToolSearch</td><td>33 events, 5 handler types</td><td>Exit 2 blocks; opt-in block on failure</td><td>Plugins</td><td>Creates skills on request</td></tr>
+  <tr><td>Kimi Code</td><td>Feature</td><td>Client, discovery</td><td>Named loop points</td><td>Declared per hook</td><td>Features, plugins</td><td>Not described here</td></tr>
+  <tr><td>Qwen Code</td><td>Bundled, curator</td><td>Transport pool, search</td><td>Claude Code names</td><td>Not described here</td><td>Extensions manifest</td><td>Not described here</td></tr>
+  <tr><td>Trae Agent</td><td>None</td><td>All listed</td><td>None</td><td>n/a</td><td>Config</td><td>No</td></tr>
+</table></div>
+
+<h2 id="choose">5. Choosing extension points</h2>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 274" width="760" style="max-width:100%;height:auto" role="img" aria-label="Choosing extension points">
+  <defs><marker id="m17" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="10" width="280" height="52" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="150.0" y="39.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Must it happen every time?</text>
+  <rect x="340" y="10" width="410" height="52" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="545.0" y="32.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">A hook at a fixed point, with an explicit</text>
+  <text x="545.0" y="46.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">failure policy; never a line in AGENTS.md</text>
+  <path d="M292 36H336" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m17)"/>
+  <text x="300" y="30" text-anchor="start" style="fill:var(--ink2);font-size:10px">yes</text>
+  <rect x="10" y="76" width="280" height="52" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="150.0" y="98.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Is it a procedure the model</text>
+  <text x="150.0" y="112.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">follows sometimes?</text>
+  <rect x="340" y="76" width="410" height="52" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="545.0" y="98.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">A skill: short description, body on demand,</text>
+  <text x="545.0" y="112.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">reference files and scripts beside it</text>
+  <path d="M292 102H336" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m17)"/>
+  <text x="300" y="96" text-anchor="start" style="fill:var(--ink2);font-size:10px">yes</text>
+  <rect x="10" y="142" width="280" height="52" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="150.0" y="171.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Is it an outside system?</text>
+  <rect x="340" y="142" width="410" height="52" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="545.0" y="164.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">MCP behind tool search, or a CLI with</text>
+  <text x="545.0" y="178.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">a README; start it only in trusted projects</text>
+  <path d="M292 168H336" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m17)"/>
+  <text x="300" y="162" text-anchor="start" style="fill:var(--ink2);font-size:10px">yes</text>
+  <rect x="10" y="208" width="280" height="52" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="150.0" y="230.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Does it change the harness</text>
+  <text x="150.0" y="244.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">itself?</text>
+  <rect x="340" y="208" width="410" height="52" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="545.0" y="230.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">An extension or plugin, reviewed before</text>
+  <text x="545.0" y="244.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">loading; block self-writes to config</text>
+  <path d="M292 234H336" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m17)"/>
+  <text x="300" y="228" text-anchor="start" style="fill:var(--ink2);font-size:10px">yes</text>
+</svg></div>
+<figcaption>Figure 17. One question per extension point.</figcaption>
+</figure>
+
+<p>This book's harness: skills with a listing and on-demand bodies, five hook points (session start, pre tool, post tool, stop, session end) with per-hook failure policies, and an MCP client behind the deferred-tool search from Chapter 3.</p>
+
+<h2 id="research">6. Research and the Chinese view</h2>
+<ul>
+  <li><strong>Progressive disclosure</strong> is LangChain's name for loading only skill metadata up front, to protect against context rot.</li>
+  <li><strong>Natural-language harness modules.</strong> The NLAH paper treats modules such as a verifier, self-evolution and file-backed state as named natural-language sections, very close to skills.</li>
+  <li><strong>Skills marketplaces in China.</strong> In early 2026 Alibaba, ByteDance and Tencent all launched skill marketplaces alongside their desktop agents; 36Kr summarised the stack as: coding builds tools, skills store experience, the harness governs the whole.</li>
+  <li><strong>Chinese practice.</strong> Kimi Code's feature registry is the most uniform extension design read for this book; Qwen Code's choice to match Claude Code's hook names is a deliberate bet on portability.</li>
+</ul>
+
+<h2 id="build">7. Build: skills, hooks and an MCP client</h2>
 <pre>&quot;&quot;&quot;Extensibility: skills with progressive disclosure, lifecycle hooks, and a minimal MCP stdio client.&quot;&quot;&quot;
 import json, re, subprocess, threading
 from pathlib import Path
@@ -221,32 +699,36 @@ class MCPClient:
   <li>Rerun your 10 tasks with the two hooks on. Did pass rate change? Did steps per task rise?</li>
 </ol>
 
-<h2 id="exercises">6. Exercises</h2>
+
+<h2 id="exercises">8. Exercises</h2>
 <ol>
-  <li>Add tool search: instead of listing MCP tools, give the model a <code>find_tool(query)</code> tool that ranks tools by keyword match and returns the best schemas, as fx and nanocode do.</li>
-  <li>Let the agent write a skill from a session it just finished. Review it before you keep it.</li>
-  <li>Add the <code>attention_required</code> hook from fx: notify yourself (a desktop notification or a Telegram message) when the agent waits for input.</li>
+  <li><strong>Skill budget.</strong> Install 100 skills. Measure the listing's token cost, then cap each description and compare. Does the model still pick the right skill?</li>
+  <li><strong>Formatter hook.</strong> Add a post-tool hook that formats edited files and returns a one-line note to the model. Compare with an AGENTS.md line asking for formatting over 20 tasks.</li>
+  <li><strong>Fail closed.</strong> Give your secret-scanning pre-tool hook a "block on failure" policy. Make it crash and confirm the write is blocked with a clear reason.</li>
+  <li><strong>Stop hook.</strong> Block the stop event until the test command passes. Count how many extra steps it adds and how many broken finishes it prevents.</li>
+  <li><strong>Portability.</strong> Take one of your skills and load it unchanged in another harness that supports Agent Skills. Which frontmatter fields did not survive?</li>
 </ol>
 
-<h2 id="quiz">7. Check yourself</h2>
+<h2 id="quiz">9. Check yourself</h2>
 <div class="widget quiz" data-quiz="qz8"></div>
 <script type="application/json" id="qz8">[
-{"q":"Which hook kinds does fx define?","o":["Only pre_tool_use","pre_tool_use, stop, post_turn_end, attention_required","Twenty lifecycle events","None"],"a":1,"e":"definitions.zig enumerates exactly these four."},
-{"q":"What goes into the prompt with progressive disclosure?","o":["Every skill's full text","Each skill's name and description only","Nothing about skills","Only the most used skill"],"a":1,"e":"The body loads when the model calls the skill tool."},
-{"q":"Why should 'tests must pass before finishing' be a stop hook?","o":["Hooks are faster","A hook always runs; a prompt rule depends on the model remembering","Prompts cannot mention tests","Stop hooks are cheaper"],"a":1,"e":"Deterministic policy belongs in code."},
-{"q":"How does nanocode keep many MCP tools from filling the context?","o":["It forbids MCP","A BM25 search over MCP tools","It summarizes schemas","It uses a bigger window"],"a":1,"e":"Search loads only the schemas the model needs."},
-{"q":"What is an eve extension?","o":["A browser plugin","An npm package with tools, skills, hooks and more, mounted from agent/extensions","A model provider","A hook"],"a":1,"e":"It reuses the agent folder layout so capabilities can be shared across agents."}
+{"q":"Which question decides between a skill and a hook?","o":["Language","Whether it must happen every time (hook) or only when the model decides (skill)","Its size","Who wrote it"],"a":1,"e":"The model's choices are samples, so anything mandatory must be harness code."},
+{"q":"What is in Claude Code's context for a skill before it is used?","o":["The full SKILL.md","Its name and description in a listing, capped at 1,536 characters","Nothing","Its scripts"],"a":1,"e":"The body loads on use; reference files and scripts only when needed."},
+{"q":"Why do most harnesses put MCP tools behind a search tool?","o":["Search is faster","Every schema costs context on every request, and a fixed tool list keeps the cache valid","MCP requires it","For security"],"a":1,"e":"nanocode uses its own BM25 index; Codex and Claude Code have a tool search tool."},
+{"q":"In Claude Code, what does a pre-tool hook that exits with no output and code 0 mean?","o":["Allow","Deny","No decision: the normal permission flow applies","Ask"],"a":2,"e":"Silence never approves."},
+{"q":"What does blocking the stop event do in Claude Code?","o":["Ends the session","Keeps the agent working","Deletes the transcript","Nothing"],"a":1,"e":"It is how teams enforce 'do not stop until the tests pass'."},
+{"q":"Which harness hooks each model request?","o":["Pi","Trae Agent","Codex","fx"],"a":2,"e":"Its 14 events include before and after each model request."},
+{"q":"What is the main risk of an agent that can install skills or write extensions?","o":["Slowness","It can widen its own powers, possibly because injected text asked it to","Higher cost","Version conflicts"],"a":1,"e":"Block writes to the harness's own config and extension folders unless the user approves."},
+{"q":"Why does Kimi Code make each hook declare a failure policy?","o":["For logging","So a broken hook cannot silently allow what it was meant to stop","To run faster","Because hooks are optional"],"a":1,"e":"A formatter may fail open; a safety check must fail closed."}
 ]</script>
 
-<h2 id="refs">8. References</h2>
+<h2 id="refs">10. References</h2>
 <ul>
-  <li>Pi: <code>packages/coding-agent/src/core/extensions/</code>; <code>packages/mcp/README.md</code>.</li>
-  <li>eve: <code>docs/skills.mdx</code>, <code>docs/extensions/index.md</code>, <code>packages/eve-*</code>.</li>
-  <li>fx: <code>src/core/hooks/definitions.zig</code>, <code>src/core/skills/</code>, <code>src/tools/skills/</code>.</li>
-  <li>nanocode: <code>crates/core/mcp</code>, <code>crates/integrations/mcp-tools/src/SEARCH.md</code>.</li>
-  <li><a href="https://lucumr.pocoo.org/2026/1/31/pi/">Pi: The Minimal Agent Within OpenClaw</a>, Armin Ronacher, Jan 2026.</li>
-  <li><a href="https://tw93.fun/en/2026-03-12/claude.html">Claude Code Deep Dive: Architecture, Governance, and Engineering Practices</a>, Mar 2026.</li>
-  <li>Model Context Protocol specification, modelcontextprotocol.io.</li>
+  <li>Pi: <a href="https://github.com/earendil-works/pi">github.com/earendil-works/pi</a> (fb248c7). eve: <a href="https://github.com/vercel/eve">github.com/vercel/eve</a> (5c52fbf). fx: <a href="https://github.com/vercel-labs/fx">github.com/vercel-labs/fx</a> (cbe7daf). nanocode: <a href="https://github.com/gakonst/nanocode">github.com/gakonst/nanocode</a> (015cbfa).</li>
+  <li>Codex CLI: <a href="https://github.com/openai/codex">github.com/openai/codex</a> (50aeac2).</li>
+  <li>Claude Code: <a href="https://code.claude.com/docs/en/hooks">Hooks reference</a> and <a href="https://code.claude.com/docs/en/skills">Skills</a>, checked 24 Nov 2026; Dive into Claude Code, arXiv 2604.14228.</li>
+  <li>Kimi Code: <a href="https://github.com/MoonshotAI/kimi-code">github.com/MoonshotAI/kimi-code</a> (111aae2). Qwen Code: <a href="https://github.com/QwenLM/qwen-code">github.com/QwenLM/qwen-code</a> (c56424fc). Trae Agent: <a href="https://github.com/bytedance/trae-agent">github.com/bytedance/trae-agent</a> (e839e55).</li>
+  <li><a href="https://agentskills.io">Agent Skills</a> open standard. <a href="https://modelcontextprotocol.io">Model Context Protocol</a>. Natural-Language Agent Harnesses, arXiv 2603.25723.</li>
 </ul>
 
 <div class="navfoot"></div>
