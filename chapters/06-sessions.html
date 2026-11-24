@@ -82,6 +82,17 @@
 <figcaption>Pi's session tree. Approach A failed; the user branched back and tried B. A stays on disk but never pollutes B's context.</figcaption>
 </figure>
 
+<h3>Codex: rollouts, a state database and a two-phase memory</h3>
+<p>Codex writes each session as a "rollout": a JSONL file named <code>rollout-&lt;timestamp&gt;-&lt;uuid&gt;.jsonl</code>, optionally compressed to <code>.jsonl.zst</code> (<code>codex-rs/rollout/</code>), with a SQLite state database for indexing and search. The CLI has <code>resume</code>, <code>fork</code>, <code>archive</code> and <code>unarchive</code>. Memory is a separate background pipeline (<code>codex-rs/memories/README.md</code>). Phase 1 picks recent, idle sessions, asks a model to extract a raw memory and a short summary from each, and redacts secrets. Phase 2 takes a global lock, ranks memories by how often and how recently they were used, drops ones unused for too long, and consolidates them into files under <code>~/.codex/memories/</code>, which is itself a git repository so every change can be inspected and reverted.</p>
+<h3>Claude Code: append-only transcripts and file checkpoints</h3>
+<p>Per the paper, Claude Code keeps three records: append-only JSONL transcripts, a global prompt history, and separate "sidechain" transcripts for subagents. Compaction never rewrites a transcript; boundaries are recorded and the chain is patched when it is read. File-history checkpoints under <code>~/.claude/file-history/&lt;sessionId&gt;/</code> let a user rewind file changes, which the transcript alone cannot undo (fact 6). Memory is plain files; to recall, a model scans the headers of the memory files and picks up to five, with no embeddings.</p>
+<h3>Kimi Code: one log per agent, undo by appending</h3>
+<p>Kimi Code stores each agent's events in its own <code>agents/&lt;agentId&gt;/wire.jsonl</code>; the main agent is <code>agents/main/</code>. A parent's log holds only the subagent call and its result. Undo does not delete anything: a <code>context.undo</code> record with a count retracts the previous N messages, and compaction is a <code>context.apply_compaction</code> record. The log is the truth; the conversation the model sees is computed from it.</p>
+<h3>Qwen Code: sessions with sidecars</h3>
+<p>Qwen Code's <code>chatRecordingService.ts</code> records the conversation, and separate sidecar files store titles, branches, goals and artifact summaries (<code>session-branch-sidecar.ts</code>, <code>session-goal-sidecar.ts</code>), so a small change does not rewrite a large transcript. A writer lease (<code>session-writer-lease.ts</code>) makes sure only one process writes a session at a time, and file-history services keep backups of files the agent changed.</p>
+<h3>Trae Agent: a trajectory, not a session</h3>
+<p>Trae Agent records every step's model request, response and tool calls to a trajectory JSON file (<code>utils/trajectory_recorder.py</code>), but it has no resume. Each run is one task from start to finish, which is what a benchmark needs.</p>
+
 <h2 id="decisions">3. Design decisions compared</h2>
 <div class="tbl"><table>
   <tr><th>Decision</th><th>Pi</th><th>fx</th><th>eve</th><th>nanocode</th></tr>
@@ -90,6 +101,14 @@
   <tr><td>Cross-session memory</td><td>AGENTS.md and extensions</td><td>AGENTS.md, skills</td><td>Memory slots with providers and scopes</td><td>AGENTS.md, host stores</td></tr>
   <tr><td>Pro</td><td>Explore without polluting context</td><td>Simple</td><td>Scoped, multi-user memory</td><td>Same records everywhere</td></tr>
   <tr><td>Con</td><td>Tree UI is harder</td><td>No branching</td><td>Needs a platform</td><td>Complex</td></tr>
+</table></div>
+<p>The same decisions in the five reference harnesses:</p>
+<div class="tbl"><table>
+  <tr><th>Decision</th><th>Codex</th><th>Claude Code</th><th>Kimi Code</th><th>Qwen Code</th><th>Trae Agent</th></tr>
+<tr><td>History format</td><td>JSONL rollout (optionally zstd) plus SQLite index</td><td>Append-only JSONL plus sidechains</td><td>Event log per agent</td><td>Recording plus sidecars</td><td>Trajectory JSON</td></tr>
+<tr><td>Branching</td><td><code>fork</code> command</td><td>Fork and resume</td><td>Undo by retraction records</td><td>Branch sidecar</td><td>None</td></tr>
+<tr><td>Memory</td><td>Two-phase extraction and consolidation into a git-tracked folder</td><td>Files; model picks up to 5 by header</td><td>AGENTS.md only; we found no separate memory store</td><td>Memory tools (<code>manage-memory</code>, <code>search-memory</code>)</td><td>None</td></tr>
+<tr><td>File undo</td><td>Turn diff tracker (diff per turn)</td><td>File-history checkpoints</td><td>Undo service</td><td>File-history backups</td><td>Git diff only</td></tr>
 </table></div>
 
 <h2 id="research">4. Research and the Chinese view</h2>

@@ -57,6 +57,17 @@
 <h3>Pi: no subagents in core</h3>
 <p>Pi's README lists no subagents as a deliberate choice. For code review, a slash command runs <code>pi --print</code> as a separate process; for research, gather context in a separate session and save it as a file the next session reads.</p>
 
+<h3>Codex: agents as threads with a small API</h3>
+<p>Codex's subagent tools (<code>core/src/tools/handlers/multi_agents*.rs</code>) are a small API: <code>spawn_agent</code>, <code>send_input</code>, <code>wait_agent</code>, <code>list_agents</code>, <code>interrupt_agent</code>, <code>resume_agent</code> and <code>close_agent</code>. A spawn can pass <code>fork_context</code> to start the child with a copy of the parent's history instead of an empty window, trading tokens for a shorter brief. Defaults in <code>core/src/config/mod.rs</code> are conservative: at most 6 agent threads and a depth of 1, so a subagent cannot spawn its own. Codex also has a Code Mode runtime (<code>codex-rs/code-mode-runtime/</code>) that runs model-written JavaScript on V8 with V8's sandbox enabled.</p>
+<h3>Claude Code: typed agents with their own transcripts</h3>
+<p>The paper lists six built-in subagent types (Explore, Plan, General-purpose, Guide, Verification and Statusline) plus custom agents defined in <code>.claude/agents/*.md</code>, whose frontmatter sets tools, disallowed tools, model, permission mode, MCP servers, hooks, maximum turns, skills, memory scope, background mode and isolation. Each subagent writes a separate sidechain transcript, so its steps never enter the parent's history. They can run in process, in a git worktree or remotely. A subagent's permission mode applies unless the user already chose a broader one for the parent, because an explicit user decision outranks an agent's setting.</p>
+<h3>Kimi Code: a tool description that argues against itself</h3>
+<p>Kimi Code's Agent tool description (<code>agent/tools/agent/agent.md</code>) is a lesson in fact 2 written for a model. Do not launch a subagent unless the user asks or project rules allow it, because "each subagent starts cold and re-derives context". Brief it "like a colleague who just walked into the room". For an investigation, give the question, not the steps. "Do not delegate understanding": if the task depends on a file path, find it first. Prefer resuming an existing subagent, which keeps its context. Each subagent has its own event log. A separate <code>swarm</code> feature handles multi-agent modes when the user turns them on.</p>
+<h3>Qwen Code: subagents that are other harnesses</h3>
+<p>Qwen Code has built-in agents such as Explore, teams (<code>team_create</code>, <code>team_plan_approval</code>), worktrees, and a Code Mode host. Its most surprising design is in <code>subagents/builtin-agents.ts</code>: two built-in subagents are not Qwen at all. One delegates to Claude Code through the <code>claude-agent-acp</code> adapter, the other to the installed Codex CLI, each with its own authentication and model. A subagent only needs a task in and a report out (fact 1), so any harness that speaks a protocol can be one.</p>
+<h3>Trae Agent: no subagents, many attempts</h3>
+<p>Trae Agent has no subagents. It plans with a <code>sequentialthinking</code> tool and gets breadth differently: run many independent attempts, then let a selector agent choose among the patches (Chapter 14).</p>
+
 <h2 id="decisions">3. Design decisions compared</h2>
 <div class="tbl"><table>
   <tr><th>Choice</th><th>Pro</th><th>Con</th><th>Who</th></tr>
@@ -64,6 +75,15 @@
   <tr><td>Subagents as durable sessions</td><td>Inspectable, resumable, budgeted</td><td>Complex runtime</td><td>nanocode</td></tr>
   <tr><td>Subagents as agents in folders</td><td>Each has its own tools and sandbox</td><td>More configuration</td><td>eve</td></tr>
   <tr><td>Code Mode</td><td>Fewer round trips and tokens; parallel calls</td><td>Needs a sandboxed interpreter; model must write correct code</td><td>nanocode, Pi</td></tr>
+</table></div>
+<p>The same decisions in the five reference harnesses:</p>
+<div class="tbl"><table>
+  <tr><th>Decision</th><th>Codex</th><th>Claude Code</th><th>Kimi Code</th><th>Qwen Code</th><th>Trae Agent</th></tr>
+<tr><td>Spawn API</td><td>spawn, send, wait, interrupt, resume, close</td><td>Agent tool with typed agents</td><td>Agent tool, resumable</td><td>Agent tool, teams, external harnesses</td><td>None</td></tr>
+<tr><td>Starting context</td><td>Empty or <code>fork_context</code></td><td>Empty plus brief</td><td>Empty plus brief ("starts cold")</td><td>Brief</td><td>n/a</td></tr>
+<tr><td>Limits</td><td>6 threads, depth 1</td><td>maxTurns per agent</td><td>Explicit-request rule in the tool description</td><td>Per agent config</td><td>n/a</td></tr>
+<tr><td>Isolation</td><td>Own thread and rollout</td><td>Sidechain transcript; worktree or remote</td><td>Own event log</td><td>Worktree, ACP process</td><td>n/a</td></tr>
+<tr><td>Code Mode</td><td>V8 runtime with sandbox</td><td>Not described in the paper</td><td>Not found</td><td>Code Mode host and scheduler</td><td>None</td></tr>
 </table></div>
 <div class="box expert">
   <span class="lbl">When to use which</span>

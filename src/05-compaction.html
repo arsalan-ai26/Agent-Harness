@@ -66,6 +66,18 @@
 <h3>Pi Durable: compaction that does not block</h3>
 <p>Spec section 8.7 defines three starts: a manual <code>Conversation.compact()</code>, a background start above one threshold, and a blocking start above a higher threshold or on overflow. Only the blocking one makes the run wait. Background summaries are placed like any passive write at a turn boundary, and several compactions may run at once. Raw history always stays in storage; the summary entry just marks the first kept entry as its head.</p>
 
+<h3>Codex: 90% by default, a handoff prompt, and compaction in the background</h3>
+<p>Codex compacts when the context passes <code>auto_compact_token_limit()</code>, which in <code>protocol/src/openai_models.rs</code> is 90% of the model's window unless configured lower. The local compactor's prompt (<code>prompts/templates/compact/prompt.md</code>) asks for a "handoff summary for another LLM that will resume the task": progress and decisions, constraints and preferences, what remains, and the data needed to continue. The summary is then introduced to the next call with a prefix that frames it as another model's work, so the model builds on it instead of repeating it. Recent user messages are kept up to 20,000 tokens. For providers that support it, Codex can ask the server to compact (<code>compact_remote_v2.rs</code>), with a 64,000-token budget for retained messages. An experimental async mode starts a speculative compaction in the background at 65% of the window, so the summary is ready when the limit arrives instead of blocking the user.</p>
+<h3>Claude Code: five stages, cheapest first</h3>
+<p>The paper's best single lesson on compaction: Claude Code does not have one compactor but five stages, applied in order before a model call, each under its own conditions. Budget reduction caps the size of individual tool results; snip trims older history; microcompact clears old tool results; context collapse is a non-destructive projection applied when the context is read, not written; auto-compact asks the model for a summary. The order follows the cost of being wrong: each stage loses more than the one before. Compact boundaries are recorded in the transcript, and the loader patches the message chain at read time, so nothing on disk is rewritten.</p>
+<h3>Kimi Code: compaction that tells the model where the raw log is</h3>
+<p>Kimi Code's defaults are in <code>agent/fullCompaction/strategy.ts</code>: compact at 85% of the window, or earlier if the remaining space would drop under a 50,000-token reserve; keep the last 4 messages, up to 20% of the window; try at most 3 times on overflow. The instruction (<code>compaction-instruction.md</code>) is one of the best in any harness. It asks for the summary in the conversation's language, exact commands, paths and results rather than descriptions of them, decisions kept separate from open questions, an explicit list of what is still unknown, and a careful forward plan, because "right now you hold more context on this task than you ever will again". Then <code>context-recovery-footer.md</code> tells the model that everything compacted is still on disk in an append-only <code>wire.jsonl</code>, and how to grep it. That turns lossy compaction into lossless compaction plus a cache, which is the design our build uses.</p>
+<p>Kimi's archived Python CLI tried something more radical, still worth knowing: a <code>SendDMail</code> tool (named after <em>Steins;Gate</em>) let the model revert its own context to an earlier checkpoint and leave itself a note with only the useful result. The model, not the harness, decided what to forget.</p>
+<h3>Qwen Code: Claude Code's numbers, plus CJK</h3>
+<p><code>services/chatCompressionService.ts</code> compacts at 85% (<code>DEFAULT_PCT</code>) and reserves 20,000 tokens for the summary. Its buffers (13,000 tokens before the window for auto-compaction, 20,000 for a warning, 3,000 hard) are documented in the comments as matching Claude Code's. After 3 consecutive failures a circuit breaker stops trying. The summary is an XML <code>&lt;state_snapshot&gt;</code> written after an <code>&lt;analysis&gt;</code> block, a format inherited from Gemini CLI. One detail no Western harness has: the token estimator counts CJK characters as 1.5 tokens, because Chinese text tokenizes differently and a count based on characters per token would underestimate it.</p>
+<h3>Trae Agent: none</h3>
+<p>Trae Agent does not compact. It clips tool output at 16,000 characters and relies on the 200-step cap and a large window. For short benchmark tasks that is enough, and it keeps experiments free of a lossy step.</p>
+
 <h2 id="decisions">3. Design decisions</h2>
 <div class="tbl"><table>
   <tr><th>Choice</th><th>Pro</th><th>Con</th><th>Who</th></tr>
@@ -75,6 +87,15 @@
   <tr><td>Background compaction</td><td>No pause for the user</td><td>Summary may race with new work</td><td>Pi Durable</td></tr>
   <tr><td>Vendor-specific compaction</td><td>Matches what each model was trained with</td><td>One compactor per vendor to maintain; summaries not portable</td><td>nanocode (Codex CLI's server-side path is the extreme case)</td></tr>
   <tr><td>No compaction, fresh sessions plus files</td><td>No summary drift</td><td>Agent must write progress files</td><td>Early Pi, Anthropic's long-running harness</td></tr>
+</table></div>
+<p>The same decisions in the five reference harnesses:</p>
+<div class="tbl"><table>
+  <tr><th>Decision</th><th>Codex</th><th>Claude Code</th><th>Kimi Code</th><th>Qwen Code</th><th>Trae Agent</th></tr>
+<tr><td>Trigger</td><td>90% of window (configurable); async at 65%</td><td>Five stages, each with its own condition</td><td>85%, or a 50,000-token reserve</td><td>85%, buffers matching Claude Code</td><td>None</td></tr>
+<tr><td>What is kept</td><td>User messages up to 20,000 tokens</td><td>Recent tail; boundaries patched at read time</td><td>Last 4 messages, up to 20% of window</td><td>Retained tail</td><td>Everything until the cap</td></tr>
+<tr><td>Summary</td><td>Handoff summary for "another LLM"</td><td>Model summary as the last stage</td><td>Detailed handoff with unknowns and plan</td><td><code>&lt;state_snapshot&gt;</code> XML</td><td>n/a</td></tr>
+<tr><td>Raw history</td><td>Rollout on disk</td><td>Transcript on disk</td><td>Model told how to grep <code>wire.jsonl</code></td><td>Transcript hint after compaction</td><td>Trajectory file</td></tr>
+<tr><td>Unusual idea</td><td>Server-side and speculative compaction</td><td>Non-destructive context collapse</td><td>Recovery footer</td><td>CJK token weighting</td><td>n/a</td></tr>
 </table></div>
 
 <h2 id="research">4. Research and the Chinese view</h2>

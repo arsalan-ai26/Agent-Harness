@@ -51,6 +51,17 @@
 <h3>Pi: modes and composition</h3>
 <p>Pi runs interactively, in print or JSON mode, over RPC and as an SDK, and OpenClaw embeds it as its engine. <code>packages/chord</code> is a standalone application-composition runtime (services, replicated state, RPC, plugins) that Pi Durable builds on; Cloudflare's Agents SDK wraps Pi Durable as <code>PiHarness</code>.</p>
 
+<h3>Codex: one core, a JSON-RPC app server</h3>
+<p>Codex's front doors share one core. <code>codex exec</code> runs headless, with <code>--json</code> for a JSONL event stream and <code>--output-schema</code> to force the final answer into a JSON Schema. <code>codex app-server</code> speaks JSON-RPC over stdio, a Unix socket or WebSocket (<code>codex-rs/app-server-transport/</code>), and the IDE extension and desktop app are clients of it. Its README shows what a protocol must handle once humans are remote: approval requests replay when a client reconnects, a command that requires a human is rejected if no capable client is connected, and remote control lets you reach a session from another device. Python and TypeScript SDKs wrap the same protocol.</p>
+<h3>Claude Code: one loop for every interface</h3>
+<p>The paper's answer to "how many execution engines?" is one: the same <code>queryLoop</code> serves the CLI, the SDK and the IDE integrations. Headless use is <code>claude -p</code> with JSON output, and the Claude Agent SDK exposes the harness as a library.</p>
+<h3>Kimi Code: a server protocol behind every surface</h3>
+<p>Kimi Code puts the boundary exactly where this chapter derives it. <code>packages/kap-server</code> exposes the Kimi Agent Protocol over REST (<code>/api/v1</code>) and WebSocket (<code>/api/v1/ws</code>), and the TUI, web UI, Electron desktop app and VS Code extension are its clients. <code>packages/acp-server</code> adds the Agent Client Protocol for editors such as Zed, and <code>packages/remote-control</code> tunnels a local server through a relay so a phone can drive a session on your machine. <code>kimi -p</code> runs one prompt without the TUI, with <code>stream-json</code> output.</p>
+<h3>Qwen Code: channels for Chinese workplaces</h3>
+<p>Qwen Code has the widest set of front doors in this book. Besides the CLI (<code>qwen -p</code> for headless runs), it ships SDKs for TypeScript, Python and Java, a VS Code companion, a Zed extension, a web shell and an ACP bridge. <code>packages/channels/</code> holds adapters for DingTalk, Feishu, WeCom, WeChat, QQ bot, Telegram, Microsoft Teams, GitHub, GitLab, email and a generic webhook. For a team in China, the channel a request arrives on is part of the harness, not an add-on.</p>
+<h3>Trae Agent: a CLI and a small server</h3>
+<p>Trae Agent offers <code>trae-cli run</code> and an interactive mode, plus a small <code>server/</code> directory. Its main consumer is an evaluation script.</p>
+
 <h2 id="decisions">3. Design decisions compared</h2>
 <div class="tbl"><table>
   <tr><th>Decision</th><th>fx</th><th>eve</th><th>nanocode</th><th>Pi</th></tr>
@@ -59,6 +70,14 @@
   <tr><td>Chat channels</td><td>Via host apps</td><td>Many built in</td><td>Via host apps</td><td>pi-chat (Slack and chat workflows)</td></tr>
   <tr><td>Pro</td><td>Tiny and fast anywhere</td><td>Every channel for free</td><td>One runtime on every platform</td><td>Simple, composable</td></tr>
   <tr><td>Con</td><td>Experimental SDK</td><td>Platform-centred</td><td>Bindings to maintain</td><td>You assemble surfaces</td></tr>
+</table></div>
+<p>The same decisions in the five reference harnesses:</p>
+<div class="tbl"><table>
+  <tr><th>Decision</th><th>Codex</th><th>Claude Code</th><th>Kimi Code</th><th>Qwen Code</th><th>Trae Agent</th></tr>
+<tr><td>Headless</td><td><code>codex exec --json</code>, <code>--output-schema</code></td><td><code>claude -p</code></td><td><code>kimi -p</code>, <code>stream-json</code></td><td><code>qwen -p</code></td><td><code>trae-cli run</code></td></tr>
+<tr><td>Protocol</td><td>JSON-RPC app server (stdio, socket, WebSocket)</td><td>SDK over the same loop</td><td>KAP (REST + WebSocket), ACP</td><td>ACP bridge, SDKs</td><td>None</td></tr>
+<tr><td>Editors and apps</td><td>IDE extension, desktop app</td><td>IDE integrations</td><td>TUI, web, desktop, VS Code</td><td>VS Code, Zed, web shell</td><td>CLI</td></tr>
+<tr><td>Channels</td><td>Remote control</td><td>n/a in the paper</td><td>Remote control relay</td><td>DingTalk, Feishu, WeCom, WeChat, QQ, Telegram, Teams, GitHub, GitLab, email, webhook</td><td>None</td></tr>
 </table></div>
 
 <h2 id="research">4. Research and the Chinese view</h2>

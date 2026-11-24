@@ -15,7 +15,7 @@
 <main><article>
 <div class="kicker">Stage 5 · Software factory · Chapter 15</div>
 <h1>Capstone: benchmark and retrospective</h1>
-<p class="lede">Sixteen weeks ago the loop was 120 lines. Now it has a provider layer, typed tools, cache-stable context, compaction, session trees, a safety gate, skills and hooks, subagents and Code Mode, evals, durability, a server, channels and a factory. This chapter measures it honestly against Pi and fx on the same tasks, writes down what each design choice bought, and tags version 1.0.</p>
+<p class="lede">Sixteen weeks ago the loop was 120 lines. Now it has a provider layer, typed tools, cache-stable context, compaction, session trees, a safety gate, skills and hooks, subagents and Code Mode, evals, durability, a server, channels and a factory. This chapter measures it honestly against Pi, fx, Codex, Claude Code, Kimi Code, Qwen Code and Trae Agent on the same tasks, writes down what each design choice bought, and tags version 1.0.</p>
 <div class="meta">
   <span class="chip">Level: advanced</span>
   <span class="chip">Time: about 20 hours</span>
@@ -24,10 +24,10 @@
 </div>
 
 <h2 id="why">1. Why compare against real harnesses</h2>
-<p>Your weekly eval tells you whether your harness improved. It does not tell you whether it is good. Reason from what a score is: a pass rate is produced jointly by the model, the harness and the tasks, and the model's outputs vary from run to run (fact 5). To learn what the harness contributes, you must hold the other two fixed and repeat enough to see through the noise. Running Pi and fx on the same tasks, with the same model where they allow it, separates three things: the model, the harness and the task. Several 2026 papers make the same point: benchmark scores mix model and harness, so honest comparisons hold one fixed while changing the other (<a href="https://arxiv.org/abs/2608.26218">Same model, different harness</a>).</p>
+<p>Your weekly eval tells you whether your harness improved. It does not tell you whether it is good. Reason from what a score is: a pass rate is produced jointly by the model, the harness and the tasks, and the model's outputs vary from run to run (fact 5). To learn what the harness contributes, you must hold the other two fixed and repeat enough to see through the noise. Running the other harnesses on the same tasks, with the same model where they allow it, separates three things: the model, the harness and the task. Several 2026 papers make the same point: benchmark scores mix model and harness, so honest comparisons hold one fixed while changing the other (<a href="https://arxiv.org/abs/2608.26218">Same model, different harness</a>).</p>
 <div class="box watch">
   <span class="lbl">Safety</span>
-  <p>Pi has no permission gate and <code>fx ask --full-access</code> turns fx's checks off. Run every harness in this chapter inside a container with only the task's copy of the repository mounted.</p>
+  <p>Pi has no permission gate, <code>fx ask --full-access</code> turns fx's checks off, and the flags in the runner below switch off the gates of Codex, Claude Code, Kimi Code and Qwen Code. Run every harness in this chapter inside a container with only the task's copy of the repository mounted.</p>
 </div>
 
 <h2 id="method">2. Method</h2>
@@ -49,6 +49,12 @@ HARNESSES = {
     &quot;mine&quot;: [&quot;harness&quot;, &quot;ask&quot;, &quot;--json&quot;],          # your CLI from Chapter 12
     &quot;pi&quot;:   [&quot;pi&quot;, &quot;--print&quot;],                     # Pi&#x27;s non-interactive mode
     &quot;fx&quot;:   [&quot;fx&quot;, &quot;ask&quot;, &quot;--json&quot;],               # fx&#x27;s scripting mode; final answer in .final_output
+    # reference harnesses: run them only inside a container, since these flags remove their gates
+    &quot;codex&quot;: [&quot;codex&quot;, &quot;exec&quot;, &quot;--json&quot;, &quot;--dangerously-bypass-approvals-and-sandbox&quot;],
+    &quot;claude&quot;: [&quot;claude&quot;, &quot;-p&quot;, &quot;--output-format&quot;, &quot;json&quot;, &quot;--dangerously-skip-permissions&quot;],
+    &quot;kimi&quot;:  [&quot;kimi&quot;, &quot;-p&quot;],                     # non-interactive runs use auto permission
+    &quot;qwen&quot;:  [&quot;qwen&quot;, &quot;--approval-mode&quot;, &quot;yolo&quot;, &quot;-p&quot;],
+    &quot;trae&quot;:  [&quot;trae-cli&quot;, &quot;run&quot;, &quot;--working-dir&quot;, &quot;.&quot;],
 }
 
 def run(harness, cmd, task, repo, timeout=1800):
@@ -107,13 +113,18 @@ if __name__ == &quot;__main__&quot;:
   <tr><td>13 to 14</td><td>Factory stations, gates, improvement loop</td><td>Foreman, StrongDM, Meta-Harness</td><td></td><td></td></tr>
 </table></div>
 
-<h2 id="lessons">6. Lessons the four harnesses teach</h2>
+<h2 id="lessons">6. Lessons the harnesses teach</h2>
 <ul>
   <li><strong>Pi:</strong> a small core you can read in an afternoon beats a large one you cannot. Add a feature when its absence costs you, not before.</li>
   <li><strong>fx:</strong> treat your own outputs as untrusted. fx checks its summaries against the record and makes its safety reviewer prove its claims.</li>
   <li><strong>eve:</strong> shape the loop for durability from day one, and keep secrets out of the place where the model's commands run.</li>
   <li><strong>nanocode:</strong> respect each model's native harness, and state your invariants as numbers you can test.</li>
   <li><strong>Pi Durable:</strong> write the specification before the code when correctness is hard. The effect sandwich fits on a napkin and prevents a class of bugs.</li>
+  <li><strong>Codex:</strong> separate what is possible (the sandbox) from when to ask (approvals), and enforce the first in the operating system. Test your rules the way you test code.</li>
+  <li><strong>Claude Code:</strong> order your context defences from cheapest to most lossy, and never rewrite the record; patch the view when it is read.</li>
+  <li><strong>Kimi Code:</strong> make the log the truth and everything else a projection, then tell the model where the log is.</li>
+  <li><strong>Qwen Code:</strong> borrowing a proven design is a strategy. Converge on what works and spend your effort where your users differ (models, language, channels).</li>
+  <li><strong>Trae Agent:</strong> a small, stable harness is the right instrument for experiments, and breadth can come from many attempts plus a good selector instead of more features.</li>
   <li><strong>Chinese practice:</strong> every rule must trace to a failure, and the harness, not the model, is where most teams now compete.</li>
 </ul>
 
@@ -128,7 +139,7 @@ if __name__ == &quot;__main__&quot;:
 
 <h2 id="next">8. Where to go next</h2>
 <ul>
-  <li>Contribute one fix upstream to Pi, fx, eve or nanocode, in a component you now understand deeply.</li>
+  <li>Contribute one fix upstream to Pi, fx, eve, nanocode, Codex, Kimi Code, Qwen Code or Trae Agent, in a component you now understand deeply.</li>
   <li>Read the research frontier: harness search (Meta-Harness), natural-language harnesses (NLAH), harness-aware evaluation, and test-time harness evolution.</li>
   <li>Run your factory on a real project for a month and publish the merge-unchanged rate.</li>
 </ul>
@@ -137,7 +148,7 @@ if __name__ == &quot;__main__&quot;:
 <h2 id="quiz">Check yourself</h2>
 <div class="widget quiz" data-quiz="qz15"></div>
 <script type="application/json" id="qz15">[
-{"q":"Why run Pi and fx on the same tasks as your harness?","o":["To copy their prompts","To separate the effect of the harness from the model and the task","Because your evals are wrong","To get a higher score"],"a":1,"e":"Holding the model and tasks fixed while changing the harness shows what the harness itself contributes."},
+{"q":"Why run other harnesses on the same tasks as your harness?","o":["To copy their prompts","To separate the effect of the harness from the model and the task","Because your evals are wrong","To get a higher score"],"a":1,"e":"Holding the model and tasks fixed while changing the harness shows what the harness itself contributes."},
 {"q":"Your harness wins on training tasks but loses on the holdout. What does that most likely mean?","o":["The holdout is broken","You overfit the harness to tasks you tuned against","The model got worse","Pi cheated"],"a":1,"e":"Tuning against a fixed set of tasks can produce gains that do not generalize. Publishing this is the honest result."},
 {"q":"Why run every harness in a container for this chapter?","o":["Containers are faster","Pi has no permission gate and fx can run with full access, so isolation is the safety boundary","fx only runs in Docker","To share a cache"],"a":1,"e":"Without a gate, the container and the mounted copy of the repo are what limit damage."},
 {"q":"How many runs per task per harness does the method ask for at minimum?","o":["1","3","10","100"],"a":1,"e":"Agent runs vary. At least three repeats give a rough pass rate instead of a single coin flip."},

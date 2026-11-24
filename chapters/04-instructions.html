@@ -71,6 +71,17 @@
 <h3>eve: markdown plus code-computed instructions</h3>
 <p>eve's <code>agent/instructions.md</code> is the always-on prompt. Dynamic instructions (<code>defineDynamic</code>) are TypeScript functions that return text per session and can be memoized, for example to load a replaced session's transcript. After a redeploy, system-role instructions update on the next turn, while a changed user-role instruction joins the history again and an unchanged one is not re-added. That is cache-aware by design.</p>
 
+<h3>Codex: AGENTS.md with a byte budget</h3>
+<p><code>codex-rs/core/src/agents_md.rs</code> walks from the project root to the working directory and loads <code>AGENTS.override.md</code> if present, else <code>AGENTS.md</code>, plus any names in <code>project_doc_fallback_filenames</code>. Files are joined with a <code>--- project-doc ---</code> separator and cut at <code>project_doc_max_bytes</code>, 32 KiB by default; if the budget runs out, the model is told to trim its project instructions. Nothing is loaded for an untrusted project. Environment facts (working directory, shell, sandbox, date) are not baked into the prefix. They are recorded as context items, and <code>record_step_world_state_if_changed()</code> appends a new one only when something actually changed, exactly the append-at-the-tail rule this chapter derives from the cache.</p>
+<h3>Claude Code: four levels, delivered as user context</h3>
+<p>The paper describes a four-level <code>CLAUDE.md</code> hierarchy: managed (<code>/etc/</code>), user (<code>~/.claude/</code>), project (<code>CLAUDE.md</code> and <code>.claude/rules/</code>) and local (<code>CLAUDE.local.md</code>, git-ignored), assembled with other sources in a fixed order of nine. One detail matters for first principles: CLAUDE.md enters as <em>user</em> context, not as part of the system prompt. Instructions there guide the model, but the paper stresses that permission checks and sandboxes, not instructions, are what enforce limits (fact 5: a rule the model reads is a suggestion).</p>
+<h3>Kimi Code: a reminder when the agent walks into a new folder</h3>
+<p>Kimi Code loads <code>AGENTS.md</code> or <code>agents.md</code> from the working directory and <code>.kimi-code/AGENTS.md</code> from its home (<code>agent/profile/context.ts</code>). The interesting part is <code>agent/agentsMdReminder/</code>: <code>bashTargets.ts</code> works out which directories a shell command touches, and when the agent enters a directory with an AGENTS.md it has not seen, a reminder pointing to that file is appended to the context. It is the same answer as fx's folder rules: the agent cannot know about a rule in a folder it has not looked at, so the harness tells it at the moment it matters, at the tail.</p>
+<h3>Qwen Code: QWEN.md and an explicit context order</h3>
+<p>Qwen Code inherited Gemini CLI's hierarchical context files, named <code>QWEN.md</code> by default and configurable (for example to <code>AGENTS.md</code>), discovered from the home directory and the project tree in <code>memory/memoryDiscovery.ts</code>. <code>core/prompt-context-order.ts</code> fixes the order in which system prompt, context files, environment and reminders are placed, and has its own tests, because changing that order silently breaks caching.</p>
+<h3>Trae Agent: one prompt, the task and the path</h3>
+<p>Trae Agent has a single system prompt in <code>trae_agent/prompt/agent_prompt.py</code> and adds the task and project path to the first user message. No project rule files are loaded. For a research harness that is a feature: every run sees the same instructions.</p>
+
 <h2 id="decisions">3. Design decisions compared</h2>
 <div class="tbl"><table>
   <tr><th>Decision</th><th>fx</th><th>Pi</th><th>nanocode</th><th>eve</th></tr>
@@ -78,6 +89,14 @@
   <tr><td>Project files</td><td>Instruction files, folder rules on first touch</td><td>AGENTS or CLAUDE files, root to cwd, worktree-aware</td><td>AGENTS.override then AGENTS, dedup, size cap</td><td>Directory is the contract</td></tr>
   <tr><td>Mid-session changes</td><td>Appended <code>fx-context-update</code></td><td>No hidden injection</td><td>Prefix-stable rebuilds</td><td>Next turn, cache-aware</td></tr>
   <tr><td>Per-model text</td><td>Prompt overlays</td><td>Same prompt</td><td>Different prompt per model</td><td>Model profiles</td></tr>
+</table></div>
+<p>The same decisions in the five reference harnesses:</p>
+<div class="tbl"><table>
+  <tr><th>Decision</th><th>Codex</th><th>Claude Code</th><th>Kimi Code</th><th>Qwen Code</th><th>Trae Agent</th></tr>
+<tr><td>Project rules</td><td>AGENTS.override.md, AGENTS.md, fallbacks; 32 KiB cap</td><td>Four-level CLAUDE.md hierarchy</td><td>AGENTS.md plus home <code>.kimi-code/AGENTS.md</code></td><td>Hierarchical QWEN.md (configurable)</td><td>None</td></tr>
+<tr><td>Where they go</td><td>Developer and user context items</td><td>User context</td><td>Prefix, plus reminders at the tail</td><td>Ordered context sections</td><td>n/a</td></tr>
+<tr><td>Rules found later</td><td>Managed by <code>agents_md_manager.rs</code></td><td>Rules directory per project</td><td>Reminder when the agent enters a folder</td><td>Discovery on load</td><td>n/a</td></tr>
+<tr><td>Environment facts</td><td>World state appended only when changed</td><td>One of nine ordered sources</td><td>Environment binding events</td><td><code>environmentContext.ts</code></td><td>Project path in the task</td></tr>
 </table></div>
 <div class="grid2">
   <div class="box ex"><span class="lbl">Short prompt (Pi)</span><p><strong>Pro:</strong> cheap, transparent, trusts RL-trained models. <strong>Con:</strong> weaker or unfamiliar models drift; every lesson must live in AGENTS.md.</p></div>

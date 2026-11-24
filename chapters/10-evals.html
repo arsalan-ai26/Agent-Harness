@@ -66,12 +66,31 @@
 <h3>nanocode: cost as a pure fold</h3>
 <p><code>crates/core/cost-fold</code> computes tokens, dollars and machine time per step as a pure function over the event log, rolled up by agent, turn, board task and commit. <code>bin/nanocode-sim</code> tests the memory invariants from <code>docs/memory-invariant.md</code> as numbers.</p>
 
+<h3>Codex: local traces you can replay, and a review rubric</h3>
+<p>Codex has OpenTelemetry export (<code>core/src/otel_init.rs</code>) for operations, and a separate, opt-in rollout trace (<code>codex-rs/rollout-trace/</code>) for debugging. Its README is clear about the difference: tracing is not telemetry, nothing is uploaded, and bundles are written only when <code>CODEX_ROLLOUT_TRACE_ROOT</code> is set. A bundle records raw evidence (prompts, responses, tool input and output, compaction) and can be replayed into a graph a debugger can inspect, but only by the same binary that recorded it, so the replay cannot quietly disagree with what ran. For checking work, <code>codex review</code> uses a rubric (<code>prompts/templates/review/rubric.md</code>) that limits findings to discrete, actionable bugs introduced by the change, which keeps a model reviewer from burying real issues in speculation (fact 5 again).</p>
+<h3>Claude Code: verification as a hook and as an agent</h3>
+<p>Two of the paper's findings are about verification. One of the four hook handler kinds is a subagent verifier, so a check can itself be an agent that runs before a stop is accepted. And one of the six built-in subagent types is Verification. Both put the check outside the context that produced the work.</p>
+<h3>Kimi Code: the same scenario on four surfaces</h3>
+<p>Kimi Code's test strategy is visible in its root AGENTS.md: <code>pnpm lint</code> must pass before any change ends, tests run against a fake model from <code>packages/testkit</code>, and <code>tests/e2e</code> runs one scenario on the TUI, web, desktop and ACP surfaces, which only works because they share one core (Chapter 12). <code>apps/vis</code> is a session and replay visualiser for debugging runs from their logs.</p>
+<h3>Qwen Code: guards that are also measurements</h3>
+<p>Qwen Code's loop detection, duplicate-call detection and compaction circuit breaker (Chapters 1 and 5) double as signals: each records why a turn stopped. A usage dashboard and token usage service (<code>services/usage-dashboard-service.ts</code>, <code>tokenUsageService.ts</code>) keep cost visible per session.</p>
+<h3>Trae Agent: built for evaluation</h3>
+<p>Trae Agent is the harness most shaped by evaluation. Every step's request, response and tool calls go to a trajectory file. Lakeview (<code>utils/lake_view.py</code>) asks a model to label each step twice: a general task in at most 10 words ("The agent is writing a reproduction test script") and bug-specific details in at most 30, which turns a long trajectory into something a person can scan. <code>evaluation/</code> runs SWE-bench, and the selector agent in <code>evaluation/patch_selection/</code> picks the best patch among many candidates after regression tests.</p>
+
 <h2 id="decisions">3. Design decisions compared</h2>
 <div class="tbl"><table>
   <tr><th>Decision</th><th>eve</th><th>Pi</th><th>fx</th><th>nanocode</th></tr>
   <tr><td>Eval unit</td><td>Eval file against the live HTTP API</td><td>Case x variant x repetition in containers</td><td>Benchmarks and tests in CI</td><td>Simulator and tests</td></tr>
   <tr><td>Grading</td><td>Assertions, judge, tool stubs</td><td>Paired lift</td><td>Time and size budgets</td><td>Invariant bounds</td></tr>
   <tr><td>Observability</td><td>Agent Runs dashboard, OpenTelemetry</td><td>Telemetry contracts</td><td>/trace, debug traces</td><td>Cost fold, OpenTelemetry spans</td></tr>
+</table></div>
+<p>The same decisions in the five reference harnesses:</p>
+<div class="tbl"><table>
+  <tr><th>Decision</th><th>Codex</th><th>Claude Code</th><th>Kimi Code</th><th>Qwen Code</th><th>Trae Agent</th></tr>
+<tr><td>Traces</td><td>OpenTelemetry; opt-in local rollout traces, same-binary replay</td><td>Transcripts; OpenTelemetry</td><td>Event log plus replay visualiser</td><td>Recording and telemetry</td><td>Trajectory JSON plus Lakeview labels</td></tr>
+<tr><td>Check before stop</td><td>Stop hooks</td><td>Subagent-verifier hooks; Verification agent</td><td>Max-steps and other blocking hooks</td><td>Stop hooks</td><td><code>task_done</code> plus non-empty patch</td></tr>
+<tr><td>Harness tests</td><td>Large Rust test suite</td><td>Not public</td><td>Fake model; one scenario on four surfaces</td><td>Unit and integration tests</td><td>SWE-bench runs and ablations</td></tr>
+<tr><td>Review</td><td><code>codex review</code> rubric</td><td>Review commands and agents</td><td>n/a</td><td>Review agents</td><td>Selector agent over candidate patches</td></tr>
 </table></div>
 
 <h2 id="research">4. Research and the Chinese view</h2>

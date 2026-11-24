@@ -97,6 +97,17 @@
 <h3>fx: one provider at a time, classified errors</h3>
 <p>fx talks to one provider per session through <code>src/gateway/client.zig</code>: Vercel AI Gateway by default, a ChatGPT or Grok subscription, or any OpenAI-compatible endpoint. Its retry code classifies errors carefully: <code>isRetryableGatewayError</code> treats closed and reset connections as retryable, and a comment notes that some errors "carry delivery ambiguity": the request may have reached the model even though the reply was lost.</p>
 
+<h3>Codex: one wire format, tuned hard</h3>
+<p>Codex has dropped the format question. <code>codex-rs/model-provider-info/src/lib.rs</code> defines a single <code>WireApi::Responses</code>, and configuring the old chat format fails with "<code>wire_api = "chat"</code> is no longer supported". Any provider must speak OpenAI's Responses API. In exchange, the transport is tuned: a WebSocket connection with a 15-second connect timeout, 5 stream retries and 4 request retries by default, a 300-second idle timeout on a stream, and a <code>prompt_cache_key</code> sent with every request so the provider can route repeated prefixes to the same cache. Base prompts are pinned per model in <code>codex-rs/core/</code>: <code>gpt_5_codex_prompt.md</code> is about 1,100 words while <code>gpt_5_1_prompt.md</code> is about 3,900. The models post-trained inside Codex need a third of the instructions, which is fact 2 seen from the other side: behaviour that is trained in does not have to be resent.</p>
+<h3>Claude Code: one vendor, layered recovery</h3>
+<p>Claude Code talks to one vendor's models, so its model layer is about recovery rather than translation. The paper lists the paths: escalating the maximum output tokens up to three times when a reply is cut off, one reactive compaction per turn when the prompt is too long, a fallback from streaming to non-streaming, and a fallback model.</p>
+<h3>Kimi Code: the model call as a compiler</h3>
+<p>Kimi Code's <code>packages/core/src/llm/</code> is a standalone library that owns exactly one request, and its design guide (<code>agent-core-v2/docs/en/llm.md</code>) is worth reading in full. Every protocol (OpenAI chat, OpenAI Responses, Anthropic, Google) is defined with <code>defineProtocol</code> and encoded by a fixed pipeline: cache key, thinking, response format, max output tokens, sampling, tools, messages, merge turns, annotate, finalize, flatten. A provider is a <em>patch</em> on a protocol (<code>protocol.with(patch)</code>); Kimi itself is one such patch. Two rules stand out. "No silent fallback": an unsupported feature fails loudly instead of quietly changing behaviour. And the settle stage validates every completed tool call against its schema; invalid arguments trigger a retry with a temporary reminder, and the bad call is never executed.</p>
+<h3>Qwen Code: many models, many quirks</h3>
+<p>Qwen Code has to run Qwen, DeepSeek, Kimi, Gemini, Anthropic and OpenAI models, and <code>packages/core/src/core/</code> shows what that costs: separate content generators for Anthropic, Gemini, OpenAI chat and OpenAI Responses; reasoning adapters per family (<code>deepseek-reasoning.ts</code>, <code>kimi-reasoning.ts</code>, <code>gemini-reasoning.ts</code>, <code>anthropic-reasoning.ts</code>); and <code>xml-tool-call-fallback.ts</code>, which recovers tool calls a model wrote as text (<code>&lt;invoke name="..."&gt;</code> or <code>&lt;function=...&gt;</code>) instead of in the structured field. That last file exists because of fact 5: a model's output follows its training, not your schema.</p>
+<h3>Trae Agent: one client per vendor</h3>
+<p>Trae Agent's <code>trae_agent/utils/llm_clients/</code> has one small client per vendor (OpenAI, Anthropic, Azure, Doubao, Google, Ollama, OpenRouter) on a shared base with <code>retry_utils.py</code>. It is the simplest approach that works and is enough for research runs.</p>
+
 <h2 id="decisions">4. Design decisions compared</h2>
 <div class="tbl"><table>
   <tr><th>Decision</th><th>Pi</th><th>nanocode</th><th>eve</th><th>fx</th></tr>
@@ -106,6 +117,14 @@
   <tr><td>Prompts</td><td>Pi's own, short</td><td>Pinned upstream prompts per model</td><td>Authored instructions</td><td>fx's own, about 1,000 words</td></tr>
   <tr><td>Pro</td><td>Maximum choice</td><td>Best native quality</td><td>Simplest ops on Vercel</td><td>Small, predictable</td></tr>
   <tr><td>Con</td><td>Lowest common denominator</td><td>Maintenance per vendor</td><td>Tied to the AI SDK shape</td><td>Less flexible</td></tr>
+</table></div>
+<p>The same layer in the five reference harnesses:</p>
+<div class="tbl"><table>
+  <tr><th>Decision</th><th>Codex</th><th>Claude Code</th><th>Kimi Code</th><th>Qwen Code</th><th>Trae Agent</th></tr>
+<tr><td>Format strategy</td><td>Responses API only</td><td>One vendor</td><td>One internal message type, protocols as pipelines, providers as patches</td><td>Generator per API, adapters per reasoning format</td><td>One client per vendor</td></tr>
+<tr><td>Retries</td><td>5 stream, 4 request, 300 s idle timeout</td><td>Output-token escalation, reactive compaction, fallback model</td><td>Policy-driven attempts; invalid tool arguments retried without executing</td><td>Stream transport retry</td><td>Shared retry helper</td></tr>
+<tr><td>Caching</td><td><code>prompt_cache_key</code> per request</td><td>Prompt caching on the vendor API</td><td>Cache key is the first pipeline stage</td><td>Per provider</td><td>Not managed</td></tr>
+<tr><td>Unusual idea</td><td>Per-model pinned prompts</td><td>Recovery ladder</td><td>No silent fallback</td><td>XML tool-call fallback</td><td>Minimal by design</td></tr>
 </table></div>
 <div class="box expert">
   <span class="lbl">Harness-model coupling</span>

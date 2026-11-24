@@ -48,6 +48,17 @@
 <h3>nanocode: journaled calls everywhere</h3>
 <p>The README promise: every model call and tool call is journaled, so a turn finishes after its process dies. <code>crates/core/durability-core</code> holds the <code>StateStore</code>, content-addressed payloads and a deterministic state machine; each backend defines its own checkpoint format; stores run on JSONL, SQLite, Postgres, Durable Objects or D1. Subagents are durable sessions too (with only 2 resident by default when durable).</p>
 
+<h3>Codex: rebuild from the rollout</h3>
+<p>Codex's durability is the rollout file plus reconstruction. <code>core/src/session/rollout_reconstruction.rs</code> rebuilds a session's history from its rollout, taking compaction checkpoints into account, so <code>codex resume</code> and <code>codex fork</code> continue from disk. The app server has its own <code>daemon_recovery.rs</code> so clients can reconnect to work that kept running. A turn in progress when the process dies is not journaled step by step the way Pi Durable or nanocode do it; the rollout holds what was recorded.</p>
+<h3>Claude Code: resume without the session's temporary grants</h3>
+<p>Claude Code resumes from its append-only transcript with <code>--resume</code> or <code>--continue</code>. The paper points out a deliberate asymmetry: the session's permission bypass flag and computer-use app allowlist are not written to the transcript, so a session resumed in a new process starts without them. Durable state and durable <em>authority</em> are different things, and a temporary grant should not outlive the process the user granted it to.</p>
+<h3>Kimi Code: resumable by construction</h3>
+<p>Because Kimi Code's state is a projection of its log, durability is mostly free: replay the log and the agent is back. <code>isResumable()</code> in <code>packages/core/src/loop/state.ts</code> decides whether to continue automatically, which is when the last assistant message has tool calls without results, or the last message is from the user or a tool. The append log reports a corrupted or truncated last line instead of failing the whole session, which is exactly what a crash in the middle of a write produces (fact 6).</p>
+<h3>Qwen Code: a recovery plan that repairs the history</h3>
+<p>Qwen Code's <code>core/session-recovery.ts</code> classifies a session on load as <code>clean</code>, <code>interrupted_prompt</code>, <code>interrupted_turn</code> or <code>degraded_history</code>, and builds a repair plan: synthesize a tool result for a call that never got one, drop a duplicate result, or mark a gap where a parent message is missing. The repaired history is valid for the model again; the plan tells the user what happened. A writer lease (<code>services/session-writer-lease.ts</code>) prevents two processes from appending to one session.</p>
+<h3>Trae Agent: none needed</h3>
+<p>Trae Agent runs one task per process and keeps only the trajectory. If a benchmark run dies, you run it again.</p>
+
 <h2 id="decisions">3. Design decisions compared</h2>
 <div class="tbl"><table>
   <tr><th>Approach</th><th>Who</th><th>Pro</th><th>Con</th></tr>
@@ -55,6 +66,14 @@
   <tr><td>Workflow engine steps</td><td>eve</td><td>Durability, deploy handoff and dashboards come with the platform</td><td>Bound to Workflow SDK semantics and eve versions</td></tr>
   <tr><td>Journal inside the runtime</td><td>nanocode</td><td>Same runtime native and in WASM</td><td>Large, complex system</td></tr>
   <tr><td>No durability; resume from session file</td><td>Pi CLI, fx</td><td>Simple</td><td>A crash loses the running turn</td></tr>
+</table></div>
+<p>The same decisions in the five reference harnesses:</p>
+<div class="tbl"><table>
+  <tr><th>Decision</th><th>Codex</th><th>Claude Code</th><th>Kimi Code</th><th>Qwen Code</th><th>Trae Agent</th></tr>
+<tr><td>What survives a crash</td><td>Rollout up to the last record</td><td>Transcript</td><td>Full event log</td><td>Recording plus repair plan</td><td>Trajectory only</td></tr>
+<tr><td>How it resumes</td><td>Reconstruct history; <code>resume</code>, <code>fork</code></td><td><code>--resume</code>, <code>--continue</code></td><td>Replay log; auto-continue if calls are unanswered</td><td>Classify, repair, continue</td><td>Rerun</td></tr>
+<tr><td>Unknown effects</td><td>Not journaled per effect</td><td>Not described</td><td>Unanswered calls detected</td><td>Synthesized tool results</td><td>n/a</td></tr>
+<tr><td>Authority after resume</td><td>Approvals per session</td><td>Temporary grants dropped on purpose</td><td>Session approval history policy</td><td>Permission state per session</td><td>n/a</td></tr>
 </table></div>
 
 <h2 id="research">4. Research and the Chinese view</h2>

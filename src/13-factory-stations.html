@@ -67,6 +67,16 @@
 </table></div>
 <p>LangChain packaged the shared Stripe, Ramp and Coinbase pattern as Open SWE: isolated cloud sandboxes, entry points in Slack, Linear and GitHub, curated tools, resumable sessions and budget limits (<a href="https://github.com/langchain-ai/open-swe">Open SWE</a>). Stripe's lesson, often repeated: tool curation matters more than tool count.</p>
 
+<h3>Factory pieces inside the reference harnesses</h3>
+<p>None of the five reference harnesses is a factory, but each ships the parts one is built from, and which parts they chose says a lot.</p>
+<ul>
+  <li><strong>Codex</strong> has the unattended pieces: <code>codex exec</code> with <code>--json</code> and <code>--output-schema</code> for CI, <code>codex review</code> against a base branch or commit, and cloud tasks (<code>codex-rs/cloud-tasks/</code>) that run in OpenAI's environments. Its flag for running without approvals or sandbox is named <code>--dangerously-bypass-approvals-and-sandbox</code> and documented as "intended solely for running in environments that are externally sandboxed": the factory, not the agent, must provide the boundary.</li>
+  <li><strong>Claude Code</strong> runs headless with <code>claude -p</code>, and Anthropic's GitHub Actions integration starts it from issue and PR comments. The paper's custom-agent frontmatter (tools, model, permission mode, isolation, max turns) is effectively a station definition.</li>
+  <li><strong>Qwen Code</strong> has the most factory-shaped code: an <code>autofix_pr</code> tool (<code>tools/autofix-pr.ts</code>) that runs a watch on a pull request and lets the fix agent run its commands unattended only after the user confirmed that watch; teams with a plan-approval step (<code>team_create</code>, <code>team_plan_approval</code>); git worktrees per agent; and GitHub and GitLab channels for intake.</li>
+  <li><strong>Kimi Code</strong> has goals with deadlines (<code>features/goal/</code>), cron, and a swarm mode, which are the long-running, scheduled parts of a factory.</li>
+  <li><strong>Trae Agent</strong> is a factory of attempts rather than of stations: generate many candidate patches, prune them, and let a selector agent choose (Chapter 14).</li>
+</ul>
+
 <h2 id="decisions">4. Design decisions</h2>
 <div class="tbl"><table>
   <tr><th>Decision</th><th>Options</th><th>Foreman's choice and why</th></tr>

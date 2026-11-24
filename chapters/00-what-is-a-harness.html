@@ -114,7 +114,7 @@
   <li>Your laptop sleeps in the middle of a task. Can the agent continue? (Fact 6, and fact 2: the model holds no state, so if the harness did not write it down, it is gone.)</li>
   <li>The model says "done". How do you know it is true? (Fact 5: a claim is a sample, so only an outside check settles it.)</li>
 </ul>
-<p>Every answer is harness code. Community analysis of Claude Code's leaked source estimated that only about 1.6% of it is AI decision logic and 98.4% is operational infrastructure around the loop (<a href="https://arxiv.org/html/2604.14228v1">Dive into Claude Code</a>). The rest of this book is about that 98%.</p>
+<p>Every answer is harness code. A source-level study of Claude Code v2.1.88 estimated that only about 1.6% of it is AI decision logic and 98.4% is operational infrastructure around the loop (<a href="https://arxiv.org/html/2604.14228v1">Dive into Claude Code</a>). The rest of this book is about that 98%.</p>
 
 <h2 id="definitions">3. Definitions we use in every chapter</h2>
 <div class="box def">
@@ -232,8 +232,9 @@
   <p>A benchmark score is a property of model, harness, environment and grader together. When you read "model X scores Y", ask which harness produced it. Several 2026 papers make this point directly, for example "Same model, different harness: different coding-agent results" and "What does a harness buy? Tokens, mostly".</p>
 </div>
 
-<h2 id="references">7. The four harnesses we read</h2>
-<p>We read real source code, not marketing pages. The four projects below sit at four corners of the design space. Claude Code and Codex appear as comparison points, because almost every design decision is made in reaction to them.</p>
+<h2 id="references">7. The harnesses we read</h2>
+<p>We read real source code, not marketing pages. The book follows two groups. Four <strong>primary harnesses</strong> sit at four corners of the design space and get the deepest tours. Five <strong>reference harnesses</strong> are the production systems most people actually use, plus the best-known open-source Chinese ones; every chapter compares them in a second table, so you see each decision across nine designs before you choose your own.</p>
+<h3>Primary harnesses</h3>
 <div class="grid2">
   <div class="box real"><span class="lbl">eve · Vercel · TypeScript</span>
     <p>An agent is a directory of files: <code>instructions.md</code>, <code>tools/</code>, <code>skills/</code>, <code>hooks/</code>, <code>channels/</code>, <code>subagents/</code>. The harness kernel does one step and returns <code>{ session, next }</code>, and a workflow engine checkpoints every step, so sessions survive crashes and redeploys. Vercel builds its own agents on it. It ships a full software-factory template.</p>
@@ -249,6 +250,26 @@
     <p class="note">Read: <code>crates/README.md</code>, <code>docs/memory-invariant.md</code></p></div>
 </div>
 <p class="note">Commits read for this edition: eve <code>5c52fbf</code> (21 Nov 2026), fx <code>cbe7daf</code>, Pi <code>fb248c7</code>, nanocode <code>015cbfa</code> (all 22 Nov 2026). All four change weekly; each chapter states the commit it quotes.</p>
+
+<h3>Reference harnesses</h3>
+<div class="grid2">
+  <div class="box real"><span class="lbl">Codex CLI · OpenAI · Rust</span>
+    <p>Open source, about 90 crates. One async turn loop in <code>core/src/session/turn.rs</code>; its own <code>apply_patch</code> grammar; a sandbox on every platform (bubblewrap and seccomp on Linux, Seatbelt on macOS, a Windows sandbox) plus a network proxy; Starlark command rules; a model-based "Guardian" reviewer; a JSON-RPC app server that the IDE extension and desktop app talk to. Models are post-trained inside this harness.</p>
+    <p class="note">Read: <code>codex-rs/core/src/session/turn.rs</code>, <code>codex-rs/core/src/compact.rs</code></p></div>
+  <div class="box real"><span class="lbl">Claude Code · Anthropic · TypeScript</span>
+    <p>Closed source. We use the source-level study <em>Dive into Claude Code</em> (MBZUAI and UCL, arXiv 2604.14228), whose authors analysed v2.1.88 file by file, together with Anthropic's own documentation and engineering posts. We did not read the leaked source itself: it is proprietary code published without permission, and the paper already reports what a harness builder needs.</p>
+    <p class="note">Read: the paper, and its companion repo <code>VILA-Lab/Dive-into-Claude-Code</code></p></div>
+  <div class="box real"><span class="lbl">Kimi Code CLI · Moonshot AI · TypeScript</span>
+    <p>Moonshot's 2026 rewrite of its Python Kimi CLI (now archived). An event-sourced loop actor, an LLM library built as a compiler pipeline, a chain of 15 permission policies, a compactor that tells the model where the raw log lives, and a server protocol (KAP) behind the TUI, web, desktop and VS Code surfaces. Its terminal UI is a fork of Pi's.</p>
+    <p class="note">Read: <code>packages/core/src/loop/</code>, <code>packages/agent-core-v2/src/agent/</code></p></div>
+  <div class="box real"><span class="lbl">Qwen Code · Alibaba Qwen team · TypeScript</span>
+    <p>Started as a fork of Google's Gemini CLI and has grown into the largest open harness we read: providers for Qwen, DeepSeek, Kimi, Anthropic, Gemini and OpenAI; loop detection; a two-stage auto-approval classifier; bubblewrap and Landlock sandboxes; subagents that can delegate to Claude Code or Codex; channels for DingTalk, Feishu, WeCom and WeChat.</p>
+    <p class="note">Read: <code>packages/core/src/core/agent-loop.ts</code>, <code>packages/core/src/services/</code></p></div>
+  <div class="box real"><span class="lbl">Trae Agent · ByteDance · Python</span>
+    <p>A research harness, deliberately small (about 1,000 lines in its <code>agent/</code> package), built for ablation studies on SWE-bench. Five tools, a 200-step loop, a completion check that rejects an empty patch, a step summariser (Lakeview), full trajectory recording, and a selector agent that picks the best of many candidate patches.</p>
+    <p class="note">Read: <code>trae_agent/agent/base_agent.py</code>, <code>evaluation/patch_selection/</code></p></div>
+</div>
+<p class="note">Reference commits: Codex <code>50aeac2</code>, Kimi Code <code>111aae2</code>, Qwen Code <code>c56424fc</code> (all 24 Nov 2026), Kimi CLI <code>9ab1286</code> (archived), Trae Agent <code>e839e55</code>. Claude Code: v2.1.88 as analysed in the paper, plus Anthropic documentation checked 24 Nov 2026.</p>
 
 <h2 id="space">8. The design space</h2>
 <p>Two questions separate most harnesses. How much is built into the core? And does the agent live inside one process, or as a durable service that outlives any process?</p>
@@ -283,7 +304,7 @@
   <li><strong>No model covers every agent scenario.</strong> As open Chinese models close the gap with closed ones, harness design becomes the differentiator (<a href="https://m.bjnews.com.cn/detail/1775178643129477.html">Beijing News</a>).</li>
   <li><strong>Zero-tolerance AGENTS.md.</strong> Every rule in your agent instructions must trace back to a real failure; if you cannot name the failure, delete the rule (<a href="https://adg.csdn.net/6a5822cf10ee7a33f28df343.html">CSDN</a>). We adopt this rule for our own harness.</li>
 </ul>
-<p>Chinese labs also tie model releases to their own harnesses: Alibaba's Qwen Code is a fork of Gemini CLI, Moonshot ships Kimi CLI, and ByteDance ships Trae Agent. Chinese research includes Tsinghua's Natural-Language Agent Harnesses, which writes harness logic as editable natural-language contracts run by a shared runtime. Chapters 4 and 10 return to it.</p>
+<p>Chinese labs also tie model releases to their own harnesses, and the three best-known open ones are reference harnesses in this book. Read side by side, they show three strategies. Qwen Code converges openly on Claude Code: its compactor quotes Claude Code's buffer sizes in comments, and it adds Chinese-specific details such as counting CJK characters as 1.5 tokens and channels for DingTalk, Feishu and WeCom. Kimi Code rebuilt its harness around an event log and borrowed Pi's terminal UI. Trae Agent stays a research platform and spends its effort on test-time scaling instead of features. Kimi Code's own AGENTS.md, the guide its developers give their coding agents, opens with an instruction this book shares: 用第一性原理思考, think from first principles. Chinese research includes Tsinghua's Natural-Language Agent Harnesses, which writes harness logic as editable natural-language contracts run by a shared runtime. Chapters 4 and 10 return to it.</p>
 
 <h2 id="plan">10. What we build, and how</h2>
 <p>We build one harness in Python and grow it through five stages. Each stage ends with a gate the harness must pass.</p>

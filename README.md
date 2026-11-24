@@ -2,7 +2,7 @@
 
 A book, written in public, that builds an AI agent harness from scratch in Python, one component per chapter.
 
-An agent is a model plus a harness: the loop, tools, context management, sessions, safety, extensions, subagents, verification and durability around the model. Each chapter explains one component from first principles, reads how four open-source harnesses built it ([eve](https://github.com/vercel/eve), [fx](https://github.com/vercel-labs/fx), [Pi and Pi Durable](https://github.com/earendil-works/pi), [nanocode](https://github.com/gakonst/nanocode)), compares their design decisions and trade-offs, covers the research and Chinese work, and ends with what we build.
+An agent is a model plus a harness: the loop, tools, context management, sessions, safety, extensions, subagents, verification and durability around the model. Each chapter explains one component from first principles, reads how four open-source harnesses built it ([eve](https://github.com/vercel/eve), [fx](https://github.com/vercel-labs/fx), [Pi and Pi Durable](https://github.com/earendil-works/pi), [nanocode](https://github.com/gakonst/nanocode)), compares them with five reference harnesses ([Codex CLI](https://github.com/openai/codex), Claude Code via the [Dive into Claude Code](https://arxiv.org/abs/2604.14228) study, and the Chinese open-source harnesses [Kimi Code](https://github.com/MoonshotAI/kimi-code), [Qwen Code](https://github.com/QwenLM/qwen-code) and [Trae Agent](https://github.com/bytedance/trae-agent)), weighs the design decisions and trade-offs, covers the research and Chinese work, and ends with what we build.
 
 Read it on GitHub Pages: open `index.html` on the published site.
 

@@ -44,6 +44,17 @@
 <h3>nanocode: its own MCP client and BM25 search</h3>
 <p>nanocode replaces the common Rust MCP libraries with its own client (<code>crates/core/mcp</code>, <code>mcp-http</code>), and searches MCP tools with its own BM25 index (<code>crates/integrations/mcp-tools/src/SEARCH.md</code>), so many servers can be connected without filling the context.</p>
 
+<h3>Codex: skills, plugins, hooks and MCP</h3>
+<p>Codex has all four extension points. Skills are <code>SKILL.md</code> files with frontmatter (<code>codex-rs/skills/</code>), shipped with a built-in <code>skill-creator</code>. Plugins bundle skills and commands, and old custom commands are migrated into skills of at most 4,000 bytes. Hooks cover the lifecycle: <code>SessionStart</code>, <code>SessionEnd</code>, <code>UserPromptSubmit</code>, <code>PreToolUse</code>, <code>PermissionRequest</code>, <code>PostToolUse</code>, <code>PreCompact</code>, <code>PostCompact</code>, <code>SubagentStart</code>, <code>SubagentStop</code>, <code>Stop</code>, <code>Interrupt</code>, <code>PreModelRequest</code> and <code>PostModelRequest</code>. MCP tools can be found through a <code>tool_search</code> tool instead of all being listed.</p>
+<h3>Claude Code: four mechanisms at three points</h3>
+<p>The paper's framing is the clearest in this book: hooks, skills, plugins and MCP act at three points of the loop, namely what the model sees (assemble), which tools it may call (model) and whether an action runs (execute). It counts 27 hook events with four kinds of handler: a shell command, an LLM evaluation, a webhook and a subagent verifier. A plugin manifest can carry ten component types, from commands, agents, skills and hooks to MCP servers, LSP servers and output styles. A skill adds guidance to the current context; an agent moves work to another context.</p>
+<h3>Kimi Code: features as contributions</h3>
+<p>Kimi Code builds almost everything as a <em>feature</em> registered with a dependency-injection container (<code>agent-core-v2/src/features/</code>): skills, plan, goal, todo, cron, swarm, reminders, external hooks and more. Inside the core loop, hooks attach to named points such as <code>step.continuing</code>, and each declares what happens if it fails (<code>onFailure: 'block'</code>), so a broken hook cannot silently allow what it was meant to stop. MCP servers and plugins plug into the same registry.</p>
+<h3>Qwen Code: Claude-compatible hooks, curated skills, extensions</h3>
+<p>Qwen Code's hook events (<code>hooks/</code>) follow Claude Code's names closely: <code>PreToolUse</code>, <code>PostToolUse</code>, <code>PostToolUseFailure</code>, <code>PostToolBatch</code>, <code>UserPromptSubmit</code>, <code>SessionStart</code>, <code>SessionEnd</code>, <code>Stop</code>, <code>SubagentStart</code>, <code>SubagentStop</code>, <code>PreCompact</code>, <code>PostCompact</code> and others. Matching names lets users move hooks between harnesses. Skills come bundled and can be managed by a skill curator with rollback; extensions are packages with a <code>qwen-extension.json</code>; MCP servers share a transport pool.</p>
+<h3>Trae Agent: MCP only</h3>
+<p>Trae Agent's extension point is MCP (<code>utils/mcp_client.py</code>, <code>tools/mcp_tool.py</code>): add a server in the config and its tools appear. Anything else means editing the Python, which for a research codebase is the point.</p>
+
 <h2 id="decisions">3. Design decisions compared</h2>
 <div class="tbl"><table>
   <tr><th>Decision</th><th>Pi</th><th>eve</th><th>fx</th><th>nanocode</th></tr>
@@ -51,6 +62,14 @@
   <tr><td>MCP</td><td>Added in 1.0; CLIs preferred</td><td><code>connections/</code></td><td>Built in, found via search</td><td>Own client, BM25 search</td></tr>
   <tr><td>Hooks</td><td>Extension lifecycle events</td><td><code>hooks/</code> for lifecycle and stream events</td><td>4 kinds</td><td>Event sinks</td></tr>
   <tr><td>Self-modification</td><td>Agent writes extensions</td><td>Opt-in extensions</td><td>Agent installs skills</td><td>No</td></tr>
+</table></div>
+<p>The same decisions in the five reference harnesses:</p>
+<div class="tbl"><table>
+  <tr><th>Decision</th><th>Codex</th><th>Claude Code</th><th>Kimi Code</th><th>Qwen Code</th><th>Trae Agent</th></tr>
+<tr><td>Skills</td><td>SKILL.md; built-in skill-creator</td><td>SKILL.md, 15+ frontmatter fields</td><td>Skill feature</td><td>Bundled skills, curator with rollback</td><td>None</td></tr>
+<tr><td>Hooks</td><td>14 lifecycle events incl. model request</td><td>27 events, 4 handler kinds</td><td>Named loop points with failure policy</td><td>Claude-compatible event names</td><td>None</td></tr>
+<tr><td>MCP</td><td>Client plus tool search</td><td>Client; tools merged into the pool</td><td>Client and discovery</td><td>Client with transport pool</td><td>Client</td></tr>
+<tr><td>Packaging</td><td>Plugins</td><td>Plugins with 10 component types</td><td>Plugins and features</td><td>Extensions (<code>qwen-extension.json</code>)</td><td>Config file</td></tr>
 </table></div>
 <div class="box watch">
   <span class="lbl">Risk</span>

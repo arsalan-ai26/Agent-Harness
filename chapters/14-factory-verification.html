@@ -78,6 +78,15 @@
   <p>A loop that optimizes against your eval will overfit to your eval. Keep a holdout set the proposer never sees, cap changes to one per round, require every rule to name the failure it fixes, and read every accepted change yourself.</p>
 </div>
 
+<h3>Verification inside the reference harnesses</h3>
+<ul>
+  <li><strong>Trae Agent</strong> made verification its research contribution. Its technical report (<a href="https://arxiv.org/abs/2507.23370">arXiv 2507.23370</a>) frames issue resolution as search: generate many candidate patches, remove ones that fail regression tests, and use a selector agent (<code>evaluation/patch_selection/</code>) to pick one, described in its README as the first agent-based ensemble reasoning approach for repository-level issues. Inside each attempt, <code>task_done</code> cannot be accepted with an empty non-test patch.</li>
+  <li><strong>Codex</strong>'s review rubric (<code>prompts/templates/review/rubric.md</code>) is a short course in useful review: flag only discrete, actionable bugs introduced by the change, that the author would fix if told, without speculation about code you cannot show is affected.</li>
+  <li><strong>Claude Code</strong> lets a hook be a subagent verifier and ships a Verification agent type, so the check runs in a context that did not produce the work.</li>
+  <li><strong>Qwen Code</strong> enforces prior reads before edits and fails its safety classifier closed, two small gates that stop the cheapest failures before review.</li>
+  <li><strong>Kimi Code</strong> validates every completed tool call against its schema and retries without executing an invalid one: verification at the smallest possible unit.</li>
+</ul>
+
 <h2 id="china">4. The Chinese view</h2>
 <ul>
   <li>Chinese practitioners describe harness feedback as "semantic gradient descent": natural-language feedback improves outputs the way gradients improve weights, and insist it stays constructive rather than hostile (<a href="https://adg.csdn.net/6a5822cf10ee7a33f28df343.html">CSDN</a>).</li>
