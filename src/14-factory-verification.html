@@ -1,85 +1,402 @@
 <div class="kicker">Stage 5 · Software factory · Chapter 14</div>
 <h1>Software factory II: verification gates and self-improvement</h1>
-<p class="lede">Generating code is a sample (fact 5), so its cost falls as models get faster and cheaper, while knowing whether it is right still needs an independent check. When agents write code faster than people can read it, verification becomes the bottleneck. This chapter covers the gates that let a factory ship safely: holdout scenarios the generator never sees, digital twins of outside services, review depth that grows with risk, and the light-versus-dark factory debate. Then it closes the loop: a harness that reads its own failed traces, proposes one change, and keeps it only if the eval says it helped.</p>
+<p class="lede">In 2026 generating code got cheap and checking it did not. A factory that builds fast without checking its own output only produces problems faster. This chapter derives the two principles behind every useful gate (independence and proportion), then takes eleven design decisions: holdout scenarios, digital twins of outside services, review depth by risk, what an agent reviewer may flag, whether a human reads the code, one attempt or a search over many, gates at the smallest unit, and how a harness may improve itself without overfitting. It compares how leading teams verify, shows the verification pieces in each of the nine harnesses, and keeps the gates and improvement loop you build.</p>
 <div class="meta">
   <span class="chip">Level: advanced</span>
-  <span class="chip">Time: about 20 hours with the build</span>
-  <span class="chip">Needs: Chapters 10 and 13</span>
-  <span class="chip">Facts checked: 22 Nov 2026</span>
+  <span class="chip">Time: about 14 hours with the build</span>
+  <span class="chip">Needs: Chapters 1 to 13</span>
+  <span class="chip">Harnesses read: Pi, eve, fx, nanocode, Codex, Claude Code, Kimi Code, Qwen Code, Trae Agent</span>
 </div>
 
 <div class="box skip">
   <span class="lbl">Before you start: skip check</span>
   <ol>
-    <li>Why must some test scenarios be hidden from the implementing agent?</li>
-    <li>What is a digital twin in StrongDM's factory?</li>
-    <li>A self-improvement loop proposes a new AGENTS.md rule. What must be true before you keep it?</li>
+    <li>Why is a test the implementer wrote a weaker check than one it never saw?</li>
+    <li>Why test against a fake Okta or Slack instead of the real one?</li>
+    <li>Trae Agent generates many candidate patches for one issue. What does it do with them?</li>
+    <li>An improvement loop raises your eval score every week. What should worry you, and what is the guard?</li>
   </ol>
   <details><summary>Answers</summary><ol>
-    <li>An agent that can see the tests can satisfy them without solving the problem (special-casing, weakening asserts). Holdouts measure the real behaviour.</li>
-    <li>A behavioural clone of a third-party service (Okta, Slack, Jira) that tests can hit at high volume without rate limits or cost.</li>
-    <li>It must improve the paired eval by a meaningful margin without a large cost increase, and it must name the failure it prevents.</li>
+    <li>It can encode the same misunderstanding as the code, and a test the model can see can be satisfied without solving the task.</li>
+    <li>Real services are slow, rate-limited, costly and cannot be reset between runs; a twin behaves like the service, can be reset and can run thousands of scenarios.</li>
+    <li>Removes the ones that fail regression tests, then a selector agent chooses among the rest.</li>
+    <li>It may be fitting the eval rather than the problem. Keep a holdout set the proposer never sees, change one thing per round, and read every accepted change.</li>
   </ol></details>
 </div>
 
+
 <h2 id="bottleneck">1. The bottleneck moved</h2>
-<p>Start from what a check is. A check is useful only if it can disagree with the thing it checks. A test the implementer wrote can encode the same misunderstanding as the code. A test the implementer can see can be satisfied without solving the task, because the model optimizes for whatever signal it is given. So the strongest check is one the generator neither wrote nor saw: a holdout. Checks also cost something, so it is rational to spend them where a mistake costs most: deeper review where the blast radius is larger. Those two ideas, independence and proportion, explain every gate in this chapter.</p>
-<p>The same reasoning applies when the harness improves itself. An improvement loop is a generator of harness changes, and your eval is its check. If it can see the eval, it will eventually fit the eval rather than the problem. Hence the holdout again.</p>
-<p>In 2026 generation got cheap and review did not. One industry report found that with high AI adoption, PRs received 25% more review comments and 31.3% more PRs skipped review entirely (a slide shown at AI Engineer World's Fair 2026, <a href="https://www.ai.engineer/talks/Ib5GBkD555M-harness-engineering-is-not-enough-why-software">talk</a>). Qodo puts the conclusion plainly: a factory that builds fast without checking its own output only produces problems faster, and the quality layer that works is one the generator does not control (<a href="https://www.qodo.ai/?p=23009">Qodo</a>).</p>
+<p>A check is useful only if it can disagree with the thing it checks. A test the implementer wrote can share its misunderstanding; a test the implementer can see can be satisfied without solving the task, because the model optimises for whatever signal it is given (fact 5). So the strongest check is one the generator neither wrote nor saw. Checks also cost something, so it is rational to spend them where a mistake costs most. Independence and proportion explain every gate in this chapter.</p>
+<p>The data agree. One industry report shown at AI Engineer World's Fair 2026 found that with high AI adoption, pull requests received 25% more review comments and 31.3% more pull requests skipped review entirely. Qodo puts the conclusion plainly: the quality layer that works is one the generator does not control.</p>
+
 <figure>
-<div class="svgwrap"><svg viewBox="0 0 760 210" width="760" style="max-width:100%;height:auto" role="img" aria-label="Verification gates in order of cost">
-  <defs><marker id="j1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
-  <rect x="24" y="40" width="130" height="70" rx="8" style="fill:var(--kv-s);stroke:var(--kv)"/><text x="89" y="66" text-anchor="middle" style="fill:var(--ink);font-size:11px;font-weight:600">Repo checks</text><text x="89" y="84" text-anchor="middle" style="fill:var(--ink2);font-size:9px">tests, lint, types</text>
-  <rect x="174" y="40" width="130" height="70" rx="8" style="fill:var(--kv-s);stroke:var(--kv)"/><text x="239" y="66" text-anchor="middle" style="fill:var(--ink);font-size:11px;font-weight:600">Holdout scenarios</text><text x="239" y="84" text-anchor="middle" style="fill:var(--ink2);font-size:9px">hidden from the agent</text>
-  <rect x="324" y="40" width="130" height="70" rx="8" style="fill:var(--kv-s);stroke:var(--kv)"/><text x="389" y="66" text-anchor="middle" style="fill:var(--ink);font-size:11px;font-weight:600">Digital twins</text><text x="389" y="84" text-anchor="middle" style="fill:var(--ink2);font-size:9px">fake Okta, Slack, ...</text>
-  <rect x="474" y="40" width="130" height="70" rx="8" style="fill:var(--pre-s);stroke:var(--pre)"/><text x="539" y="66" text-anchor="middle" style="fill:var(--ink);font-size:11px;font-weight:600">Agent review</text><text x="539" y="84" text-anchor="middle" style="fill:var(--ink2);font-size:9px">other vendor, evidence</text>
-  <rect x="624" y="40" width="112" height="70" rx="8" style="fill:var(--dec-s);stroke:var(--dec)"/><text x="680" y="66" text-anchor="middle" style="fill:var(--ink);font-size:11px;font-weight:600">Human review</text><text x="680" y="84" text-anchor="middle" style="fill:var(--ink2);font-size:9px">only if risky</text>
-  <g style="fill:none;stroke:var(--ink2);stroke-width:1.3"><path d="M154 75H172" marker-end="url(#j1)"/><path d="M304 75H322" marker-end="url(#j1)"/><path d="M454 75H472" marker-end="url(#j1)"/><path d="M604 75H622" marker-end="url(#j1)"/></g>
-  <path d="M24 140H736" style="stroke:var(--line)"/><text x="24" y="160" style="fill:var(--ink2);font-size:11px">cheap, automatic, every change</text><text x="736" y="160" text-anchor="end" style="fill:var(--ink2);font-size:11px">expensive, rare, by risk</text>
-  <text x="24" y="196" style="fill:var(--ink2);font-size:11px">Each gate stops what the earlier ones cannot. Human attention is spent last, and only where the blast radius is large.</text>
+<div class="svgwrap"><svg viewBox="0 0 760 200" width="760" style="max-width:100%;height:auto" role="img" aria-label="Verification gates">
+  <defs><marker id="m1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="20" width="124" height="56" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="72.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Repo checks</text>
+  <text x="72.0" y="58.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">tests, lint, types</text>
+  <rect x="164" y="20" width="124" height="56" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="226.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Holdout</text>
+  <text x="226.0" y="58.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">scenarios</text>
+  <path d="M136 48.0H161" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m1)"/>
+  <rect x="318" y="20" width="124" height="56" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="380.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Digital twins</text>
+  <text x="380.0" y="58.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">of services</text>
+  <path d="M290 48.0H315" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m1)"/>
+  <rect x="472" y="20" width="124" height="56" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="534.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Agent review</text>
+  <text x="534.0" y="58.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">other vendor</text>
+  <path d="M444 48.0H469" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m1)"/>
+  <rect x="626" y="20" width="124" height="56" rx="7" style="fill:var(--panel2);stroke:var(--line)"/>
+  <text x="688.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Human review</text>
+  <text x="688.0" y="58.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">only if risky</text>
+  <path d="M598 48.0H623" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m1)"/>
+  <path d="M20 100H740" style="fill:none;stroke:var(--ink2);stroke-width:1"/>
+  <text x="20" y="120" text-anchor="start" style="fill:var(--ink2);font-size:10px">cheap, automatic, every change</text>
+  <text x="740" y="120" text-anchor="end" style="fill:var(--ink2);font-size:10px">expensive, rare, by risk</text>
+  <text x="20" y="160" text-anchor="start" style="fill:var(--ink2);font-size:10px">Each gate stops what the earlier ones cannot. Human attention is spent last,</text>
+  <text x="20" y="176" text-anchor="start" style="fill:var(--ink2);font-size:10px">and only where the blast radius is large.</text>
 </svg></div>
+<figcaption>Figure 1. Independence increases to the right; so does cost. Proportion decides how far right each change goes.</figcaption>
 </figure>
 
-<h2 id="practice">2. How leading teams verify</h2>
+<h2 id="decisions">2. The decisions, one at a time</h2>
+<h3 id="d-holdout">Decision 1. Does the generator see the tests?</h3>
+<p>StrongDM's software factory is built on scenarios: specifications plus scenarios drive agents that write code and run harnesses until they converge, and validation is scenario-based. The scenarios the code is judged on are a holdout, curated by people and kept from the generator, the same principle as a machine-learning test set. The repository's own tests are still run, but they are the generator's tests, and they can be wrong in the same way the code is.</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 176" width="760" style="max-width:100%;height:auto" role="img" aria-label="What the generator sees">
+  <defs><marker id="m2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <text x="10" y="18" text-anchor="start" style="fill:var(--ink);font-size:12px;font-weight:600">Visible tests</text>
+  <text x="10" y="34" text-anchor="start" style="fill:var(--ink2);font-size:10px">every harness</text>
+  <rect x="10" y="44" width="238" height="76" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="129.0" y="71.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">the repo's tests; run in</text>
+  <text x="129.0" y="85.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">the implementer's sandbox;</text>
+  <text x="129.0" y="99.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">fast feedback</text>
+  <rect x="10" y="132" width="238" height="34" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="129.0" y="152.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">can share the code's mistake</text>
+  <text x="260" y="18" text-anchor="start" style="fill:var(--ink);font-size:12px;font-weight:600">Holdout scenarios</text>
+  <text x="260" y="34" text-anchor="start" style="fill:var(--ink2);font-size:10px">StrongDM</text>
+  <rect x="260" y="44" width="238" height="76" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="379.0" y="71.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">curated by people; never</text>
+  <text x="379.0" y="85.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">shown to the generator;</text>
+  <text x="379.0" y="99.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">judge the result</text>
+  <rect x="260" y="132" width="238" height="34" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="379.0" y="152.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">independent; costs curation</text>
+  <text x="510" y="18" text-anchor="start" style="fill:var(--ink);font-size:12px;font-weight:600">Criteria from the plan</text>
+  <text x="510" y="34" text-anchor="start" style="fill:var(--ink2);font-size:10px">Foreman</text>
+  <rect x="510" y="44" width="238" height="76" rx="7" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="629.0" y="71.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">written by the analyst</text>
+  <text x="629.0" y="85.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">before code; checked by</text>
+  <text x="629.0" y="99.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">the reviewer</text>
+  <rect x="510" y="132" width="238" height="34" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="629.0" y="152.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">independent of the code</text>
+</svg></div>
+<figcaption>Figure 2. The further a check is from the generator, the more its agreement means.</figcaption>
+</figure>
+
+<h3 id="d-twin">Decision 2. How do you test against outside services?</h3>
+<p>Real integrations (identity providers, chat, payments) are slow, rate-limited, cost money and cannot be reset between runs. StrongDM built a Digital Twin Universe: behavioural copies of services such as Okta and Slack that agents can run thousands of scenarios against. A Baidu Cloud lead made the same point about agentic training: the biggest obstacle is reproducing real environments, not the model. For a coding factory the twin can be modest: a fake API with recorded responses and a reset button.</p>
+
+<h3 id="d-risk">Decision 3. How deep is review, and for which changes?</h3>
+<p>Not every change deserves the same scrutiny. CodeRabbit proposes a review gate whose depth increases with risk and blast radius: a typo fix passes on repository checks, a change to authentication goes to deep review and a person.</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 200" width="760" style="max-width:100%;height:auto" role="img" aria-label="Review by risk">
+  <defs><marker id="m3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="14" width="360" height="44" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="190.0" y="39.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">docs, typos, tests only</text>
+  <path d="M372 36H416" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m3)"/>
+  <rect x="420" y="14" width="330" height="44" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="585.0" y="39.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">repo checks</text>
+  <rect x="10" y="70" width="360" height="44" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="190.0" y="95.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">ordinary feature code</text>
+  <path d="M372 92H416" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m3)"/>
+  <rect x="420" y="70" width="330" height="44" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="585.0" y="95.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">repo checks + agent review</text>
+  <rect x="10" y="126" width="360" height="44" rx="7" style="fill:var(--bad-s);stroke:var(--bad)"/>
+  <text x="190.0" y="151.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">auth, payments, data migrations, infrastructure</text>
+  <path d="M372 148H416" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m3)"/>
+  <rect x="420" y="126" width="330" height="44" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="585.0" y="151.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">all gates + a person</text>
+</svg></div>
+<figcaption>Figure 3. Proportion. Spend review where a mistake is expensive, so the reviews that happen are read.</figcaption>
+</figure>
+
+<h3 id="d-agentreview">Decision 4. What may an agent reviewer flag?</h3>
+<p>A model reviewer asked to "find problems" will always find some, and a review buried in speculation trains people to ignore it. Codex's review rubric is a short course in useful review: flag only discrete, actionable bugs introduced by the change, that the author would fix if told, without speculating about code you cannot show is affected. Foreman's reviewer (Chapter 13) adds independence (another vendor, diff only) and evidence for each verdict against each criterion. OpenAI's Codex team described a loop where Codex reviews its own pull request, requests more agent reviews locally and in the cloud, and iterates until the reviewers are satisfied, with application logs and metrics exposed to the agent.</p>
+
+<h3 id="d-human">Decision 5. Does a person read the code?</h3>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 200" width="760" style="max-width:100%;height:auto" role="img" aria-label="Light to dark factory">
+  <defs><marker id="m4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <path d="M20 40H740" style="fill:none;stroke:var(--ink2);stroke-width:2"/>
+  <circle cx="80" cy="40" r="6" style="fill:var(--kv)"/>
+  <text x="80" y="64" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Stripe</text>
+  <text x="80" y="80" text-anchor="middle" style="fill:var(--ink2);font-size:9px">people review</text>
+  <text x="80" y="94" text-anchor="middle" style="fill:var(--ink2);font-size:9px">every pull request</text>
+  <circle cx="260" cy="40" r="6" style="fill:var(--kv)"/>
+  <text x="260" y="64" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Foreman</text>
+  <text x="260" y="80" text-anchor="middle" style="fill:var(--ink2);font-size:9px">a person marks</text>
+  <text x="260" y="94" text-anchor="middle" style="fill:var(--ink2);font-size:9px">ready and merges</text>
+  <circle cx="440" cy="40" r="6" style="fill:var(--kv)"/>
+  <text x="440" y="64" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Codex team</text>
+  <text x="440" y="80" text-anchor="middle" style="fill:var(--ink2);font-size:9px">agents review;</text>
+  <text x="440" y="94" text-anchor="middle" style="fill:var(--ink2);font-size:9px">people steer</text>
+  <circle cx="640" cy="40" r="6" style="fill:var(--kv)"/>
+  <text x="640" y="64" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">StrongDM</text>
+  <text x="640" y="80" text-anchor="middle" style="fill:var(--ink2);font-size:9px">no human writes or</text>
+  <text x="640" y="94" text-anchor="middle" style="fill:var(--ink2);font-size:9px">reviews code</text>
+  <text x="20" y="26" text-anchor="start" style="fill:var(--ink);font-size:11px;font-weight:600">light factory</text>
+  <text x="740" y="26" text-anchor="end" style="fill:var(--ink);font-size:11px;font-weight:600">dark factory</text>
+  <rect x="10" y="116" width="740" height="66" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="380.0" y="138.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Dan Shapiro's five levels place the dark factory (no human reads the code) at the top. Critics answer that the hard part</text>
+  <text x="380.0" y="152.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">of software is judgement, so the better metaphor is a software company, not a factory. StrongDM is a security company,</text>
+  <text x="380.0" y="166.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">which made its choice to drop human review the most debated decision of the year.</text>
+</svg></div>
+<figcaption>Figure 4. The question is open. Where you sit should depend on your holdouts and twins, not on ambition.</figcaption>
+</figure>
+
+<h3 id="d-search">Decision 6. One attempt, or a search over many?</h3>
+<p>Because each attempt is a sample, several attempts give several different patches, and some are better than others. Trae Agent made this its research contribution.</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 200" width="760" style="max-width:100%;height:auto" role="img" aria-label="Trae Agent ensemble">
+  <defs><marker id="m5" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="20" width="134" height="56" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="77.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">issue</text>
+  <rect x="161" y="20" width="134" height="56" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="228.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">N independent</text>
+  <text x="228.0" y="58.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">attempts</text>
+  <path d="M146 48.0H158" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m5)"/>
+  <rect x="312" y="20" width="134" height="56" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="379.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">N candidate</text>
+  <text x="379.0" y="58.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">patches</text>
+  <path d="M297 48.0H309" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m5)"/>
+  <rect x="463" y="20" width="134" height="56" rx="7" style="fill:var(--bad-s);stroke:var(--bad)"/>
+  <text x="530.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">drop those failing</text>
+  <text x="530.0" y="58.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">regression tests</text>
+  <path d="M448 48.0H460" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m5)"/>
+  <rect x="614" y="20" width="134" height="56" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="681.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">selector agent</text>
+  <text x="681.0" y="58.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">picks one</text>
+  <path d="M599 48.0H611" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m5)"/>
+  <rect x="10" y="100" width="740" height="80" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="380.0" y="129.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Its technical report frames issue resolution as search: generate, prune, select. Its README calls the selector the first</text>
+  <text x="380.0" y="143.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">agent-based ensemble reasoning approach for repository-level issues. Inside each attempt, finishing is refused</text>
+  <text x="380.0" y="157.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">while the non-test patch is empty. Cost grows with N; the gain is largest when single attempts are unreliable.</text>
+</svg></div>
+<figcaption>Figure 5. Breadth instead of delegation. A factory can do the same at the implementer station when a task is high-value.</figcaption>
+</figure>
+
+<h3 id="d-small">Decision 7. Gates at the smallest unit</h3>
+<p>The cheapest failures should be stopped before any review sees them.</p>
+<ul>
+  <li><strong>Kimi Code</strong> validates every completed tool call against its schema and asks the model to retry an invalid one without executing it (Chapter 2).</li>
+  <li><strong>Qwen Code</strong> rejects a change to a file the model has not read, or whose content changed since (Chapter 3), and fails its safety classifier closed (Chapter 7).</li>
+  <li><strong>Claude Code</strong> lets a hook be an agent that verifies before deciding, and the paper lists a Verification agent, so the check runs in a context that did not produce the work.</li>
+  <li><strong>Trae Agent</strong> refuses to finish with an empty patch.</li>
+</ul>
+
+<h3 id="d-self">Decision 8. May the harness improve itself?</h3>
+<p>An improvement loop is a generator of harness changes, and your eval is its check. Several systems now close that loop.</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 230" width="760" style="max-width:100%;height:auto" role="img" aria-label="Self-improvement loop">
+  <defs><marker id="m6" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="20" width="134" height="56" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="77.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">traces, scores,</text>
+  <text x="77.0" y="58.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">code of past versions</text>
+  <rect x="161" y="20" width="134" height="56" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="228.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">agent proposes</text>
+  <text x="228.0" y="58.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">a harness change</text>
+  <path d="M146 48.0H158" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m6)"/>
+  <rect x="312" y="20" width="134" height="56" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="379.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">eval on the</text>
+  <text x="379.0" y="58.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">visible set</text>
+  <path d="M297 48.0H309" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m6)"/>
+  <rect x="463" y="20" width="134" height="56" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="530.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">check on a</text>
+  <text x="530.0" y="58.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">holdout set</text>
+  <path d="M448 48.0H460" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m6)"/>
+  <rect x="614" y="20" width="134" height="56" rx="7" style="fill:var(--panel2);stroke:var(--line)"/>
+  <text x="681.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">person reads,</text>
+  <text x="681.0" y="58.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">accepts or rejects</text>
+  <path d="M599 48.0H611" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m6)"/>
+  <path d="M685 78V100H85V80" style="fill:none;stroke:var(--ink2);stroke-width:1.3;stroke-dasharray:4 3" marker-end="url(#m6)"/>
+  <text x="330" y="96" text-anchor="start" style="fill:var(--ink2);font-size:10px">accepted version joins the folder</text>
+  <rect x="10" y="120" width="740" height="92" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="380.0" y="149.7" text-anchor="middle" style="fill:var(--ink);font-size:9px">Meta-Harness (Stanford, MIT, KRAFTON, 2026): an agent reads every earlier harness's code, scores and raw traces, proposes</text>
+  <text x="380.0" y="162.7" text-anchor="middle" style="fill:var(--ink);font-size:9px">  a new harness; discovered harnesses beat hand-built ones; raw traces, not summaries, are the key. Model weights never change.</text>
+  <text x="380.0" y="175.7" text-anchor="middle" style="fill:var(--ink);font-size:9px">OpenAI's cookbook loop: traces become feedback, feedback becomes evals, eval results rank changes, and Codex implements them.</text>
+  <text x="380.0" y="188.7" text-anchor="middle" style="fill:var(--ink);font-size:9px">eve ships opt-in self-improvement and self-modification extensions; Pi's agents write their own extensions (Chapter 8).</text>
+</svg></div>
+<figcaption>Figure 6. The loop works because it uses everything earlier chapters built: traces (Ch. 10), evals (Ch. 10), extensions (Ch. 8).</figcaption>
+</figure>
+
+<h3 id="d-trap">Decision 9. How do you keep self-improvement honest?</h3>
+<div class="box watch"><span class="lbl">The trap</span><p>A loop that optimises against your eval will overfit to your eval. Keep a holdout set the proposer never sees; change one thing per round so you know what helped; require every rule it adds to name the failure it fixes (Chapter 4's zero-tolerance AGENTS.md); and read every accepted change yourself. Block writes to the harness's own configuration from inside a run (Chapter 8).</p></div>
+
+<h3 id="d-feedback">Decision 10. What kind of feedback goes back to the generator?</h3>
+<p>Chinese practitioners describe harness feedback as semantic gradient descent: natural-language feedback improves outputs the way gradients improve weights. Two rules follow from the analogy. The feedback must point in a direction (what to change, as Codex's rubric requires, not just "this is wrong"). And it must be constructive rather than hostile, because a model told only that it failed will often change something irrelevant.</p>
+
+<h3 id="d-measure">Decision 11. How do you know the gates work?</h3>
+<p>Gates are themselves checks, and checks need checking. Plant known bugs and count how many each gate catches; track how often a human overturns an agent review; measure how many revisions CI-failure classification saved (Chapter 13). A gate that never fires is either unnecessary or broken; find out which.</p>
+
+<h2 id="practice">3. How leading teams verify</h2>
 <div class="tbl"><table>
   <tr><th>Team</th><th>Verification</th><th>Human role</th></tr>
-  <tr><td><a href="https://simonwillison.net/2026/feb/7/software-factory/">StrongDM</a></td><td>Specs plus scenarios drive agents that write code and run harnesses until they converge; scenario-based validation; a Digital Twin Universe of services like Okta and Slack (<a href="https://www.strongdm.com/blog/the-strongdm-software-factory-building-software-with-ai">StrongDM</a>)</td><td>Design specs, curate scenarios, watch scores; no code review</td></tr>
-  <tr><td>Stripe</td><td>Unattended agents in isolated cloud dev environments, linters and CI before a PR</td><td>Review every PR</td></tr>
-  <tr><td>Vercel Foreman</td><td>Repo checks in the implementer's sandbox; reviewer from another vendor with evidence per criterion; CI-failure classification</td><td>Mark ready, merge</td></tr>
-  <tr><td>OpenAI Codex team</td><td>Codex reviews its own PR, requests more agent reviews locally and in the cloud, iterates until reviewers are satisfied; app logs and metrics exposed to the agent</td><td>Steer through prompts</td></tr>
-  <tr><td>CodeRabbit's proposal</td><td>A review gate whose depth increases with risk and blast radius (<a href="https://www.coderabbit.ai/blog/software-factory-review-gate">CodeRabbit</a>)</td><td>Deep review only on consequential changes</td></tr>
+  <tr><td>StrongDM</td><td>Specifications and holdout scenarios; agents iterate until they converge; digital twins of services such as Okta and Slack</td><td>Design specifications, curate scenarios, watch scores; no code review</td></tr>
+  <tr><td>Stripe</td><td>Unattended agents in isolated cloud development environments; linters and CI before a pull request</td><td>Review every pull request</td></tr>
+  <tr><td>Vercel Foreman</td><td>Repository checks in the implementer's sandbox; reviewer from another vendor with evidence per criterion; CI-failure classification</td><td>Mark ready, merge</td></tr>
+  <tr><td>OpenAI Codex team</td><td>Codex reviews its own pull request, requests more agent reviews, iterates until reviewers are satisfied; logs and metrics exposed to the agent</td><td>Steer through prompts</td></tr>
+  <tr><td>CodeRabbit (proposal)</td><td>Review depth increases with risk and blast radius</td><td>Deep review only on consequential changes</td></tr>
 </table></div>
-<p>The light versus dark factory question is open. Dan Shapiro's five levels place the dark factory (no human reads the code) at the top. Critics answer that the hard part of software is judgement, so the better metaphor is a software company, not a factory (<a href="https://every.to/thesis-statements/noah-brier">Every</a>). StrongDM is a security company, which made its choice to drop human review the most debated decision of the year.</p>
 
-<h2 id="self">3. Harnesses that improve themselves</h2>
+<h2 id="harnesses">4. Verification pieces in each harness</h2>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 140" width="760" style="max-width:100%;height:auto" role="img" aria-label="Verification pieces A">
+  <defs><marker id="m7" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <text x="10" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">Trae Agent</text>
+  <rect x="10" y="24" width="131" height="22" rx="4" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="75.5" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">ensemble attempts</text>
+  <rect x="10" y="50" width="131" height="22" rx="4" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="75.5" y="64.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">regression filter</text>
+  <rect x="10" y="76" width="131" height="22" rx="4" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="75.5" y="90.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">selector agent</text>
+  <rect x="10" y="102" width="131" height="22" rx="4" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="75.5" y="116.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">no empty patch</text>
+  <text x="153" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">Codex</text>
+  <rect x="153" y="24" width="110" height="22" rx="4" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="208.0" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">review rubric</text>
+  <rect x="153" y="50" width="110" height="22" rx="4" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="208.0" y="64.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">review command</text>
+  <rect x="153" y="76" width="110" height="22" rx="4" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="208.0" y="90.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">stop hooks</text>
+  <text x="275" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">Claude Code</text>
+  <rect x="275" y="24" width="145" height="22" rx="4" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="347.5" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">agent verifier hook</text>
+  <rect x="275" y="50" width="145" height="22" rx="4" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="347.5" y="64.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Verification agent</text>
+  <rect x="275" y="76" width="145" height="22" rx="4" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="347.5" y="90.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">stop hooks</text>
+  <text x="432" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">Qwen Code</text>
+  <rect x="432" y="24" width="166" height="22" rx="4" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="515.0" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">prior-read gate</text>
+  <rect x="432" y="50" width="166" height="22" rx="4" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="515.0" y="64.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">fail-closed classifier</text>
+  <rect x="432" y="76" width="166" height="22" rx="4" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="515.0" y="90.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">autofix PR watch</text>
+</svg></div>
+<figcaption>Figure 7. The four with the most verification machinery.</figcaption>
+</figure>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 120" width="760" style="max-width:100%;height:auto" role="img" aria-label="Verification pieces B">
+  <defs><marker id="m8" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <text x="10" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">Kimi Code</text>
+  <rect x="10" y="24" width="124" height="22" rx="4" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="72.0" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">schema check per</text>
+  <rect x="10" y="50" width="124" height="22" rx="4" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="72.0" y="64.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">tool call</text>
+  <rect x="10" y="76" width="124" height="22" rx="4" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="72.0" y="90.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">lint rule</text>
+  <text x="146" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">eve</text>
+  <rect x="146" y="24" width="124" height="22" rx="4" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="208.0" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Foreman reviewer</text>
+  <rect x="146" y="50" width="124" height="22" rx="4" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="208.0" y="64.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">evals</text>
+  <rect x="146" y="76" width="124" height="22" rx="4" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="208.0" y="90.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">self-improvement</text>
+  <text x="282" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">Pi</text>
+  <rect x="282" y="24" width="110" height="22" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="337.0" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">paired evals</text>
+  <rect x="282" y="50" width="110" height="22" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="337.0" y="64.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">self-written</text>
+  <rect x="282" y="76" width="110" height="22" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="337.0" y="90.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">extensions</text>
+  <text x="404" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">fx</text>
+  <rect x="404" y="24" width="131" height="22" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="469.5" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">stop hook</text>
+  <rect x="404" y="50" width="131" height="22" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="469.5" y="64.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">classifier review</text>
+  <text x="547" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">nanocode</text>
+  <rect x="547" y="24" width="110" height="22" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="602.0" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">invariant</text>
+  <rect x="547" y="50" width="110" height="22" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="602.0" y="64.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">simulator</text>
+</svg></div>
+<figcaption>Figure 8. The rest: gates at the smallest unit, evals and self-extension.</figcaption>
+</figure>
+
+<h2 id="compare">5. All nine in one table</h2>
+<div class="tbl"><table>
+  <tr><th>Harness</th><th>Smallest-unit gate</th><th>Stop gate</th><th>Review</th><th>Search over attempts</th><th>Self-improvement</th></tr>
+  <tr><td>Pi</td><td>Not described here</td><td>Extensions</td><td>Separate process</td><td>No</td><td>Agent writes extensions</td></tr>
+  <tr><td>eve</td><td>Not described here</td><td>Hooks</td><td>Foreman reviewer</td><td>No</td><td>Opt-in extensions</td></tr>
+  <tr><td>fx</td><td>Classifier with evidence</td><td>Stop hook</td><td>Not described here</td><td>No</td><td>Installs skills</td></tr>
+  <tr><td>nanocode</td><td>Invariant checks</td><td>Not described here</td><td>Per vendor</td><td>No</td><td>No</td></tr>
+  <tr><td>Codex</td><td>Policy rules with tests</td><td>Stop hooks</td><td>Rubric-limited review</td><td>No</td><td>Cookbook loop (external)</td></tr>
+  <tr><td>Claude Code</td><td>Hooks</td><td>Stop hooks, agent verifier</td><td>Verification agent</td><td>No</td><td>Not described here</td></tr>
+  <tr><td>Kimi Code</td><td>Schema check per call</td><td>Hooks</td><td>Not described here</td><td>No</td><td>Not described here</td></tr>
+  <tr><td>Qwen Code</td><td>Prior-read gate</td><td>Stop hooks</td><td>Review agents</td><td>No</td><td>Skill curator with rollback</td></tr>
+  <tr><td>Trae Agent</td><td>No empty patch</td><td>Done tool</td><td>Selector agent</td><td>Yes</td><td>No</td></tr>
+</table></div>
+
+<h2 id="choose">6. Choosing gates</h2>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 274" width="760" style="max-width:100%;height:auto" role="img" aria-label="Choosing gates">
+  <defs><marker id="m9" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="10" width="280" height="52" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="150.0" y="32.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Can the generator see</text>
+  <text x="150.0" y="46.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">the checks?</text>
+  <rect x="340" y="10" width="410" height="52" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="545.0" y="32.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Add a holdout it never sees; keep it</text>
+  <text x="545.0" y="46.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">curated by people</text>
+  <path d="M292 36H336" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m9)"/>
+  <text x="300" y="30" text-anchor="start" style="fill:var(--ink2);font-size:10px">yes</text>
+  <rect x="10" y="76" width="280" height="52" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="150.0" y="98.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Does the code call outside</text>
+  <text x="150.0" y="112.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">services?</text>
+  <rect x="340" y="76" width="410" height="52" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="545.0" y="98.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Build a twin with recorded behaviour</text>
+  <text x="545.0" y="112.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">and a reset</text>
+  <path d="M292 102H336" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m9)"/>
+  <text x="300" y="96" text-anchor="start" style="fill:var(--ink2);font-size:10px">yes</text>
+  <rect x="10" y="142" width="280" height="52" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="150.0" y="164.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Is review being skipped or</text>
+  <text x="150.0" y="178.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">ignored?</text>
+  <rect x="340" y="142" width="410" height="52" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="545.0" y="164.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Depth by risk; agent reviews limited to</text>
+  <text x="545.0" y="178.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">concrete bugs with evidence</text>
+  <path d="M292 168H336" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m9)"/>
+  <text x="300" y="162" text-anchor="start" style="fill:var(--ink2);font-size:10px">yes</text>
+  <rect x="10" y="208" width="280" height="52" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="150.0" y="230.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Will the harness change</text>
+  <text x="150.0" y="244.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">itself?</text>
+  <rect x="340" y="208" width="410" height="52" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="545.0" y="230.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Holdout, one change per round, every rule</text>
+  <text x="545.0" y="244.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">names a failure, a person reads it</text>
+  <path d="M292 234H336" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m9)"/>
+  <text x="300" y="228" text-anchor="start" style="fill:var(--ink2);font-size:10px">yes</text>
+</svg></div>
+<figcaption>Figure 9. Independence first, then proportion.</figcaption>
+</figure>
+
+<p>This book's gates: repository checks in the implementer's container, a holdout of ten scenarios the agent never sees, a reviewer on another vendor limited to concrete bugs, depth by a simple risk rule on touched paths, and an improvement loop that proposes one change per round and must pass the holdout before a person reviews it.</p>
+
+<h2 id="china">7. The Chinese view</h2>
 <ul>
-  <li><strong>Meta-Harness</strong> (Stanford, MIT, KRAFTON, 2026): a coding agent reads a folder of every earlier harness's code, scores and raw traces, proposes a new harness, and the result is evaluated and added to the folder. The model weights never change. Discovered harnesses beat hand-built ones; the key design choice is raw traces, not compressed summaries (<a href="https://arxiv.org/html/2603.28052v1">arXiv 2603.28052</a>).</li>
-  <li><strong>OpenAI's improvement loop</strong>: traces become feedback, feedback becomes evals, eval results rank harness changes, and Codex implements them, in one repeatable workflow (OpenAI cookbook, May 2026).</li>
-  <li><strong>eve</strong> ships <code>eve-self-improvement</code> and <code>eve-self-modification</code> extensions; <strong>Pi</strong>'s agents write their own extensions.</li>
-  <li><strong>Test-time harness evolution</strong> and <strong>JIT-Agent</strong> adapt the harness during a task (<a href="https://arxiv.org/pdf/2608.25593">arXiv 2608.25593</a>).</li>
-</ul>
-<div class="box watch">
-  <span class="lbl">The trap</span>
-  <p>A loop that optimizes against your eval will overfit to your eval. Keep a holdout set the proposer never sees, cap changes to one per round, require every rule to name the failure it fixes, and read every accepted change yourself.</p>
-</div>
-
-<h3>Verification inside the reference harnesses</h3>
-<ul>
-  <li><strong>Trae Agent</strong> made verification its research contribution. Its technical report (<a href="https://arxiv.org/abs/2507.23370">arXiv 2507.23370</a>) frames issue resolution as search: generate many candidate patches, remove ones that fail regression tests, and use a selector agent (<code>evaluation/patch_selection/</code>) to pick one, described in its README as the first agent-based ensemble reasoning approach for repository-level issues. Inside each attempt, <code>task_done</code> cannot be accepted with an empty non-test patch.</li>
-  <li><strong>Codex</strong>'s review rubric (<code>prompts/templates/review/rubric.md</code>) is a short course in useful review: flag only discrete, actionable bugs introduced by the change, that the author would fix if told, without speculation about code you cannot show is affected.</li>
-  <li><strong>Claude Code</strong> lets a hook be a subagent verifier and ships a Verification agent type, so the check runs in a context that did not produce the work.</li>
-  <li><strong>Qwen Code</strong> enforces prior reads before edits and fails its safety classifier closed, two small gates that stop the cheapest failures before review.</li>
-  <li><strong>Kimi Code</strong> validates every completed tool call against its schema and retries without executing an invalid one: verification at the smallest possible unit.</li>
+  <li>Chinese practitioners describe harness feedback as semantic gradient descent, and insist it stays constructive rather than hostile.</li>
+  <li>Woshipm's essay "Harness is the new dataset" argues that harness design is now the main lever for agent capability gains, organised into information, execution and feedback layers.</li>
+  <li>A Baidu Cloud lead told Beijing News that the biggest obstacle to agentic training is reproducing real environments, the insight behind StrongDM's digital twins.</li>
+  <li>ByteDance's Trae Agent made search over attempts plus a selector its research contribution; Kimi Code's per-call schema check is the smallest gate read for this book.</li>
 </ul>
 
-<h2 id="china">4. The Chinese view</h2>
-<ul>
-  <li>Chinese practitioners describe harness feedback as "semantic gradient descent": natural-language feedback improves outputs the way gradients improve weights, and insist it stays constructive rather than hostile (<a href="https://adg.csdn.net/6a5822cf10ee7a33f28df343.html">CSDN</a>).</li>
-  <li>Woshipm's essay "Harness is the new dataset" argues that harness design is now the main lever for agent intelligence gains, organized into information, execution and feedback layers (<a href="https://www.woshipm.com/ai/6365944.html">Woshipm</a>).</li>
-  <li>A Baidu Cloud lead told Beijing News that the biggest obstacle to agentic training is reproducing real environments, not the model (<a href="https://m.bjnews.com.cn/detail/1775178643129477.html">Beijing News</a>): the same insight behind StrongDM's digital twins.</li>
-</ul>
-
-<h2 id="build">5. Build: gates and an improvement loop</h2>
+<h2 id="build">8. Build: gates and an improvement loop</h2>
 <pre>&quot;&quot;&quot;Verification gates the generator cannot see, review depth by risk, and a harness that improves from its traces.&quot;&quot;&quot;
 import fnmatch, json, subprocess
 from pathlib import Path
@@ -146,29 +463,32 @@ def improve_once(config_dir, propose, evaluate, min_lift=0.05, max_cost_increase
 <h3>Measure</h3>
 <p>Run four improvement rounds. For each, report the diagnosis, train lift, holdout lift and whether you agree with the change. A change with train lift but no holdout lift is overfitting; record it.</p>
 
-<h2 id="exercises">6. Exercises</h2>
+
+<h2 id="exercises">9. Exercises</h2>
 <ol>
-  <li>Build a digital twin: a 50-line fake of one API your project calls, and make scenarios hit it instead of the real service.</li>
-  <li>Let the proposer change Python code instead of Markdown. What new guards do you need?</li>
-  <li>Write the case for and against a dark factory for your own work, with one scenario where each fails.</li>
+  <li><strong>Holdout.</strong> Write ten scenarios the agent never sees. Run your factory on five issues and score with both the repo's tests and the holdout. Where do they disagree?</li>
+  <li><strong>Planted bugs.</strong> Plant ten known bugs in diffs and run each gate. Which gate catches which?</li>
+  <li><strong>Ensemble.</strong> Run five attempts per issue, drop those failing regression tests, and let a selector pick. Compare pass rate and cost with one attempt.</li>
+  <li><strong>Rubric.</strong> Review 20 diffs with an open "find problems" prompt and with a rubric limited to concrete bugs. How many findings does each give, and how many are real?</li>
+  <li><strong>Improvement loop.</strong> Let an agent propose one AGENTS.md change per round from failing traces for five rounds. Track visible and holdout scores separately.</li>
 </ol>
 
-<h2 id="quiz">7. Check yourself</h2>
+<h2 id="quiz">10. Check yourself</h2>
 <div class="widget quiz" data-quiz="qz14"></div>
 <script type="application/json" id="qz14">[
-{"q":"What makes holdout scenarios useful?","o":["They run faster","The implementing agent never sees them, so it cannot satisfy them without solving the task","They replace unit tests","They need no maintenance"],"a":1,"e":"Visible tests can be gamed; hidden ones measure behaviour."},
-{"q":"What is StrongDM's Digital Twin Universe?","o":["A model ensemble","Behavioural clones of third-party services used for high-volume testing","A staging cluster","A UI"],"a":1,"e":"Twins of Okta, Slack, Jira and others remove rate limits and cost from testing."},
-{"q":"Meta-Harness's proposer reads:","o":["Only scores","Summaries of failures","The code, scores and raw execution traces of earlier harnesses","Human feedback only"],"a":2,"e":"Raw traces allow selective diagnosis of long-horizon failures."},
-{"q":"A proposed rule improves the training eval but not the holdout. What is it?","o":["A great rule","Probably overfitting; do not trust it","A bug in the eval","A model problem"],"a":1,"e":"Keep a holdout precisely to catch this."},
-{"q":"In a risk-based review gate, human review is required when:","o":["Always","The change touches sensitive areas or is large","Never","The agent asks"],"a":1,"e":"Human attention is the scarcest resource; spend it where blast radius is large."}
+{"q":"Why is a holdout scenario a stronger check than the repo's tests?","o":["It is longer","The generator neither wrote nor saw it, so it cannot share the code's mistake or be gamed","It runs faster","It uses another language"],"a":1,"e":"Independence is what makes agreement meaningful."},
+{"q":"What is a digital twin in StrongDM's factory?","o":["A copy of the codebase","A behavioural copy of an outside service such as Okta or Slack that can be reset and run at scale","A second model","A backup server"],"a":1,"e":"Real services are slow, costly and cannot be reset."},
+{"q":"What does CodeRabbit propose for review depth?","o":["Always deep","Depth that increases with risk and blast radius","None","Random sampling"],"a":1,"e":"Proportion: spend review where mistakes are expensive."},
+{"q":"What does Codex's review rubric allow the reviewer to flag?","o":["Everything","Only discrete, actionable bugs introduced by the change that the author would fix","Style only","Performance only"],"a":1,"e":"It keeps real findings from being buried in speculation."},
+{"q":"How does Trae Agent pick a patch?","o":["The first one","Generate many, drop those failing regression tests, then a selector agent chooses","A person picks","The shortest"],"a":1,"e":"Its report frames issue resolution as search."},
+{"q":"What is the key design choice in Meta-Harness?","o":["Fine-tuning","Giving the proposer raw traces of past harnesses, not summaries","Using many models","Human labels"],"a":1,"e":"Model weights never change; the harness does."},
+{"q":"Which is NOT a guard against an improvement loop overfitting?","o":["A holdout set the proposer never sees","One change per round","Letting the loop edit its own eval","A person reads every accepted change"],"a":2,"e":"Letting it edit its eval is exactly how it would game it."},
+{"q":"Which small gate does Kimi Code apply to every tool call?","o":["A human prompt","A schema check; invalid calls are retried without executing","A classifier","None"],"a":1,"e":"Stop the cheapest failures before any review sees them."}
 ]</script>
 
-<h2 id="refs">8. References</h2>
+<h2 id="refs">11. References</h2>
 <ul>
-  <li><a href="https://simonwillison.net/2026/feb/7/software-factory/">StrongDM's software factory</a>, Simon Willison, Feb 2026; <a href="https://law.stanford.edu/2026/02/08/built-by-agents-tested-by-agents-trusted-by-whom/">Built by Agents, Tested by Agents, Trusted by Whom?</a>, Stanford CodeX.</li>
-  <li><a href="https://arxiv.org/html/2603.28052v1">Meta-Harness: End-to-End Optimization of Model Harnesses</a>, 2026.</li>
-  <li><a href="https://openai.com/index/harness-engineering/">Harness engineering</a>, OpenAI, Feb 2026.</li>
-  <li><a href="https://www.coderabbit.ai/blog/software-factory-review-gate">A software factory needs a review gate it can trust</a>, CodeRabbit, Sep 2026.</li>
-  <li><a href="https://www.qodo.ai/?p=23009">What is a software factory?</a>, Qodo, 2026.</li>
-  <li><a href="https://www.woshipm.com/ai/6365944.html">Harness is the New Dataset</a>, Woshipm, 2026.</li>
+  <li>Trae Agent: <a href="https://github.com/bytedance/trae-agent">github.com/bytedance/trae-agent</a> (e839e55) and its technical report, arXiv 2507.23370.</li>
+  <li>Codex CLI: <a href="https://github.com/openai/codex">github.com/openai/codex</a> (50aeac2), review rubric. Claude Code: Dive into Claude Code, arXiv 2604.14228. Kimi Code: <a href="https://github.com/MoonshotAI/kimi-code">github.com/MoonshotAI/kimi-code</a> (111aae2). Qwen Code: <a href="https://github.com/QwenLM/qwen-code">github.com/QwenLM/qwen-code</a> (c56424fc). eve and Foreman: <a href="https://github.com/vercel/eve">github.com/vercel/eve</a> (5c52fbf).</li>
+  <li>Meta-Harness: End-to-End Optimization of Model Harnesses, arXiv 2603.28052. StrongDM, Software Factory. CodeRabbit on risk-based review. Qodo on factory quality. Dan Shapiro, the five levels.</li>
 </ul>
