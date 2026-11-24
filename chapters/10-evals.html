@@ -15,93 +15,568 @@
 <main><article>
 <div class="kicker">Stage 3 · Control · Chapter 10</div>
 <h1>Verification, evals and observability</h1>
-<p class="lede">The model's output is a sample (fact 5): the same harness on the same task can pass today and fail tomorrow, and a confident "done" is not evidence. So a harness change that is not measured, many times, is a guess. This chapter is about three feedback loops: the agent checking its own work before it stops, you checking whether a harness change helped, and everyone seeing where time, tokens and money went. It reads eve's eval framework, Pi's paired "lift" evals, fx's 2 ms performance gate and nanocode's cost fold, then builds tracing, a cost report and a paired A/B eval runner. It closes Stage 3.</p>
+<p class="lede">Every output is a sample (fact 5). That has three consequences: an agent cannot confirm its own work by thinking harder, one run of a harness tells you almost nothing about the next, and a harness can get slower and more expensive while its pass rate looks unchanged. This chapter derives three feedback loops from those consequences (inside a turn, across harness versions, in operation), then takes ten design decisions: what must happen before the agent may stop, who judges, what an eval runs against, how to compare versions, what a trace records and who may see it, how cost is counted, whether the harness's own speed is tested, and how real failures become tests. It shows each harness's approach and keeps the trace, cost and paired-eval runner you build.</p>
 <div class="meta">
-  <span class="chip">Level: intermediate</span>
-  <span class="chip">Time: about 20 hours with the build</span>
-  <span class="chip">Needs: Stage 2, your test tasks from Chapter 1</span>
-  <span class="chip">Code read at: Pi fb248c7, eve 5c52fbf, fx cbe7daf, nanocode 015cbfa</span>
+  <span class="chip">Level: intermediate to advanced</span>
+  <span class="chip">Time: about 14 hours with the build</span>
+  <span class="chip">Needs: Chapters 1 to 9</span>
+  <span class="chip">Harnesses read: Pi, eve, fx, nanocode, Codex, Claude Code, Kimi Code, Qwen Code, Trae Agent</span>
 </div>
 
 <div class="box skip">
   <span class="lbl">Before you start: skip check</span>
   <ol>
-    <li>Your change raises the pass rate from 6/10 to 7/10 on one run. Is the change better?</li>
-    <li>What is a paired comparison in agent evals?</li>
-    <li>Who should decide that a task is done: the agent or the harness?</li>
+    <li>Why does asking the model "are you sure the tests pass?" add almost no information?</li>
+    <li>Version B passes 62% of tasks, version A 58%, each run once over 50 tasks. Is B better? What would you do instead?</li>
+    <li>Codex's rollout traces can only be replayed by the same binary that recorded them. Why is that a feature?</li>
+    <li>Why does fx fail a pull request if a command like help takes more than 2 ms?</li>
   </ol>
   <details><summary>Answers</summary><ol>
-    <li>Not proven. Agents are random; one extra pass on one run is noise. Repeat each task several times and compare the same tasks across both variants.</li>
-    <li>Running the same tasks, the same number of times, under two variants (old and new harness), then comparing per task. Pi's evals call the difference "lift".</li>
-    <li>The harness, through an external check: tests, a feature list, a reviewer. The agent's own "done" is a claim, not evidence.</li>
+    <li>The answer is another sample from the same model reading the same context. Only something outside the model (running the tests) adds new information.</li>
+    <li>You cannot tell: four points on 50 single runs is within noise. Run both versions on the same tasks several times and compare per task (paired), which removes the large differences between tasks.</li>
+    <li>A replay by different code could quietly disagree with what actually ran; tying it to the recording binary guarantees the replay shows the truth.</li>
+    <li>Speed and size are properties of the harness like correctness, and they rot silently unless a test fails when they get worse.</li>
   </ol></details>
 </div>
 
+
 <h2 id="loops">1. Three feedback loops</h2>
-<p>Fact 5 has three consequences, one per loop. First, within a turn: the model cannot verify its own claim by thinking harder, because the check would be another sample from the same model reading the same context. Only something outside the model (a test run, a type checker, a diff) adds new information. So the agent must run checks before it stops, and the harness should refuse a stop that skipped them.</p>
-<p>Second, across harness versions: if one run of a task is a coin flip with an unknown bias, one run tells you almost nothing. You need repeats, and you need to compare versions on the same tasks, because the differences between tasks are much larger than the difference you are trying to detect. That is why paired comparisons (same task, version A against version B) find real effects with far fewer runs than comparing two overall averages.</p>
-<p>Third, across operations: because cost and time grow with session length (facts 2 and 4), a harness can get worse in money and latency while its pass rate stays flat. You only see that if every step records what it spent.</p>
+
 <figure>
-<div class="svgwrap"><svg viewBox="0 0 760 220" width="760" style="max-width:100%;height:auto" role="img" aria-label="Three feedback loops: inside the turn, across harness versions, across operations">
-  <rect x="24" y="30" width="220" height="150" rx="10" style="fill:var(--kv-s);stroke:var(--kv)"/>
-  <text x="134" y="56" text-anchor="middle" style="fill:var(--ink);font-size:13px;font-weight:600">1. Inside the turn</text>
-  <text x="40" y="84" style="fill:var(--ink2);font-size:11px">tests and linters after edits</text><text x="40" y="104" style="fill:var(--ink2);font-size:11px">stop hook: no finish while red</text><text x="40" y="124" style="fill:var(--ink2);font-size:11px">separate reviewer or judge</text><text x="40" y="160" style="fill:var(--kv);font-size:11px">who: the agent and harness</text>
-  <rect x="270" y="30" width="220" height="150" rx="10" style="fill:var(--pre-s);stroke:var(--pre)"/>
-  <text x="380" y="56" text-anchor="middle" style="fill:var(--ink);font-size:13px;font-weight:600">2. Across versions</text>
-  <text x="286" y="84" style="fill:var(--ink2);font-size:11px">fixed task set, repeated</text><text x="286" y="104" style="fill:var(--ink2);font-size:11px">paired A/B per change</text><text x="286" y="124" style="fill:var(--ink2);font-size:11px">pass rate, tokens, cost</text><text x="286" y="160" style="fill:var(--pre);font-size:11px">who: you, before merging</text>
-  <rect x="516" y="30" width="220" height="150" rx="10" style="fill:var(--dec-s);stroke:var(--dec)"/>
-  <text x="626" y="56" text-anchor="middle" style="fill:var(--ink);font-size:13px;font-weight:600">3. In operation</text>
-  <text x="532" y="84" style="fill:var(--ink2);font-size:11px">traces per turn and tool</text><text x="532" y="104" style="fill:var(--ink2);font-size:11px">cost rolled up per session</text><text x="532" y="124" style="fill:var(--ink2);font-size:11px">failures become new tasks</text><text x="532" y="160" style="fill:var(--dec);font-size:11px">who: everyone, continuously</text>
-  <text x="24" y="210" style="fill:var(--ink2);font-size:11px">Loop 3 feeds loop 2: every real failure becomes an eval task, and the fix must pass it (Hashimoto's habit, made measurable).</text>
+<div class="svgwrap"><svg viewBox="0 0 760 176" width="760" style="max-width:100%;height:auto" role="img" aria-label="Three feedback loops">
+  <defs><marker id="m1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <text x="10" y="18" text-anchor="start" style="fill:var(--ink);font-size:12px;font-weight:600">1. Inside the turn</text>
+  <text x="10" y="34" text-anchor="start" style="fill:var(--ink2);font-size:10px">the agent and harness</text>
+  <rect x="10" y="44" width="238" height="76" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="129.0" y="71.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">run tests and linters after</text>
+  <text x="129.0" y="85.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">edits; refuse to stop while</text>
+  <text x="129.0" y="99.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">red; a separate reviewer</text>
+  <rect x="10" y="132" width="238" height="34" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="129.0" y="152.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">catches this task's mistakes</text>
+  <text x="260" y="18" text-anchor="start" style="fill:var(--ink);font-size:12px;font-weight:600">2. Across versions</text>
+  <text x="260" y="34" text-anchor="start" style="fill:var(--ink2);font-size:10px">you, before merging</text>
+  <rect x="260" y="44" width="238" height="76" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="379.0" y="71.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">fixed task set, repeated;</text>
+  <text x="379.0" y="85.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">paired A/B per change;</text>
+  <text x="379.0" y="99.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">pass rate, tokens, cost</text>
+  <rect x="260" y="132" width="238" height="34" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="379.0" y="152.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">catches the harness's mistakes</text>
+  <text x="510" y="18" text-anchor="start" style="fill:var(--ink);font-size:12px;font-weight:600">3. In operation</text>
+  <text x="510" y="34" text-anchor="start" style="fill:var(--ink2);font-size:10px">everyone, continuously</text>
+  <rect x="510" y="44" width="238" height="76" rx="7" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="629.0" y="71.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">traces per turn and tool;</text>
+  <text x="629.0" y="85.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">cost per session; failures</text>
+  <text x="629.0" y="99.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">become new eval tasks</text>
+  <rect x="510" y="132" width="238" height="34" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="629.0" y="152.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">catches what tests missed</text>
 </svg></div>
+<figcaption>Figure 1. Loop 3 feeds loop 2: every real failure becomes an eval task, and the fix must pass it.</figcaption>
 </figure>
 
-<h2 id="tour">2. Code tour</h2>
-<h3>eve: evals that talk to the real agent</h3>
-<p>An eve eval is a <code>.eval.ts</code> file under <code>evals/</code> run by <code>eve eval</code> (<code>docs/evals/index.mdx</code>). It sends messages to a running agent over the same HTTP API as users and records assertions: <code>t.send(...)</code>, <code>t.succeeded()</code>, <code>t.calledTool("get_weather")</code>, <code>t.check(turn.reply, includes("Sunny"))</code>. Tool stubs fix what tools return; a judge (<code>src/evals/judge.ts</code>) scores open answers; a mock model (<code>mock-model.ts</code>) makes fast unit tests; reporters send results to Datadog and others. In production, Agent Runs shows every session's turns, tool calls, reasoning, timing and token use in the Vercel dashboard with no instrumentation.</p>
-<h3>Pi: measure the lift of a change</h3>
-<p><code>packages/evals</code> uses vitest-evals. Its documentation-lift evals run each case twice, <code>without_docs</code> and <code>with_docs</code>, in isolated Docker containers, expand cases into (case, variant, repetition) tasks (<code>src/plan.ts</code>), and pair the two arms to compute lift (<code>src/report.ts</code>). That is exactly the method for any harness change: same cases, both variants, repeated, paired. <code>packages/telemetry</code> defines vendor-neutral telemetry contracts with conformance tests.</p>
-<h3>fx: performance is a test too</h3>
-<p>fx's CI fails a pull request if any benchmarked command, such as <code>fx help</code> or <code>fx status --json</code>, takes over 2 ms on Linux, and release binaries must fit a size limit (<code>benchmarks/check_budgets.py</code>). It also benchmarks long-turn memory and approval review. <code>/trace</code> shows bounded compaction events in the app.</p>
-<h3>nanocode: cost as a pure fold</h3>
-<p><code>crates/core/cost-fold</code> computes tokens, dollars and machine time per step as a pure function over the event log, rolled up by agent, turn, board task and commit. <code>bin/nanocode-sim</code> tests the memory invariants from <code>docs/memory-invariant.md</code> as numbers.</p>
+<p>Each loop comes from fact 5. Inside a turn, the model cannot verify its own claim by thinking harder, because the check would be another sample from the same model on the same context; only something outside the model adds information. Across versions, one run of a task is a coin flip with an unknown bias, so you need repeats and you need to compare versions on the same tasks. In operation, cost and time grow with session length (facts 2 and 4), so a harness can get worse in money and latency while its pass rate stays flat; you only see it if every step records what it spent.</p>
 
-<h3>Codex: local traces you can replay, and a review rubric</h3>
-<p>Codex has OpenTelemetry export (<code>core/src/otel_init.rs</code>) for operations, and a separate, opt-in rollout trace (<code>codex-rs/rollout-trace/</code>) for debugging. Its README is clear about the difference: tracing is not telemetry, nothing is uploaded, and bundles are written only when <code>CODEX_ROLLOUT_TRACE_ROOT</code> is set. A bundle records raw evidence (prompts, responses, tool input and output, compaction) and can be replayed into a graph a debugger can inspect, but only by the same binary that recorded it, so the replay cannot quietly disagree with what ran. For checking work, <code>codex review</code> uses a rubric (<code>prompts/templates/review/rubric.md</code>) that limits findings to discrete, actionable bugs introduced by the change, which keeps a model reviewer from burying real issues in speculation (fact 5 again).</p>
-<h3>Claude Code: verification as a hook and as an agent</h3>
-<p>Two of the paper's findings are about verification. One of the four hook handler kinds is a subagent verifier, so a check can itself be an agent that runs before a stop is accepted. And one of the six built-in subagent types is Verification. Both put the check outside the context that produced the work.</p>
-<h3>Kimi Code: the same scenario on four surfaces</h3>
-<p>Kimi Code's test strategy is visible in its root AGENTS.md: <code>pnpm lint</code> must pass before any change ends, tests run against a fake model from <code>packages/testkit</code>, and <code>tests/e2e</code> runs one scenario on the TUI, web, desktop and ACP surfaces, which only works because they share one core (Chapter 12). <code>apps/vis</code> is a session and replay visualiser for debugging runs from their logs.</p>
-<h3>Qwen Code: guards that are also measurements</h3>
-<p>Qwen Code's loop detection, duplicate-call detection and compaction circuit breaker (Chapters 1 and 5) double as signals: each records why a turn stopped. A usage dashboard and token usage service (<code>services/usage-dashboard-service.ts</code>, <code>tokenUsageService.ts</code>) keep cost visible per session.</p>
-<h3>Trae Agent: built for evaluation</h3>
-<p>Trae Agent is the harness most shaped by evaluation. Every step's request, response and tool calls go to a trajectory file. Lakeview (<code>utils/lake_view.py</code>) asks a model to label each step twice: a general task in at most 10 words ("The agent is writing a reproduction test script") and bug-specific details in at most 30, which turns a long trajectory into something a person can scan. <code>evaluation/</code> runs SWE-bench, and the selector agent in <code>evaluation/patch_selection/</code> picks the best patch among many candidates after regression tests.</p>
+<h2 id="decisions">2. The decisions, one at a time</h2>
+<h3 id="d-stop">Decision 1. What must happen before the agent may stop?</h3>
+<p>The most common failure of coding agents is declaring success too early. The fix is to make stopping a checked action.</p>
 
-<h2 id="decisions">3. Design decisions compared</h2>
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 210" width="760" style="max-width:100%;height:auto" role="img" aria-label="Checked stop">
+  <defs><marker id="m2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="16" width="150" height="50" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="85.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">model says</text>
+  <text x="85.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">"done"</text>
+  <rect x="190" y="16" width="150" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="265.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">stop hook or</text>
+  <text x="265.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">verifier runs</text>
+  <path d="M162 41.0H187" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m2)"/>
+  <rect x="370" y="16" width="150" height="50" rx="7" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="445.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">tests, lint,</text>
+  <text x="445.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">type check</text>
+  <path d="M342 41.0H367" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m2)"/>
+  <rect x="580" y="10" width="170" height="30" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="665.0" y="28.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">green: stop accepted</text>
+  <rect x="580" y="50" width="170" height="30" rx="7" style="fill:var(--bad-s);stroke:var(--bad)"/>
+  <text x="665.0" y="68.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">red: keep working</text>
+  <path d="M550 41L576 25" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m2)"/>
+  <path d="M550 41L576 65" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m2)"/>
+  <path d="M665 82V100H85V68" style="fill:none;stroke:var(--ink2);stroke-width:1.3;stroke-dasharray:4 3" marker-end="url(#m2)"/>
+  <text x="300" y="96" text-anchor="start" style="fill:var(--ink2);font-size:10px">failure output becomes the next input</text>
+  <rect x="10" y="118" width="740" height="76" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="380.0" y="139.7" text-anchor="middle" style="fill:var(--ink);font-size:9px">Claude Code: blocking the stop event keeps the agent working; a hook handler can be an agent that verifies before deciding;</text>
+  <text x="380.0" y="152.7" text-anchor="middle" style="fill:var(--ink);font-size:9px">  the paper lists a Verification subagent among the built-ins.  fx: a stop hook kind that can refuse to let the turn end.</text>
+  <text x="380.0" y="165.7" text-anchor="middle" style="fill:var(--ink);font-size:9px">Qwen Code and Codex: stop hooks.  Trae Agent: finishing requires calling its done tool, and its runs require a non-empty patch.</text>
+  <text x="380.0" y="178.7" text-anchor="middle" style="fill:var(--ink);font-size:9px">Kimi Code: its own development rules require lint to pass before any change ends.</text>
+</svg></div>
+<figcaption>Figure 2. The stop becomes a gate. The check is outside the model, so it adds information a second opinion from the same model cannot.</figcaption>
+</figure>
+
+<h3 id="d-judge">Decision 2. Who judges the work?</h3>
+<p>Judges differ in how much new information they add and how much they can be fooled.</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 220" width="760" style="max-width:100%;height:auto" role="img" aria-label="Evidence ladder">
+  <defs><marker id="m3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="10" width="230" height="40" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="125.0" y="33.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Deterministic checks</text>
+  <text x="252" y="34" text-anchor="start" style="fill:var(--ink2);font-size:10px">tests, type checker, linter, a diff: cannot be talked into passing</text>
+  <rect x="10" y="60" width="230" height="40" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="125.0" y="83.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Rubric-limited model review</text>
+  <text x="252" y="84" text-anchor="start" style="fill:var(--ink2);font-size:10px">Codex's review rubric: only discrete, actionable bugs introduced by the change</text>
+  <rect x="10" y="110" width="230" height="40" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="125.0" y="133.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Separate judge model</text>
+  <text x="252" y="134" text-anchor="start" style="fill:var(--ink2);font-size:10px">eve's judge; Anthropic's evaluator kept apart from the generator</text>
+  <rect x="10" y="160" width="230" height="40" rx="7" style="fill:var(--bad-s);stroke:var(--bad)"/>
+  <text x="125.0" y="183.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Same model, same context</text>
+  <text x="252" y="184" text-anchor="start" style="fill:var(--ink2);font-size:10px">"check your work": a second sample of the same reasoning</text>
+  <text x="10" y="212" text-anchor="start" style="fill:var(--ink2);font-size:10px">Stronger evidence at the top. Use the highest rung the task allows.</text>
+</svg></div>
+<figcaption>Figure 3. A rubric that limits a model reviewer to concrete bugs keeps real findings from being buried in speculation.</figcaption>
+</figure>
+
+<h3 id="d-unit">Decision 3. What does an eval run against?</h3>
+<p>An eval is only as good as its resemblance to real use. The harnesses choose different points on the spectrum from fast and fake to slow and real.</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 220" width="760" style="max-width:100%;height:auto" role="img" aria-label="Eval realism spectrum">
+  <defs><marker id="m4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <path d="M20 40H740" style="fill:none;stroke:var(--ink2);stroke-width:2"/>
+  <text x="20" y="26" text-anchor="start" style="fill:var(--ink);font-size:11px;font-weight:600">fast, fake</text>
+  <text x="740" y="26" text-anchor="end" style="fill:var(--ink);font-size:11px;font-weight:600">slow, real</text>
+  <circle cx="80" cy="40" r="6" style="fill:var(--kv)"/>
+  <text x="80" y="64" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">fake model</text>
+  <text x="80" y="80" text-anchor="middle" style="fill:var(--ink2);font-size:9px">Kimi Code, eve</text>
+  <text x="80" y="94" text-anchor="middle" style="fill:var(--ink2);font-size:9px">unit tests of the loop</text>
+  <circle cx="240" cy="40" r="6" style="fill:var(--kv)"/>
+  <text x="240" y="64" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">tool stubs</text>
+  <text x="240" y="80" text-anchor="middle" style="fill:var(--ink2);font-size:9px">eve</text>
+  <text x="240" y="94" text-anchor="middle" style="fill:var(--ink2);font-size:9px">fixed tool results</text>
+  <circle cx="400" cy="40" r="6" style="fill:var(--kv)"/>
+  <text x="400" y="64" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">live agent API</text>
+  <text x="400" y="80" text-anchor="middle" style="fill:var(--ink2);font-size:9px">eve evals</text>
+  <text x="400" y="94" text-anchor="middle" style="fill:var(--ink2);font-size:9px">same HTTP API as users</text>
+  <circle cx="560" cy="40" r="6" style="fill:var(--kv)"/>
+  <text x="560" y="64" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">containers</text>
+  <text x="560" y="80" text-anchor="middle" style="fill:var(--ink2);font-size:9px">Pi evals</text>
+  <text x="560" y="94" text-anchor="middle" style="fill:var(--ink2);font-size:9px">isolated runs per case</text>
+  <circle cx="700" cy="40" r="6" style="fill:var(--kv)"/>
+  <text x="700" y="64" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">benchmarks</text>
+  <text x="700" y="80" text-anchor="middle" style="fill:var(--ink2);font-size:9px">Trae Agent</text>
+  <text x="700" y="94" text-anchor="middle" style="fill:var(--ink2);font-size:9px">SWE-bench</text>
+  <rect x="10" y="116" width="740" height="88" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="380.0" y="143.7" text-anchor="middle" style="fill:var(--ink);font-size:9px">Kimi Code runs one end-to-end scenario on four surfaces (terminal, web, desktop, agent protocol), which works only because they</text>
+  <text x="380.0" y="156.7" text-anchor="middle" style="fill:var(--ink);font-size:9px">share one core (Chapter 12).  eve evals send messages to a running agent and assert on the turn: succeeded, called a tool,</text>
+  <text x="380.0" y="169.7" text-anchor="middle" style="fill:var(--ink);font-size:9px">the reply includes a phrase; reporters send results to observability tools.  Pi's evals expand every case into case x variant x</text>
+  <text x="380.0" y="182.7" text-anchor="middle" style="fill:var(--ink);font-size:9px">repetition and run each in its own container.  Trae Agent was built for SWE-bench and ships the evaluation harness with it.</text>
+</svg></div>
+<figcaption>Figure 4. Use the fast end for every commit and the slow end before a release. Both are needed.</figcaption>
+</figure>
+
+<h3 id="d-pair">Decision 4. How do you compare two versions?</h3>
+<p>Tasks differ from each other far more than two harness versions differ on any one task. If you compare overall averages, that task-to-task spread drowns the effect you are looking for. Compare per task instead.</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 240" width="760" style="max-width:100%;height:auto" role="img" aria-label="Paired comparison">
+  <defs><marker id="m5" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="60" y="150.0" width="26" height="30.0" rx="2" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="73.0" y="169.0" text-anchor="middle" style="fill:var(--ink);font-size:11px"></text>
+  <rect x="88" y="138.0" width="26" height="42.00000000000001" rx="2" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="101.0" y="163.0" text-anchor="middle" style="fill:var(--ink);font-size:11px"></text>
+  <rect x="145" y="45.0" width="26" height="135.0" rx="2" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="158.0" y="116.5" text-anchor="middle" style="fill:var(--ink);font-size:11px"></text>
+  <rect x="173" y="33.0" width="26" height="147.0" rx="2" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="186.0" y="110.5" text-anchor="middle" style="fill:var(--ink);font-size:11px"></text>
+  <rect x="230" y="105.0" width="26" height="75.0" rx="2" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="243.0" y="146.5" text-anchor="middle" style="fill:var(--ink);font-size:11px"></text>
+  <rect x="258" y="93.0" width="26" height="87.0" rx="2" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="271.0" y="140.5" text-anchor="middle" style="fill:var(--ink);font-size:11px"></text>
+  <rect x="315" y="75.0" width="26" height="105.0" rx="2" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="328.0" y="131.5" text-anchor="middle" style="fill:var(--ink);font-size:11px"></text>
+  <rect x="343" y="63.000000000000014" width="26" height="116.99999999999999" rx="2" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="356.0" y="125.5" text-anchor="middle" style="fill:var(--ink);font-size:11px"></text>
+  <rect x="400" y="127.5" width="26" height="52.5" rx="2" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="413.0" y="157.7" text-anchor="middle" style="fill:var(--ink);font-size:11px"></text>
+  <rect x="428" y="115.5" width="26" height="64.5" rx="2" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="441.0" y="151.7" text-anchor="middle" style="fill:var(--ink);font-size:11px"></text>
+  <rect x="485" y="60.0" width="26" height="120.0" rx="2" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="498.0" y="124.0" text-anchor="middle" style="fill:var(--ink);font-size:11px"></text>
+  <rect x="513" y="48.0" width="26" height="132.0" rx="2" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="526.0" y="118.0" text-anchor="middle" style="fill:var(--ink);font-size:11px"></text>
+  <rect x="570" y="90.0" width="26" height="90.0" rx="2" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="583.0" y="139.0" text-anchor="middle" style="fill:var(--ink);font-size:11px"></text>
+  <rect x="598" y="78.00000000000001" width="26" height="101.99999999999999" rx="2" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="611.0" y="133.0" text-anchor="middle" style="fill:var(--ink);font-size:11px"></text>
+  <rect x="655" y="157.5" width="26" height="22.5" rx="2" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="668.0" y="172.7" text-anchor="middle" style="fill:var(--ink);font-size:11px"></text>
+  <rect x="683" y="145.5" width="26" height="34.5" rx="2" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="696.0" y="166.7" text-anchor="middle" style="fill:var(--ink);font-size:11px"></text>
+  <path d="M40 180H740" style="fill:none;stroke:var(--ink2);stroke-width:1"/>
+  <text x="40" y="200" text-anchor="start" style="fill:var(--ink2);font-size:10px">tasks 1 to 8; white: version A pass rate, green: version B</text>
+  <text x="40" y="218" text-anchor="start" style="fill:var(--ink2);font-size:10px">Spread between tasks is huge; the difference within each pair is small but always in the same direction.</text>
+</svg></div>
+<figcaption>Figure 5. Illustrative numbers. Pairing removes the task-to-task spread. Pi's evals pair each case's two variants to compute lift.</figcaption>
+</figure>
+
+<p>Pi's documentation-lift evals are the template for any harness change: run every case without and with the change, several times each, in isolated containers, and report the per-case difference. Record tokens and cost alongside pass rate, because a change that adds one point of pass rate and doubles cost is usually a loss (fact 4).</p>
+
+<h3 id="d-trace">Decision 5. What does a trace record, and who sees it?</h3>
+<p>A trace is the record of what the harness actually did: every request, response, tool call and result, with timing and tokens. The design questions are completeness, privacy and faithfulness.</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 186" width="760" style="max-width:100%;height:auto" role="img" aria-label="Trace designs">
+  <defs><marker id="m6" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <text x="10" y="18" text-anchor="start" style="fill:var(--ink);font-size:12px;font-weight:600">Operational telemetry</text>
+  <text x="10" y="34" text-anchor="start" style="fill:var(--ink2);font-size:10px">Codex, eve, nanocode, Claude Code</text>
+  <rect x="10" y="44" width="238" height="86" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="129.0" y="76.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">OpenTelemetry spans and</text>
+  <text x="129.0" y="90.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">metrics to the team's own</text>
+  <text x="129.0" y="104.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">observability stack</text>
+  <rect x="10" y="142" width="238" height="34" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="129.0" y="162.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">aggregate health, cost, latency</text>
+  <text x="260" y="18" text-anchor="start" style="fill:var(--ink);font-size:12px;font-weight:600">Local debug traces</text>
+  <text x="260" y="34" text-anchor="start" style="fill:var(--ink2);font-size:10px">Codex</text>
+  <rect x="260" y="44" width="238" height="86" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="379.0" y="69.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">opt-in; nothing uploaded;</text>
+  <text x="379.0" y="83.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">raw prompts, responses, tools,</text>
+  <text x="379.0" y="97.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">compaction; replay by the</text>
+  <text x="379.0" y="111.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">same binary only</text>
+  <rect x="260" y="142" width="238" height="34" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="379.0" y="162.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">faithful replay for debugging</text>
+  <text x="510" y="18" text-anchor="start" style="fill:var(--ink);font-size:12px;font-weight:600">Trajectories for analysis</text>
+  <text x="510" y="34" text-anchor="start" style="fill:var(--ink2);font-size:10px">Trae Agent, Kimi Code</text>
+  <rect x="510" y="44" width="238" height="86" rx="7" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="629.0" y="76.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">every step to a file;</text>
+  <text x="629.0" y="90.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Trae labels each step;</text>
+  <text x="629.0" y="104.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Kimi has a replay visualiser</text>
+  <rect x="510" y="142" width="238" height="34" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="629.0" y="162.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">research and step-by-step review</text>
+</svg></div>
+<figcaption>Figure 6. Telemetry answers "how are we doing?"; a trace answers "what exactly happened in this run?". Codex keeps them separate on purpose.</figcaption>
+</figure>
+
+<p>Codex's documentation draws the line clearly: tracing is not telemetry. Its rollout traces are written only when a developer turns them on, contain the raw evidence of a run, and can be replayed into a graph for inspection, but only by the same binary that recorded them, so the replay cannot quietly disagree with what ran. Trae Agent solves a different problem, reading long trajectories: its Lakeview step asks a model to label every step twice, a general description in at most 10 words and bug-specific details in at most 30, so a person can scan a 200-step run. eve shows every session's turns, tool calls, reasoning, timing and token use in its platform dashboard with no instrumentation.</p>
+
+<h3 id="d-cost">Decision 6. How is cost counted?</h3>
+<p>Cost has to be attributable: which agent, which turn, which task spent it. nanocode computes tokens, dollars and machine time for each step as a pure function over the event log, then rolls them up by agent, turn, board task and commit. Because it is computed from the log, it can be recomputed for any past session when prices change, and it cannot disagree with what happened. Qwen Code keeps a usage dashboard and per-session token accounting; Chapter 2 covered how each provider's usage report is normalised.</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 160" width="760" style="max-width:100%;height:auto" role="img" aria-label="Cost fold">
+  <defs><marker id="m7" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="20" width="160" height="50" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="90.0" y="48.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">event log</text>
+  <rect x="200" y="20" width="160" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="280.0" y="41.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">per-step</text>
+  <text x="280.0" y="55.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">tokens, $, time</text>
+  <path d="M172 45.0H197" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m7)"/>
+  <rect x="390" y="20" width="160" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="470.0" y="41.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">roll up by agent,</text>
+  <text x="470.0" y="55.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">turn, task, commit</text>
+  <path d="M362 45.0H387" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m7)"/>
+  <rect x="580" y="20" width="160" height="50" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="660.0" y="41.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">dashboards and</text>
+  <text x="660.0" y="55.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">eval reports</text>
+  <path d="M552 45.0H577" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m7)"/>
+  <text x="10" y="110" text-anchor="start" style="fill:var(--ink2);font-size:10px">Pure function over the log: recompute any time, attribute every dollar, no separate counter to drift.</text>
+</svg></div>
+<figcaption>Figure 7. nanocode's cost fold. The same idea as Chapter 6: the log is the truth, everything else is a projection.</figcaption>
+</figure>
+
+<h3 id="d-perf">Decision 7. Is the harness's own speed tested?</h3>
+<p>A harness adds latency on every step and every keystroke. fx treats that as a correctness property: its continuous integration fails a pull request if any benchmarked command (such as help or status) takes more than 2 ms on Linux, and release binaries must fit a size budget. It also benchmarks long-turn memory and approval review. nanocode's simulator checks its memory invariants as numbers. Without such tests, a harness gets slower one reasonable change at a time.</p>
+
+<h3 id="d-signals">Decision 8. Do guards double as measurements?</h3>
+<p>The guards from earlier chapters (loop detection, duplicate-call detection, the compaction circuit breaker, the repeat breaker) each fire for a reason. Qwen Code records why a turn stopped, so the guards become signals: a rise in loop-detector stops after a model change is a regression found without a single new eval. Codex records turn aborts as typed items; Kimi Code's repeat breaker escalates in stages that can be counted (Chapter 4).</p>
+
+<h3 id="d-failures">Decision 9. How do real failures become tests?</h3>
+<p>Mitchell Hashimoto's habit is the simplest form of loop 3 feeding loop 2: every time the agent makes a mistake, change the harness (a line in AGENTS.md, a tool, a hook) so it cannot make that mistake again. Made measurable, it becomes: save the failing session, turn it into an eval case with a check, make the fix pass it, and keep the case forever. Pair it with Chapter 4's zero-tolerance rule for AGENTS.md: every line traces to a recorded failure.</p>
+
+<h3 id="d-review">Decision 10. Who reviews what the agent produced?</h3>
+<p>For coding agents, the final check is often a review of the diff. Codex has a review command with a rubric limited to concrete bugs the change introduced. Claude Code and Qwen Code have review commands and agents. Trae Agent, for benchmarks, generates many candidate patches, runs regression tests, and lets a selector agent choose among the survivors (Chapter 14). The common rule: the reviewer must not be the context that wrote the code, or it will share its blind spots.</p>
+
+<h2 id="harnesses">3. Verification and observability in each harness</h2>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 116" width="760" style="max-width:100%;height:auto" role="img" aria-label="Pi">
+  <defs><marker id="m8" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="16" width="134" height="50" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="77.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">cases</text>
+  <rect x="161" y="16" width="134" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="228.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">x variant</text>
+  <text x="228.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">x repetition</text>
+  <path d="M146 41.0H158" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m8)"/>
+  <rect x="312" y="16" width="134" height="50" rx="7" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="379.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">one container</text>
+  <text x="379.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">each</text>
+  <path d="M297 41.0H309" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m8)"/>
+  <rect x="463" y="16" width="134" height="50" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="530.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">paired lift</text>
+  <path d="M448 41.0H460" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m8)"/>
+  <rect x="614" y="16" width="134" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="681.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">telemetry</text>
+  <text x="681.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">contracts</text>
+  <path d="M599 41.0H611" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m8)"/>
+  <text x="10" y="98" text-anchor="start" style="fill:var(--ink2);font-size:10px">The telemetry package defines vendor-neutral contracts with conformance tests.</text>
+</svg></div>
+<figcaption>Figure 8. Pi. The cleanest A/B method here.</figcaption>
+</figure>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 116" width="760" style="max-width:100%;height:auto" role="img" aria-label="eve">
+  <defs><marker id="m9" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="16" width="134" height="50" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="77.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">eval files</text>
+  <rect x="161" y="16" width="134" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="228.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">live agent</text>
+  <text x="228.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">HTTP API</text>
+  <path d="M146 41.0H158" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m9)"/>
+  <rect x="312" y="16" width="134" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="379.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">stubs, mock</text>
+  <text x="379.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">model, judge</text>
+  <path d="M297 41.0H309" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m9)"/>
+  <rect x="463" y="16" width="134" height="50" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="530.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">reporters</text>
+  <path d="M448 41.0H460" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m9)"/>
+  <rect x="614" y="16" width="134" height="50" rx="7" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="681.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Agent Runs</text>
+  <text x="681.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">dashboard</text>
+  <path d="M599 41.0H611" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m9)"/>
+  <text x="10" y="98" text-anchor="start" style="fill:var(--ink2);font-size:10px">Assertions: the turn succeeded, a tool was called, the reply includes a phrase.</text>
+</svg></div>
+<figcaption>Figure 9. eve. Evals talk to the real agent.</figcaption>
+</figure>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 116" width="760" style="max-width:100%;height:auto" role="img" aria-label="fx">
+  <defs><marker id="m10" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="16" width="134" height="50" rx="7" style="fill:var(--bad-s);stroke:var(--bad)"/>
+  <text x="77.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">2 ms command</text>
+  <text x="77.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">budget in CI</text>
+  <rect x="161" y="16" width="134" height="50" rx="7" style="fill:var(--bad-s);stroke:var(--bad)"/>
+  <text x="228.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">binary size</text>
+  <text x="228.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">budget</text>
+  <path d="M146 41.0H158" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m10)"/>
+  <rect x="312" y="16" width="134" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="379.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">memory and</text>
+  <text x="379.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">review benchmarks</text>
+  <path d="M297 41.0H309" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m10)"/>
+  <rect x="463" y="16" width="134" height="50" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="530.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">stop hook</text>
+  <path d="M448 41.0H460" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m10)"/>
+  <rect x="614" y="16" width="134" height="50" rx="7" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="681.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">trace view</text>
+  <path d="M599 41.0H611" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m10)"/>
+  <text x="10" y="98" text-anchor="start" style="fill:var(--ink2);font-size:10px">Performance regressions fail the build like broken tests.</text>
+</svg></div>
+<figcaption>Figure 10. fx. Speed is a test.</figcaption>
+</figure>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 116" width="760" style="max-width:100%;height:auto" role="img" aria-label="nanocode">
+  <defs><marker id="m11" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="16" width="134" height="50" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="77.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">event log</text>
+  <rect x="161" y="16" width="134" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="228.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">cost fold</text>
+  <path d="M146 41.0H158" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m11)"/>
+  <rect x="312" y="16" width="134" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="379.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">roll-ups</text>
+  <path d="M297 41.0H309" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m11)"/>
+  <rect x="463" y="16" width="134" height="50" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="530.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">simulator for</text>
+  <text x="530.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">invariants</text>
+  <path d="M448 41.0H460" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m11)"/>
+  <rect x="614" y="16" width="134" height="50" rx="7" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="681.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">OpenTelemetry</text>
+  <path d="M599 41.0H611" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m11)"/>
+  <text x="10" y="98" text-anchor="start" style="fill:var(--ink2);font-size:10px">Cost per agent, turn, task and commit, recomputable from the log.</text>
+</svg></div>
+<figcaption>Figure 11. nanocode. Accounting as a projection.</figcaption>
+</figure>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 116" width="760" style="max-width:100%;height:auto" role="img" aria-label="Codex">
+  <defs><marker id="m12" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="16" width="134" height="50" rx="7" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="77.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">OpenTelemetry</text>
+  <rect x="161" y="16" width="134" height="50" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="228.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">opt-in rollout</text>
+  <text x="228.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">traces</text>
+  <path d="M146 41.0H158" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m12)"/>
+  <rect x="312" y="16" width="134" height="50" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="379.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">same-binary</text>
+  <text x="379.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">replay</text>
+  <path d="M297 41.0H309" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m12)"/>
+  <rect x="463" y="16" width="134" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="530.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">review rubric</text>
+  <path d="M448 41.0H460" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m12)"/>
+  <rect x="614" y="16" width="134" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="681.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">stop hooks</text>
+  <path d="M599 41.0H611" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m12)"/>
+  <text x="10" y="98" text-anchor="start" style="fill:var(--ink2);font-size:10px">Tracing is not telemetry: nothing is uploaded.</text>
+</svg></div>
+<figcaption>Figure 12. Codex. Faithful local traces, separate from telemetry.</figcaption>
+</figure>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 116" width="760" style="max-width:100%;height:auto" role="img" aria-label="Claude Code">
+  <defs><marker id="m13" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="16" width="134" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="77.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">stop hook</text>
+  <rect x="161" y="16" width="134" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="228.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">agent handler</text>
+  <text x="228.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">verifies</text>
+  <path d="M146 41.0H158" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m13)"/>
+  <rect x="312" y="16" width="134" height="50" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="379.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Verification</text>
+  <text x="379.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">subagent</text>
+  <path d="M297 41.0H309" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m13)"/>
+  <rect x="463" y="16" width="134" height="50" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="530.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">transcripts</text>
+  <path d="M448 41.0H460" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m13)"/>
+  <rect x="614" y="16" width="134" height="50" rx="7" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="681.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">OpenTelemetry</text>
+  <path d="M599 41.0H611" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m13)"/>
+  <text x="10" y="98" text-anchor="start" style="fill:var(--ink2);font-size:10px">Checks run outside the context that produced the work.</text>
+</svg></div>
+<figcaption>Figure 13. Claude Code. Verification as a hook and as an agent.</figcaption>
+</figure>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 116" width="760" style="max-width:100%;height:auto" role="img" aria-label="Kimi Code">
+  <defs><marker id="m14" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="16" width="134" height="50" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="77.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">fake model</text>
+  <rect x="161" y="16" width="134" height="50" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="228.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">one scenario,</text>
+  <text x="228.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">four surfaces</text>
+  <path d="M146 41.0H158" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m14)"/>
+  <rect x="312" y="16" width="134" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="379.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">lint before</text>
+  <text x="379.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">any change ends</text>
+  <path d="M297 41.0H309" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m14)"/>
+  <rect x="463" y="16" width="134" height="50" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="530.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">event logs</text>
+  <path d="M448 41.0H460" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m14)"/>
+  <rect x="614" y="16" width="134" height="50" rx="7" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="681.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">replay</text>
+  <text x="681.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">visualiser</text>
+  <path d="M599 41.0H611" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m14)"/>
+  <text x="10" y="98" text-anchor="start" style="fill:var(--ink2);font-size:10px">Shared core makes cross-surface tests possible.</text>
+</svg></div>
+<figcaption>Figure 14. Kimi Code. Test the core once, prove it everywhere.</figcaption>
+</figure>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 116" width="760" style="max-width:100%;height:auto" role="img" aria-label="Qwen Code">
+  <defs><marker id="m15" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="16" width="134" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="77.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">guards record</text>
+  <text x="77.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">stop reasons</text>
+  <rect x="161" y="16" width="134" height="50" rx="7" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="228.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">usage</text>
+  <text x="228.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">dashboard</text>
+  <path d="M146 41.0H158" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m15)"/>
+  <rect x="312" y="16" width="134" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="379.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">stop hooks</text>
+  <path d="M297 41.0H309" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m15)"/>
+  <rect x="463" y="16" width="134" height="50" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="530.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">review agents</text>
+  <path d="M448 41.0H460" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m15)"/>
+  <text x="10" y="98" text-anchor="start" style="fill:var(--ink2);font-size:10px">Loop and duplicate detection double as regression signals.</text>
+</svg></div>
+<figcaption>Figure 15. Qwen Code. Every guard is a measurement.</figcaption>
+</figure>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 116" width="760" style="max-width:100%;height:auto" role="img" aria-label="Trae Agent">
+  <defs><marker id="m16" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="16" width="134" height="50" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="77.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">trajectory</text>
+  <text x="77.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">per run</text>
+  <rect x="161" y="16" width="134" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="228.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Lakeview labels:</text>
+  <text x="228.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">10 and 30 words</text>
+  <path d="M146 41.0H158" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m16)"/>
+  <rect x="312" y="16" width="134" height="50" rx="7" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="379.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">SWE-bench</text>
+  <text x="379.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">harness</text>
+  <path d="M297 41.0H309" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m16)"/>
+  <rect x="463" y="16" width="134" height="50" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="530.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">regression</text>
+  <text x="530.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">tests</text>
+  <path d="M448 41.0H460" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m16)"/>
+  <rect x="614" y="16" width="134" height="50" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="681.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">selector agent</text>
+  <path d="M599 41.0H611" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m16)"/>
+  <text x="10" y="98" text-anchor="start" style="fill:var(--ink2);font-size:10px">The harness most shaped by evaluation.</text>
+</svg></div>
+<figcaption>Figure 16. Trae Agent. Built to be measured.</figcaption>
+</figure>
+
+<h2 id="compare">4. All nine in one table</h2>
 <div class="tbl"><table>
-  <tr><th>Decision</th><th>eve</th><th>Pi</th><th>fx</th><th>nanocode</th></tr>
-  <tr><td>Eval unit</td><td>Eval file against the live HTTP API</td><td>Case x variant x repetition in containers</td><td>Benchmarks and tests in CI</td><td>Simulator and tests</td></tr>
-  <tr><td>Grading</td><td>Assertions, judge, tool stubs</td><td>Paired lift</td><td>Time and size budgets</td><td>Invariant bounds</td></tr>
-  <tr><td>Observability</td><td>Agent Runs dashboard, OpenTelemetry</td><td>Telemetry contracts</td><td>/trace, debug traces</td><td>Cost fold, OpenTelemetry spans</td></tr>
-</table></div>
-<p>The same decisions in the five reference harnesses:</p>
-<div class="tbl"><table>
-  <tr><th>Decision</th><th>Codex</th><th>Claude Code</th><th>Kimi Code</th><th>Qwen Code</th><th>Trae Agent</th></tr>
-<tr><td>Traces</td><td>OpenTelemetry; opt-in local rollout traces, same-binary replay</td><td>Transcripts; OpenTelemetry</td><td>Event log plus replay visualiser</td><td>Recording and telemetry</td><td>Trajectory JSON plus Lakeview labels</td></tr>
-<tr><td>Check before stop</td><td>Stop hooks</td><td>Subagent-verifier hooks; Verification agent</td><td>Max-steps and other blocking hooks</td><td>Stop hooks</td><td><code>task_done</code> plus non-empty patch</td></tr>
-<tr><td>Harness tests</td><td>Large Rust test suite</td><td>Not public</td><td>Fake model; one scenario on four surfaces</td><td>Unit and integration tests</td><td>SWE-bench runs and ablations</td></tr>
-<tr><td>Review</td><td><code>codex review</code> rubric</td><td>Review commands and agents</td><td>n/a</td><td>Review agents</td><td>Selector agent over candidate patches</td></tr>
+  <tr><th>Harness</th><th>Checked stop</th><th>Judge</th><th>Eval unit</th><th>Traces</th><th>Cost</th><th>Harness performance</th></tr>
+  <tr><td>Pi</td><td>Extensions</td><td>Per eval</td><td>Case x variant x repetition, containers</td><td>Telemetry contracts</td><td>Usage entries</td><td>Not described here</td></tr>
+  <tr><td>eve</td><td>Hooks</td><td>Assertions + judge</td><td>Eval files on the live API</td><td>Agent Runs, OpenTelemetry</td><td>Per turn in dashboard</td><td>Not described here</td></tr>
+  <tr><td>fx</td><td>Stop hook kind</td><td>Not described here</td><td>Benchmarks and tests</td><td>Trace view</td><td>Not described here</td><td>2 ms commands, size budget</td></tr>
+  <tr><td>nanocode</td><td>Not described here</td><td>Not described here</td><td>Simulator and tests</td><td>OpenTelemetry</td><td>Cost fold by agent, turn, task, commit</td><td>Invariant checks</td></tr>
+  <tr><td>Codex</td><td>Stop hooks</td><td>Review rubric</td><td>Large test suite</td><td>OpenTelemetry + opt-in local traces</td><td>Token accounting</td><td>Not described here</td></tr>
+  <tr><td>Claude Code</td><td>Stop hooks, agent verifier</td><td>Verification agent, review</td><td>Not public</td><td>Transcripts, OpenTelemetry</td><td>Per session</td><td>Not public</td></tr>
+  <tr><td>Kimi Code</td><td>Hooks; lint rule</td><td>Not described here</td><td>Fake model; four-surface e2e</td><td>Event logs, visualiser</td><td>Usage feature</td><td>Not described here</td></tr>
+  <tr><td>Qwen Code</td><td>Stop hooks</td><td>Review agents</td><td>Unit and integration</td><td>Recording, telemetry</td><td>Usage dashboard</td><td>Not described here</td></tr>
+  <tr><td>Trae Agent</td><td>Done tool, non-empty patch</td><td>Selector agent</td><td>SWE-bench</td><td>Trajectories + Lakeview</td><td>In trajectory</td><td>n/a</td></tr>
 </table></div>
 
-<h2 id="research">4. Research and the Chinese view</h2>
+<h2 id="choose">5. Choosing what to build first</h2>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 274" width="760" style="max-width:100%;height:auto" role="img" aria-label="Choosing verification">
+  <defs><marker id="m17" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="10" width="280" height="52" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="150.0" y="32.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Does the agent declare</text>
+  <text x="150.0" y="46.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">success too early?</text>
+  <rect x="340" y="10" width="410" height="52" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="545.0" y="32.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">A checked stop: tests and lint must pass,</text>
+  <text x="545.0" y="46.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">failure output goes back as input</text>
+  <path d="M292 36H336" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m17)"/>
+  <text x="300" y="30" text-anchor="start" style="fill:var(--ink2);font-size:10px">yes</text>
+  <rect x="10" y="76" width="280" height="52" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="150.0" y="98.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Are you changing the</text>
+  <text x="150.0" y="112.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">harness?</text>
+  <rect x="340" y="76" width="410" height="52" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="545.0" y="98.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">A fixed task set, repeated, paired A/B, with</text>
+  <text x="545.0" y="112.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">pass rate, tokens and cost per task</text>
+  <path d="M292 102H336" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m17)"/>
+  <text x="300" y="96" text-anchor="start" style="fill:var(--ink2);font-size:10px">yes</text>
+  <rect x="10" y="142" width="280" height="52" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="150.0" y="164.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Can you not explain a</text>
+  <text x="150.0" y="178.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">bad run?</text>
+  <rect x="340" y="142" width="410" height="52" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="545.0" y="164.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Full local traces with step labels; replay by</text>
+  <text x="545.0" y="178.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">the same code that recorded them</text>
+  <path d="M292 168H336" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m17)"/>
+  <text x="300" y="162" text-anchor="start" style="fill:var(--ink2);font-size:10px">yes</text>
+  <rect x="10" y="208" width="280" height="52" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="150.0" y="230.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Is it getting slower or</text>
+  <text x="150.0" y="244.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">costlier?</text>
+  <rect x="340" y="208" width="410" height="52" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="545.0" y="237.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Cost fold from the log; latency budgets in CI</text>
+  <path d="M292 234H336" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m17)"/>
+  <text x="300" y="228" text-anchor="start" style="fill:var(--ink2);font-size:10px">yes</text>
+</svg></div>
+<figcaption>Figure 17. Build the checked stop first: it improves results immediately. Build the paired eval before your second harness change.</figcaption>
+</figure>
+
+<p>This book's setup: a stop gate that runs your tests, a JSONL trace per run with per-step tokens and cost, a cost fold over the trace, and a paired eval runner that runs every case with both versions three times in containers.</p>
+
+<h2 id="research">6. Research and the Chinese view</h2>
 <ul>
-  <li><strong>Self-verification is the biggest lever.</strong> LangChain's Terminal Bench gains came mostly from making the agent verify its work and from tracing (<a href="https://langchain.com/blog/improving-deep-agents-with-harness-engineering">LangChain</a>).</li>
-  <li><strong>Harness optimization from traces.</strong> Meta-Harness gives a coding agent the raw traces, code and scores of past harness versions and lets it propose the next one; the access to raw traces, not summaries, is the key (<a href="https://arxiv.org/html/2603.28052v1">Meta-Harness</a>). JIT-Agent and test-time harness evolution extend this (<a href="https://arxiv.org/pdf/2608.25593">arXiv 2608.25593</a>).</li>
-  <li><strong>Scores mix model and harness.</strong> A Sep 2026 survey proposes evaluating model, harness, environment and evaluator as four separate factors (<a href="https://www.preprints.org/manuscript/202609.2140">survey</a>).</li>
-  <li><strong>Chinese view.</strong> Chinese write-ups describe harness feedback as "semantic gradient descent": natural-language feedback steers outputs the way numeric gradients steer weights (<a href="https://adg.csdn.net/6a5822cf10ee7a33f28df343.html">CSDN</a>). Alibaba published Terminal-Bench Pro as a harder benchmark.</li>
+  <li><strong>Self-verification is the biggest lever.</strong> LangChain's Terminal Bench gains came mostly from making the agent verify its work and from tracing.</li>
+  <li><strong>Harness optimisation from traces.</strong> Meta-Harness gives a coding agent the raw traces, code and scores of past harness versions and lets it propose the next; access to raw traces rather than summaries is the key. Later work on test-time harness evolution extends this.</li>
+  <li><strong>Scores mix model and harness.</strong> A September 2026 survey proposes evaluating model, harness, environment and evaluator as four separate factors.</li>
+  <li><strong>Chinese view.</strong> Chinese write-ups describe harness feedback as semantic gradient descent: natural-language feedback steers outputs the way numeric gradients steer weights. Alibaba published Terminal-Bench Pro as a harder benchmark, and ByteDance's Trae Agent is the most evaluation-shaped harness in this book.</li>
 </ul>
 
-<h2 id="build">5. Build: traces, cost and a paired eval runner</h2>
+<h2 id="build">7. Build: traces, cost and a paired eval runner</h2>
 <pre>&quot;&quot;&quot;Traces, cost, and a paired A/B eval runner: the harness&#x27;s feedback loop.&quot;&quot;&quot;
 import json, shutil, statistics, subprocess, tempfile, time, uuid
 from contextlib import contextmanager
@@ -183,31 +658,36 @@ def compare(agent_a, agent_b, tasks, repo, repeats=3):
   <li>Plot pass rate from week 1 to now. This is the most shareable chart of the book.</li>
 </ol>
 
-<h2 id="exercises">6. Exercises</h2>
+
+<h2 id="exercises">8. Exercises</h2>
 <ol>
-  <li>Add a stop hook that runs <code>check.sh</code>-style verification before the agent may finish. How much does pass rate move?</li>
-  <li>Add a bootstrap confidence interval to <code>compare</code> so you can say whether a lift is real.</li>
-  <li>Add a performance budget like fx's: fail CI if starting your harness and printing help takes more than 300 ms.</li>
+  <li><strong>Checked stop.</strong> Refuse the stop while tests fail and feed the failure back. Count early "done" claims before and after over 20 tasks.</li>
+  <li><strong>Paired versus unpaired.</strong> Run versions A and B three times on 20 tasks. Compute the difference with overall averages and with per-task pairs. How many runs does each method need to see a 5-point gain?</li>
+  <li><strong>Step labels.</strong> Add a Lakeview-style pass that labels each step in at most 10 words. Can you find where a failed run went wrong in under a minute?</li>
+  <li><strong>Cost fold.</strong> Compute cost per turn and per task from your trace alone. Change a price and recompute last week's sessions.</li>
+  <li><strong>Latency budget.</strong> Add a CI test that fails if starting your harness or rendering a step takes longer than a budget you choose.</li>
 </ol>
 
-<h2 id="quiz">7. Check yourself</h2>
+<h2 id="quiz">9. Check yourself</h2>
 <div class="widget quiz" data-quiz="qz10"></div>
 <script type="application/json" id="qz10">[
-{"q":"Pi's documentation-lift evals run each case:","o":["Once","Twice, without_docs and with_docs, in isolated containers, with repetitions","Only with docs","On the user's machine"],"a":1,"e":"Paired arms let them report the lift caused by the docs."},
-{"q":"What does fx's CI fail on?","o":["Low test coverage","Any benchmarked command over 2 ms on Linux","Model errors","Lint warnings only"],"a":1,"e":"Performance budgets are enforced like tests."},
-{"q":"How do eve evals reach the agent?","o":["By importing its code","Over the same HTTP API as users, through the TypeScript client","Through the model API directly","By reading transcripts"],"a":1,"e":"A passing eval proves the real server started, accepted a request and produced the asserted result."},
-{"q":"Why repeat each task several times?","o":["To use more tokens","Agent runs are random; single runs cannot separate a real improvement from noise","Benchmarks require it","To warm the cache"],"a":1,"e":"Repetition plus pairing is the minimum for honest comparisons."},
-{"q":"What made Meta-Harness effective?","o":["A bigger model","Giving the optimizing agent raw traces, code and scores of earlier harnesses instead of summaries","Human review","Random search"],"a":1,"e":"Raw traces let the proposer diagnose specific failures."}
+{"q":"Why can't the model verify its own work by thinking harder?","o":["It is too slow","The check is another sample from the same model on the same context; only an outside check adds information","Providers forbid it","It lacks tools"],"a":1,"e":"Tests, type checkers and diffs add information."},
+{"q":"Why compare harness versions per task rather than by overall average?","o":["It is faster","Tasks differ far more than versions do, and pairing removes that spread","Averages are wrong","Providers require it"],"a":1,"e":"Pi's evals pair each case's two variants to compute lift."},
+{"q":"What does Codex's review rubric limit findings to?","o":["Style issues","Discrete, actionable bugs introduced by the change","All possible risks","Performance only"],"a":1,"e":"It keeps real findings from being buried in speculation."},
+{"q":"What is the difference between Codex's telemetry and its rollout traces?","o":["None","Telemetry exports operational data; rollout traces are opt-in, local, contain raw evidence and replay only with the same binary","Traces are uploaded","Telemetry is replayable"],"a":1,"e":"Tracing is not telemetry."},
+{"q":"What does Trae Agent's Lakeview produce?","o":["Patches","Two labels per step: a general one in at most 10 words and a specific one in at most 30","Cost reports","Test cases"],"a":1,"e":"It makes long trajectories scannable."},
+{"q":"Why does nanocode compute cost as a pure function over the log?","o":["It is faster","It can be recomputed and attributed by agent, turn, task and commit, and cannot drift from what happened","Providers report no usage","For privacy"],"a":1,"e":"The log is the truth; accounting is a projection."},
+{"q":"What does fx's CI enforce besides correctness?","o":["Code style","A 2 ms budget for benchmarked commands on Linux and a binary size budget","Test coverage","Documentation"],"a":1,"e":"Speed regressions fail the build."},
+{"q":"How does Kimi Code test its four surfaces?","o":["Separately","One end-to-end scenario run on terminal, web, desktop and agent protocol, possible because they share one core","Manually","It does not"],"a":1,"e":"A shared core makes cross-surface tests cheap."}
 ]</script>
 
-<h2 id="refs">8. References</h2>
+<h2 id="refs">10. References</h2>
 <ul>
-  <li>eve: <code>docs/evals/</code>, <code>packages/eve/src/evals/</code>; <a href="https://vercel.com/eve?utm_id=fossy.dev">Agent Runs</a>.</li>
-  <li>Pi: <code>packages/evals/README.md</code>, <code>packages/telemetry</code>.</li>
-  <li>fx: <code>README.md</code> (2 ms budget), <code>benchmarks/</code>.</li>
-  <li>nanocode: <code>crates/core/cost-fold</code>, <code>docs/memory-invariant.md</code>.</li>
-  <li><a href="https://arxiv.org/html/2603.28052v1">Meta-Harness: End-to-End Optimization of Model Harnesses</a>, 2026.</li>
-  <li><a href="https://langchain.com/blog/improving-deep-agents-with-harness-engineering">Improving Deep Agents with harness engineering</a>, LangChain, Feb 2026.</li>
+  <li>Pi: <a href="https://github.com/earendil-works/pi">github.com/earendil-works/pi</a> (fb248c7). eve: <a href="https://github.com/vercel/eve">github.com/vercel/eve</a> (5c52fbf), evals documentation. fx: <a href="https://github.com/vercel-labs/fx">github.com/vercel-labs/fx</a> (cbe7daf). nanocode: <a href="https://github.com/gakonst/nanocode">github.com/gakonst/nanocode</a> (015cbfa).</li>
+  <li>Codex CLI: <a href="https://github.com/openai/codex">github.com/openai/codex</a> (50aeac2), including its rollout-trace notes and review rubric.</li>
+  <li>Claude Code: <a href="https://code.claude.com/docs/en/hooks">Hooks</a>; Dive into Claude Code, arXiv 2604.14228.</li>
+  <li>Kimi Code: <a href="https://github.com/MoonshotAI/kimi-code">github.com/MoonshotAI/kimi-code</a> (111aae2). Qwen Code: <a href="https://github.com/QwenLM/qwen-code">github.com/QwenLM/qwen-code</a> (c56424fc). Trae Agent: <a href="https://github.com/bytedance/trae-agent">github.com/bytedance/trae-agent</a> (e839e55).</li>
+  <li>Improving Deep Agents with harness engineering, LangChain, Feb 2026. Meta-Harness: End-to-End Optimization of Model Harnesses, 2026.</li>
 </ul>
 
 <div class="navfoot"></div>
