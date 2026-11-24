@@ -15,90 +15,483 @@
 <main><article>
 <div class="kicker">Stage 4 · Durability and surfaces · Chapter 11</div>
 <h1>Durable execution</h1>
-<p class="lede">Processes crash and machines sleep (fact 6), and the model holds none of the agent's state (fact 2), so a terminal agent dies with its process. A durable agent survives crashes, redeploys and a laptop lid, and can wait days for a human. This is where eve, Pi Durable and nanocode converged independently in 2026, each in its own way. This chapter reads Pi Durable's 7,300-line specification, eve's workflow-backed sessions and nanocode's journaled runtime, then builds a SQLite journal with the "effect sandwich" and tests it by crashing the agent mid-task.</p>
+<p class="lede">Processes die: a laptop sleeps, a deploy replaces a server, a container is killed. Because the model keeps nothing (fact 2), restoring the agent's mind is easy: replay what the harness wrote down. Restoring the world is not (fact 6): a crash between "push the branch" and "the push succeeded" leaves a question the message list cannot answer. This chapter derives the effect sandwich that answers it, then takes ten design decisions: what to journal and how often, what to do with an effect of unknown outcome, torn writes, who hosts the journal, deploys and version upgrades, single writers, authority after a resume, reconnecting clients and what durability deliberately does not promise. It shows each harness's recovery path and keeps the journal you build.</p>
 <div class="meta">
   <span class="chip">Level: advanced</span>
-  <span class="chip">Time: about 20 hours with the build</span>
-  <span class="chip">Needs: Chapters 1, 6 and 10</span>
-  <span class="chip">Code read at: Pi fb248c7, eve 5c52fbf, nanocode 015cbfa</span>
+  <span class="chip">Time: about 14 hours with the build</span>
+  <span class="chip">Needs: Chapters 1 to 10</span>
+  <span class="chip">Harnesses read: Pi, eve, fx, nanocode, Codex, Claude Code, Kimi Code, Qwen Code, Trae Agent</span>
 </div>
 
 <div class="box skip">
   <span class="lbl">Before you start: skip check</span>
   <ol>
-    <li>The agent sends an email, then the process dies before saving that it did. On restart, what should happen?</li>
-    <li>What is the difference between replaying a model call and repeating it?</li>
-    <li>Why can only some tool calls be safely re-run?</li>
+    <li>Why is restoring the model's state after a crash easy, and restoring the world's state hard?</li>
+    <li>On restart the journal shows "intent: send email" with no outcome. Name three things the harness could do.</li>
+    <li>Claude Code deliberately does not save a session's permission bypass flag to the transcript. Why?</li>
+    <li>Kimi Code reports a corrupted last line in its log instead of failing the session. Why is that the right default?</li>
   </ol>
   <details><summary>Answers</summary><ol>
-    <li>Not send it again blindly. The harness knows it started (intent recorded) but not whether it finished, so it tells the agent the outcome is unknown and lets it check, or polls an external handle.</li>
-    <li>Replaying returns the recorded result from the journal; repeating calls the model again, costs money and may return something different.</li>
-    <li>Only idempotent ones (reads, pure computations, "set X to 5") give the same result when run twice. "Append a line", "charge a card" or "send an email" do not.</li>
+    <li>The model's whole state is the history the harness wrote (fact 2); any process can replay it. The world changed outside the process, and a crash in the gap between doing and recording leaves the outcome unknown (fact 6).</li>
+    <li>Re-run it if it is safe to repeat; check an external handle (look for the sent message); or tell the agent the outcome is unknown and let it or the user decide.</li>
+    <li>Durable state and durable authority are different. A temporary grant should not outlive the process the user granted it to.</li>
+    <li>A crash mid-write produces exactly that: a torn last line. Everything before it is intact, so losing one partial record is better than losing the session.</li>
   </ol></details>
 </div>
 
+
 <h2 id="problem">1. The problem in one picture</h2>
-<p>Reduce durability to its smallest question: after a crash, what does the new process need to continue exactly where the old one stopped? By fact 2 the model contributes nothing; any model can read the saved history and carry on. So the answer is only what the harness wrote down. If it wrote the message list after every step, the new process can rebuild the agent's mind. That part is easy.</p>
-<p>The hard part is the world (fact 6). Between "the model asked for <code>git push</code>" and "the result was appended", the push happens outside your process. A crash in that gap leaves a question that cannot be answered from the message list: did it run? Running it again might push twice or send a second email. Skipping it might lose the change. The only honest design is to write down your intent before the effect, write down the outcome after, and when you restart with an intent but no outcome, treat it as unknown: re-run it only if it is safe to repeat, otherwise ask or tell the model what is uncertain.</p>
+<p>Ask the smallest question: after a crash, what does a new process need to continue exactly where the old one stopped? The model contributes nothing; any model can read the saved history and carry on. So the answer is only what the harness wrote down. If it wrote every step, the agent's mind is back. The hard part is the world.</p>
+
 <figure>
-<div class="svgwrap"><svg viewBox="0 0 760 230" width="760" style="max-width:100%;height:auto" role="img" aria-label="The effect sandwich: commit intent, perform effect, commit outcome; a crash between them leaves an unknown outcome">
-  <defs><marker id="g1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
-  <rect x="24" y="40" width="190" height="64" rx="8" style="fill:var(--kv-s);stroke:var(--kv)"/><text x="119" y="66" text-anchor="middle" style="fill:var(--ink);font-size:12px;font-weight:600">1. Commit intent</text><text x="119" y="86" text-anchor="middle" style="fill:var(--ink2);font-size:10px">journal: key, phase=intent</text>
-  <rect x="284" y="40" width="190" height="64" rx="8" style="fill:var(--dec-s);stroke:var(--dec)"/><text x="379" y="66" text-anchor="middle" style="fill:var(--ink);font-size:12px;font-weight:600">2. Perform effect</text><text x="379" y="86" text-anchor="middle" style="fill:var(--ink2);font-size:10px">model call, tool, API</text>
-  <rect x="544" y="40" width="190" height="64" rx="8" style="fill:var(--kv-s);stroke:var(--kv)"/><text x="639" y="66" text-anchor="middle" style="fill:var(--ink);font-size:12px;font-weight:600">3. Commit outcome</text><text x="639" y="86" text-anchor="middle" style="fill:var(--ink2);font-size:10px">journal: phase=done, result</text>
-  <g style="fill:none;stroke:var(--ink2);stroke-width:1.3"><path d="M214 72H282" marker-end="url(#g1)"/><path d="M474 72H542" marker-end="url(#g1)"/></g>
-  <path d="M508 112V140" style="stroke:var(--bad);stroke-width:2"/><text x="508" y="158" text-anchor="middle" style="fill:var(--bad);font-size:11px;font-weight:600">crash here</text>
-  <text x="24" y="190" style="fill:var(--ink);font-size:12px">On restart: done → replay the recorded result. Intent only → the effect may have happened:</text>
-  <text x="24" y="210" style="fill:var(--ink2);font-size:12px">re-run if idempotent, poll an external handle, or tell the agent the outcome is unknown.</text>
+<div class="svgwrap"><svg viewBox="0 0 760 250" width="760" style="max-width:100%;height:auto" role="img" aria-label="Effect sandwich">
+  <defs><marker id="m1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="20" width="200" height="56" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="110.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">1. Commit intent</text>
+  <text x="110.0" y="58.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">key, phase = intent</text>
+  <rect x="270" y="20" width="200" height="56" rx="7" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="370.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">2. Perform effect</text>
+  <text x="370.0" y="58.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">model call, tool, API</text>
+  <path d="M212 48.0H267" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m1)"/>
+  <rect x="530" y="20" width="200" height="56" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="630.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">3. Commit outcome</text>
+  <text x="630.0" y="58.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">phase = done, result</text>
+  <path d="M472 48.0H527" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m1)"/>
+  <path d="M240 10V90" style="fill:none;stroke:var(--bad);stroke-width:2;stroke-dasharray:4 3"/>
+  <text x="240" y="104" text-anchor="middle" style="fill:var(--ink2);font-size:10px">crash here: safe</text>
+  <path d="M500 10V90" style="fill:none;stroke:var(--bad);stroke-width:2;stroke-dasharray:4 3"/>
+  <text x="500" y="104" text-anchor="middle" style="fill:var(--ink2);font-size:10px">crash here: outcome unknown</text>
+  <rect x="10" y="124" width="740" height="108" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="380.0" y="153.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">On restart:</text>
+  <text x="380.0" y="167.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">outcome recorded  ->  replay the recorded result; never redo the effect</text>
+  <text x="380.0" y="181.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">intent only       ->  the effect may have happened:</text>
+  <text x="380.0" y="195.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">                      re-run if it is idempotent; poll an external handle; or tell the agent the outcome is unknown</text>
+  <text x="380.0" y="209.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">nothing recorded  ->  the effect never started; run it</text>
 </svg></div>
-<figcaption>Pi Durable calls this the effect sandwich. Every durable harness implements some version of it.</figcaption>
+<figcaption>Figure 1. Pi Durable's name for this is the effect sandwich. Every durable harness implements some version of it.</figcaption>
 </figure>
 
-<h2 id="tour">2. Code tour</h2>
-<h3>Pi Durable: a specification first</h3>
-<p><code>packages/durable/docs/spec.md</code> is normative and long; read sections 1, 4, 5.2 and 8. Its core rule: a Session atomically commits immutable entries, full task records and documents, and only committed state is observable. Selected invariants: one commit is atomic across all writes; all visible progress is durable (except explicitly deferred commits, which may be lost within a bounded window); <strong>external effects do not run inside the mutation transaction</strong>; entries and IDs are never reused. Work is modelled as tasks, durable state machines with phases; a terminal task record is the result receipt. Section 5.2 is the effect sandwich: commit the intent phase, perform the external effect, commit the outcome or next phase; reopening in an intent phase means the effect may have happened, so the handler retries safely, polls an external handle, or records interruption. Storage backends: memory, SQLite, JSONL, IndexedDB (<code>src/storage/</code>), each passing a conformance suite. Section 13 lists non-goals, including no automatic checkpoint heuristic and no forced termination of non-cooperative extension code.</p>
-<p>Field note: a team killed a Pi Durable agent right after a Gmail write and found two drafts; the sandwich detects the risk, but only you can make the effect idempotent (<a href="https://www.withone.ai/blog/pi-durable-crash-safe-one-cli/md">withone.ai</a>).</p>
-<h3>eve: the workflow engine is the journal</h3>
-<p>Every eve session is one workflow on the open-source Workflow SDK (<code>docs/concepts/execution-model-and-durability.mdx</code>). The kernel from Chapter 1 returns <code>{ session, next }</code>; each step is saved; a crash replays from the last step. Locally, runs persist under <code>.eve/.workflow-data</code>; self-hosted worlds include Postgres. Durability brings new problems eve solves explicitly: an idle session moves to a new deployment on its next message; a session built by an older eve version is "stranded" and retired safely; after compaction the session moves to a fresh workflow run so its run history stays bounded. On Vercel, the same mechanism runs other harnesses durably too: Vercel documents running Pi, fx, OpenCode, Claude Code and Codex this way.</p>
-<h3>nanocode: journaled calls everywhere</h3>
-<p>The README promise: every model call and tool call is journaled, so a turn finishes after its process dies. <code>crates/core/durability-core</code> holds the <code>StateStore</code>, content-addressed payloads and a deterministic state machine; each backend defines its own checkpoint format; stores run on JSONL, SQLite, Postgres, Durable Objects or D1. Subagents are durable sessions too (with only 2 resident by default when durable).</p>
+<p>A real case from the field: a team killed a Pi Durable agent right after a Gmail write and found two drafts on restart. The sandwich detected the risk correctly; only the effect's owner can make it safe to repeat (for example by searching for an existing draft before creating one). Durability tells you an outcome is unknown; idempotency is what lets you act on that safely.</p>
 
-<h3>Codex: rebuild from the rollout</h3>
-<p>Codex's durability is the rollout file plus reconstruction. <code>core/src/session/rollout_reconstruction.rs</code> rebuilds a session's history from its rollout, taking compaction checkpoints into account, so <code>codex resume</code> and <code>codex fork</code> continue from disk. The app server has its own <code>daemon_recovery.rs</code> so clients can reconnect to work that kept running. A turn in progress when the process dies is not journaled step by step the way Pi Durable or nanocode do it; the rollout holds what was recorded.</p>
-<h3>Claude Code: resume without the session's temporary grants</h3>
-<p>Claude Code resumes from its append-only transcript with <code>--resume</code> or <code>--continue</code>. The paper points out a deliberate asymmetry: the session's permission bypass flag and computer-use app allowlist are not written to the transcript, so a session resumed in a new process starts without them. Durable state and durable <em>authority</em> are different things, and a temporary grant should not outlive the process the user granted it to.</p>
-<h3>Kimi Code: resumable by construction</h3>
-<p>Because Kimi Code's state is a projection of its log, durability is mostly free: replay the log and the agent is back. <code>isResumable()</code> in <code>packages/core/src/loop/state.ts</code> decides whether to continue automatically, which is when the last assistant message has tool calls without results, or the last message is from the user or a tool. The append log reports a corrupted or truncated last line instead of failing the whole session, which is exactly what a crash in the middle of a write produces (fact 6).</p>
-<h3>Qwen Code: a recovery plan that repairs the history</h3>
-<p>Qwen Code's <code>core/session-recovery.ts</code> classifies a session on load as <code>clean</code>, <code>interrupted_prompt</code>, <code>interrupted_turn</code> or <code>degraded_history</code>, and builds a repair plan: synthesize a tool result for a call that never got one, drop a duplicate result, or mark a gap where a parent message is missing. The repaired history is valid for the model again; the plan tells the user what happened. A writer lease (<code>services/session-writer-lease.ts</code>) prevents two processes from appending to one session.</p>
-<h3>Trae Agent: none needed</h3>
-<p>Trae Agent runs one task per process and keeps only the trajectory. If a benchmark run dies, you run it again.</p>
+<h2 id="decisions">2. The decisions, one at a time</h2>
+<h3 id="d-grain">Decision 1. How often is progress written?</h3>
 
-<h2 id="decisions">3. Design decisions compared</h2>
-<div class="tbl"><table>
-  <tr><th>Approach</th><th>Who</th><th>Pro</th><th>Con</th></tr>
-  <tr><td>Transactional session library; you host it</td><td>Pi Durable</td><td>Portable (Node, Cloudflare, browser); precise semantics</td><td>You build hosting, routing, upgrades</td></tr>
-  <tr><td>Workflow engine steps</td><td>eve</td><td>Durability, deploy handoff and dashboards come with the platform</td><td>Bound to Workflow SDK semantics and eve versions</td></tr>
-  <tr><td>Journal inside the runtime</td><td>nanocode</td><td>Same runtime native and in WASM</td><td>Large, complex system</td></tr>
-  <tr><td>No durability; resume from session file</td><td>Pi CLI, fx</td><td>Simple</td><td>A crash loses the running turn</td></tr>
-</table></div>
-<p>The same decisions in the five reference harnesses:</p>
-<div class="tbl"><table>
-  <tr><th>Decision</th><th>Codex</th><th>Claude Code</th><th>Kimi Code</th><th>Qwen Code</th><th>Trae Agent</th></tr>
-<tr><td>What survives a crash</td><td>Rollout up to the last record</td><td>Transcript</td><td>Full event log</td><td>Recording plus repair plan</td><td>Trajectory only</td></tr>
-<tr><td>How it resumes</td><td>Reconstruct history; <code>resume</code>, <code>fork</code></td><td><code>--resume</code>, <code>--continue</code></td><td>Replay log; auto-continue if calls are unanswered</td><td>Classify, repair, continue</td><td>Rerun</td></tr>
-<tr><td>Unknown effects</td><td>Not journaled per effect</td><td>Not described</td><td>Unanswered calls detected</td><td>Synthesized tool results</td><td>n/a</td></tr>
-<tr><td>Authority after resume</td><td>Approvals per session</td><td>Temporary grants dropped on purpose</td><td>Session approval history policy</td><td>Permission state per session</td><td>n/a</td></tr>
-</table></div>
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 210" width="760" style="max-width:100%;height:auto" role="img" aria-label="Durability granularity">
+  <defs><marker id="m2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <path d="M20 40H740" style="fill:none;stroke:var(--ink2);stroke-width:2"/>
+  <text x="20" y="26" text-anchor="start" style="fill:var(--ink);font-size:11px;font-weight:600">none</text>
+  <text x="740" y="26" text-anchor="end" style="fill:var(--ink);font-size:11px;font-weight:600">every effect</text>
+  <circle cx="60" cy="40" r="6" style="fill:var(--kv)"/>
+  <text x="60" y="64" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Trae Agent</text>
+  <text x="60" y="80" text-anchor="middle" style="fill:var(--ink2);font-size:9px">trajectory only;</text>
+  <text x="60" y="94" text-anchor="middle" style="fill:var(--ink2);font-size:9px">rerun the task</text>
+  <circle cx="220" cy="40" r="6" style="fill:var(--kv)"/>
+  <text x="220" y="64" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Pi CLI, fx</text>
+  <text x="220" y="80" text-anchor="middle" style="fill:var(--ink2);font-size:9px">session file;</text>
+  <text x="220" y="94" text-anchor="middle" style="fill:var(--ink2);font-size:9px">running turn lost</text>
+  <circle cx="380" cy="40" r="6" style="fill:var(--kv)"/>
+  <text x="380" y="64" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Codex, Claude Code</text>
+  <text x="380" y="80" text-anchor="middle" style="fill:var(--ink2);font-size:9px">rollout or transcript;</text>
+  <text x="380" y="94" text-anchor="middle" style="fill:var(--ink2);font-size:9px">resume from disk</text>
+  <circle cx="540" cy="40" r="6" style="fill:var(--kv)"/>
+  <text x="540" y="64" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Kimi, Qwen</text>
+  <text x="540" y="80" text-anchor="middle" style="fill:var(--ink2);font-size:9px">log replay;</text>
+  <text x="540" y="94" text-anchor="middle" style="fill:var(--ink2);font-size:9px">repair what is open</text>
+  <circle cx="676" cy="40" r="6" style="fill:var(--kv)"/>
+  <text x="676" y="64" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Pi Durable, eve,</text>
+  <text x="676" y="80" text-anchor="middle" style="fill:var(--ink2);font-size:9px">nanocode: journal</text>
+  <text x="676" y="94" text-anchor="middle" style="fill:var(--ink2);font-size:9px">per step and effect</text>
+  <rect x="10" y="118" width="740" height="76" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="380.0" y="145.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Left: simplest, and enough when a run is cheap to repeat (a benchmark task) or a person is watching (a terminal).</text>
+  <text x="380.0" y="159.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Right: a turn finishes after its process dies, which a server, a scheduled job or a multi-day task needs.</text>
+  <text x="380.0" y="173.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">nanocode's promise: every model call and tool call is journaled, so a turn finishes after its process dies.</text>
+</svg></div>
+<figcaption>Figure 2. The cost of writing more often is complexity, not speed: journal writes are small next to model calls.</figcaption>
+</figure>
 
-<h2 id="research">4. Research and the Chinese view</h2>
+<h3 id="d-unknown">Decision 2. What happens to work that was in flight?</h3>
+<p>On restart, the last record tells the harness what was happening. The harnesses that replay logs classify the session and repair it before the model sees it, because a provider rejects a history with a tool call that has no result (Chapter 2).</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 240" width="760" style="max-width:100%;height:auto" role="img" aria-label="Qwen Code recovery classification">
+  <defs><marker id="m3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="10" width="200" height="36" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="110.0" y="31.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">clean</text>
+  <text x="222" y="32" text-anchor="start" style="fill:var(--ink2);font-size:10px">nothing open</text>
+  <rect x="10" y="54" width="200" height="36" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="110.0" y="75.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">interrupted prompt</text>
+  <text x="222" y="76" text-anchor="start" style="fill:var(--ink2);font-size:10px">the user's message has no reply</text>
+  <rect x="10" y="98" width="200" height="36" rx="7" style="fill:var(--bad-s);stroke:var(--bad)"/>
+  <text x="110.0" y="119.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">interrupted turn</text>
+  <text x="222" y="120" text-anchor="start" style="fill:var(--ink2);font-size:10px">a tool call has no result</text>
+  <rect x="10" y="142" width="200" height="36" rx="7" style="fill:var(--bad-s);stroke:var(--bad)"/>
+  <text x="110.0" y="163.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">degraded history</text>
+  <text x="222" y="164" text-anchor="start" style="fill:var(--ink2);font-size:10px">duplicates or a missing parent</text>
+  <rect x="470" y="10" width="280" height="168" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="610.0" y="55.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Repair plan</text>
+  <text x="610.0" y="69.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">synthesise a result for a call</text>
+  <text x="610.0" y="83.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">  that never got one</text>
+  <text x="610.0" y="97.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">drop a duplicate result</text>
+  <text x="610.0" y="111.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">mark a gap where a parent</text>
+  <text x="610.0" y="125.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">  message is missing</text>
+  <text x="610.0" y="139.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">tell the user what happened</text>
+  <text x="10" y="210" text-anchor="start" style="fill:var(--ink2);font-size:9px">Kimi Code auto-continues when the last assistant message has unanswered tool calls, or the last message is from the user or a tool.</text>
+  <text x="10" y="226" text-anchor="start" style="fill:var(--ink2);font-size:9px">Codex rebuilds history from the rollout, honouring compaction checkpoints; Claude Code resumes from the transcript.</text>
+</svg></div>
+<figcaption>Figure 3. Classify, repair, then continue. The repaired history is valid for the model again; the plan is the audit trail.</figcaption>
+</figure>
+
+<p>A synthesised result must be honest. "The tool was interrupted; its outcome is unknown" lets the model check (look at the file, query the branch) before acting again. A synthesised "success" would be a lie the model then builds on.</p>
+
+<h3 id="d-torn">Decision 3. What if the crash tears a write?</h3>
+<p>A process killed in the middle of writing a line leaves half a line. Three properties make that harmless:</p>
 <ul>
-  <li><strong>Durable execution is an old idea.</strong> Workflow engines (Temporal, Step Functions) have used journals and replay for years; 2026 harnesses apply them to agents, where every model call is a slow, expensive, non-deterministic effect worth recording.</li>
-  <li><strong>Long-horizon work needs it.</strong> Anthropic's long-running harness and the Dive into Claude Code paper both name horizon scaling (from single sessions to multi-day programs) as an open direction.</li>
-  <li><strong>Chinese coverage.</strong> Taiwanese and Chinese tech press covered Pi Durable's release as an agent framework that reads saved progress after a restart and handles unfinished work, with several conversations at once and several people joining one task (<a href="https://www.ithome.com.tw/news/179369">iThome</a>). Cloudflare's Agents SDK already runs Pi Durable as a harness (<a href="https://developers.cloudflare.com/changelog/post/2026-10-02-pi-harness/">Cloudflare</a>).</li>
+  <li><strong>Append-only files</strong> (every harness here): a torn write can only damage the last record, never history before it.</li>
+  <li><strong>Tolerant readers</strong>: Kimi Code's log reader reports a corrupted or truncated last line instead of failing the whole session.</li>
+  <li><strong>Atomic commits</strong>: Pi Durable's rule is that one commit is atomic across all its writes, and only committed state is observable, so a reader never sees half a step.</li>
 </ul>
 
-<h2 id="build">5. Build: a journal with the effect sandwich</h2>
+<h3 id="d-host">Decision 4. Who hosts the journal?</h3>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 196" width="760" style="max-width:100%;height:auto" role="img" aria-label="Durability hosting models">
+  <defs><marker id="m4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <text x="10" y="18" text-anchor="start" style="fill:var(--ink);font-size:12px;font-weight:600">A library you host</text>
+  <text x="10" y="34" text-anchor="start" style="fill:var(--ink2);font-size:10px">Pi Durable</text>
+  <rect x="10" y="44" width="238" height="96" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="129.0" y="74.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">a session library with a</text>
+  <text x="129.0" y="88.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">normative specification;</text>
+  <text x="129.0" y="102.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">memory, SQLite, JSONL and</text>
+  <text x="129.0" y="116.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">IndexedDB stores</text>
+  <rect x="10" y="152" width="238" height="34" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="129.0" y="172.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">portable; you build hosting</text>
+  <text x="260" y="18" text-anchor="start" style="fill:var(--ink);font-size:12px;font-weight:600">A workflow engine</text>
+  <text x="260" y="34" text-anchor="start" style="fill:var(--ink2);font-size:10px">eve</text>
+  <rect x="260" y="44" width="238" height="96" rx="7" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="379.0" y="74.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">each session is one workflow;</text>
+  <text x="379.0" y="88.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">each step is saved; a crash</text>
+  <text x="379.0" y="102.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">replays from the last step;</text>
+  <text x="379.0" y="116.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">local files or Postgres</text>
+  <rect x="260" y="152" width="238" height="34" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="379.0" y="172.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">platform gives deploys, dashboards</text>
+  <text x="510" y="18" text-anchor="start" style="fill:var(--ink);font-size:12px;font-weight:600">A journal in the runtime</text>
+  <text x="510" y="34" text-anchor="start" style="fill:var(--ink2);font-size:10px">nanocode</text>
+  <rect x="510" y="44" width="238" height="96" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="629.0" y="74.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">a deterministic state machine,</text>
+  <text x="629.0" y="88.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">content-addressed payloads;</text>
+  <text x="629.0" y="102.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">JSONL, SQLite, Postgres,</text>
+  <text x="629.0" y="116.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Durable Objects, D1</text>
+  <rect x="510" y="152" width="238" height="34" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="629.0" y="172.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">same runtime native and in WASM</text>
+</svg></div>
+<figcaption>Figure 4. Three ways to own the same idea. Each store in Pi Durable must pass a conformance suite, so semantics do not drift between backends.</figcaption>
+</figure>
+
+<p>Pi Durable's specification is worth reading as an example of how to write down durability semantics. Selected invariants: one commit is atomic across all writes; all visible progress is durable, except explicitly deferred commits, which may be lost within a bounded window; external effects never run inside the mutation transaction; entries and IDs are never reused. Work is modelled as tasks, durable state machines with phases, and a finished task record is the receipt for its result. The workflow-engine route trades that control for infrastructure: Vercel documents running several harnesses (including Pi, fx, Claude Code and Codex) durably on the same workflow mechanism eve uses, and Cloudflare's Agents SDK runs Pi Durable.</p>
+
+<h3 id="d-deploy">Decision 5. What happens when the code changes under a running session?</h3>
+<p>A durable session outlives deploys. Replaying a journal written by older code with newer code can go wrong in subtle ways. eve handles this explicitly:</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 180" width="760" style="max-width:100%;height:auto" role="img" aria-label="eve deploys and versions">
+  <defs><marker id="m5" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="16" width="150" height="46" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="85.0" y="35.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">session idle on</text>
+  <text x="85.0" y="49.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">deploy A</text>
+  <rect x="190" y="16" width="150" height="46" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="265.0" y="42.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">new message</text>
+  <path d="M162 39.0H187" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m5)"/>
+  <rect x="370" y="16" width="150" height="46" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="445.0" y="35.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">moves to</text>
+  <text x="445.0" y="49.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">deploy B</text>
+  <path d="M342 39.0H367" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m5)"/>
+  <rect x="10" y="84" width="740" height="80" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="380.0" y="113.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">A session from an older eve version that cannot continue safely is marked stranded and retired.</text>
+  <text x="380.0" y="127.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">After compaction, the session moves to a fresh workflow run, so its run history stays bounded.</text>
+  <text x="380.0" y="141.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Codex rebuilds history from the rollout; nanocode lets each backend define its own checkpoint format.</text>
+</svg></div>
+<figcaption>Figure 5. Move idle sessions forward at a safe point; retire what cannot be moved; keep run history from growing forever.</figcaption>
+</figure>
+
+<h3 id="d-writer">Decision 6. Who may write a session?</h3>
+<p>Two processes appending to one session (two terminals, a retry and the original) interleave records and corrupt the history. Qwen Code takes a writer lease so only one process writes a session at a time. Pi Durable's atomic commits serialise writers through the store. nanocode limits how many durable subagents are resident at once. A workflow engine like eve's guarantees one run per session.</p>
+
+<h3 id="d-auth">Decision 7. What authority survives a resume?</h3>
+<p>The Claude Code paper points out a deliberate asymmetry: the session's permission-bypass flag and its computer-use app allowlist are not written to the transcript, so a session resumed in a new process starts without them. The reasoning generalises: a user grants a temporary permission to a process they are watching; a resumed session may run somewhere else, later, unwatched. Durable state and durable authority are different things. Codex and Qwen Code keep approvals per session; eve's approvals are durable on purpose, because its sessions are built to wait days for a human (Chapter 7), and the approval is for one specific pending action.</p>
+
+<h3 id="d-reconnect">Decision 8. Can a client reconnect to work that kept running?</h3>
+<p>If the harness runs as a server (Chapter 12), the client is not the process: closing a laptop should not stop the agent. Codex's app server has its own recovery so clients can reconnect to work that kept running. eve sessions live on the platform and are reached through its API and channels. Pi Durable is built for several conversations at once and several people joining one task.</p>
+
+<h3 id="d-non">Decision 9. What does durability not promise?</h3>
+<p>Pi Durable's specification ends with non-goals, a good habit: no automatic checkpoint heuristic (the code says when to commit) and no forced termination of extension code that does not cooperate. Two others apply to every design: durability cannot make an effect idempotent (the Gmail drafts), and it cannot recover what the world itself lost (a deleted branch).</p>
+
+<h3 id="d-none">Decision 10. When is durability not worth it?</h3>
+<p>Trae Agent runs one benchmark task per process and keeps only the trajectory; if a run dies, it runs again. The Pi CLI and fx save the session file and lose only the turn in progress, which a person at the terminal simply repeats. Durability pays off when nobody is watching, when runs are long or expensive, or when effects reach other people (emails, pull requests, payments).</p>
+
+<h2 id="harnesses">3. Recovery in each harness</h2>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 116" width="760" style="max-width:100%;height:auto" role="img" aria-label="Pi">
+  <defs><marker id="m6" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="16" width="134" height="50" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="77.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">CLI: session</text>
+  <text x="77.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">file</text>
+  <rect x="161" y="16" width="134" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="228.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Durable: atomic</text>
+  <text x="228.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">commits</text>
+  <path d="M146 41.0H158" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m6)"/>
+  <rect x="312" y="16" width="134" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="379.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">tasks with</text>
+  <text x="379.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">phases</text>
+  <path d="M297 41.0H309" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m6)"/>
+  <rect x="463" y="16" width="134" height="50" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="530.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">effect sandwich</text>
+  <path d="M448 41.0H460" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m6)"/>
+  <rect x="614" y="16" width="134" height="50" rx="7" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="681.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">4 stores +</text>
+  <text x="681.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">conformance suite</text>
+  <path d="M599 41.0H611" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m6)"/>
+  <text x="10" y="98" text-anchor="start" style="fill:var(--ink2);font-size:10px">A normative specification defines what is observable after any crash.</text>
+</svg></div>
+<figcaption>Figure 6. Pi. Two products: a simple CLI and a durable session library.</figcaption>
+</figure>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 116" width="760" style="max-width:100%;height:auto" role="img" aria-label="eve">
+  <defs><marker id="m7" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="16" width="134" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="77.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">session = one</text>
+  <text x="77.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">workflow</text>
+  <rect x="161" y="16" width="134" height="50" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="228.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">each step</text>
+  <text x="228.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">saved</text>
+  <path d="M146 41.0H158" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m7)"/>
+  <rect x="312" y="16" width="134" height="50" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="379.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">crash: replay</text>
+  <text x="379.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">from last step</text>
+  <path d="M297 41.0H309" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m7)"/>
+  <rect x="463" y="16" width="134" height="50" rx="7" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="530.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">deploy handoff,</text>
+  <text x="530.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">stranded retire</text>
+  <path d="M448 41.0H460" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m7)"/>
+  <rect x="614" y="16" width="134" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="681.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">fresh run after</text>
+  <text x="681.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">compaction</text>
+  <path d="M599 41.0H611" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m7)"/>
+  <text x="10" y="98" text-anchor="start" style="fill:var(--ink2);font-size:10px">Runs persist locally or in Postgres; the platform shows every run.</text>
+</svg></div>
+<figcaption>Figure 7. eve. The workflow engine is the journal.</figcaption>
+</figure>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 116" width="760" style="max-width:100%;height:auto" role="img" aria-label="fx">
+  <defs><marker id="m8" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="16" width="134" height="50" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="77.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">session file</text>
+  <rect x="161" y="16" width="134" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="228.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">resume last</text>
+  <text x="228.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">or by ID</text>
+  <path d="M146 41.0H158" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m8)"/>
+  <rect x="312" y="16" width="134" height="50" rx="7" style="fill:var(--bad-s);stroke:var(--bad)"/>
+  <text x="379.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">running turn</text>
+  <text x="379.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">lost on crash</text>
+  <path d="M297 41.0H309" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m8)"/>
+  <text x="10" y="98" text-anchor="start" style="fill:var(--ink2);font-size:10px">Simple, and enough for an interactive terminal.</text>
+</svg></div>
+<figcaption>Figure 8. fx. Resumable, not durable.</figcaption>
+</figure>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 116" width="760" style="max-width:100%;height:auto" role="img" aria-label="nanocode">
+  <defs><marker id="m9" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="16" width="134" height="50" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="77.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">every model and</text>
+  <text x="77.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">tool call journaled</text>
+  <rect x="161" y="16" width="134" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="228.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">deterministic</text>
+  <text x="228.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">state machine</text>
+  <path d="M146 41.0H158" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m9)"/>
+  <rect x="312" y="16" width="134" height="50" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="379.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">payloads by</text>
+  <text x="379.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">hash</text>
+  <path d="M297 41.0H309" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m9)"/>
+  <rect x="463" y="16" width="134" height="50" rx="7" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="530.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">5 store</text>
+  <text x="530.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">backends</text>
+  <path d="M448 41.0H460" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m9)"/>
+  <rect x="614" y="16" width="134" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="681.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">durable</text>
+  <text x="681.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">subagents</text>
+  <path d="M599 41.0H611" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m9)"/>
+  <text x="10" y="98" text-anchor="start" style="fill:var(--ink2);font-size:10px">A turn finishes after its process dies.</text>
+</svg></div>
+<figcaption>Figure 9. nanocode. Durability inside the runtime.</figcaption>
+</figure>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 116" width="760" style="max-width:100%;height:auto" role="img" aria-label="Codex">
+  <defs><marker id="m10" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="16" width="134" height="50" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="77.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">rollout file</text>
+  <rect x="161" y="16" width="134" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="228.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">reconstruct</text>
+  <text x="228.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">history</text>
+  <path d="M146 41.0H158" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m10)"/>
+  <rect x="312" y="16" width="134" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="379.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">honour compaction</text>
+  <text x="379.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">checkpoints</text>
+  <path d="M297 41.0H309" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m10)"/>
+  <rect x="463" y="16" width="134" height="50" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="530.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">resume, fork</text>
+  <path d="M448 41.0H460" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m10)"/>
+  <rect x="614" y="16" width="134" height="50" rx="7" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="681.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">app server</text>
+  <text x="681.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">reconnect</text>
+  <path d="M599 41.0H611" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m10)"/>
+  <text x="10" y="98" text-anchor="start" style="fill:var(--ink2);font-size:10px">A turn in progress is not journaled per effect; the rollout holds what was recorded.</text>
+</svg></div>
+<figcaption>Figure 10. Codex. Rebuild from disk.</figcaption>
+</figure>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 116" width="760" style="max-width:100%;height:auto" role="img" aria-label="Claude Code">
+  <defs><marker id="m11" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="16" width="134" height="50" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="77.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">transcript</text>
+  <rect x="161" y="16" width="134" height="50" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="228.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">resume,</text>
+  <text x="228.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">continue</text>
+  <path d="M146 41.0H158" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m11)"/>
+  <rect x="312" y="16" width="134" height="50" rx="7" style="fill:var(--bad-s);stroke:var(--bad)"/>
+  <text x="379.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">temporary grants</text>
+  <text x="379.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">not saved</text>
+  <path d="M297 41.0H309" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m11)"/>
+  <text x="10" y="98" text-anchor="start" style="fill:var(--ink2);font-size:10px">Durable state, non-durable authority.</text>
+</svg></div>
+<figcaption>Figure 11. Claude Code. Resume without the session's temporary grants.</figcaption>
+</figure>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 116" width="760" style="max-width:100%;height:auto" role="img" aria-label="Kimi Code">
+  <defs><marker id="m12" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="16" width="134" height="50" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="77.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">event log</text>
+  <rect x="161" y="16" width="134" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="228.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">state is a</text>
+  <text x="228.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">projection</text>
+  <path d="M146 41.0H158" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m12)"/>
+  <rect x="312" y="16" width="134" height="50" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="379.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">auto-continue</text>
+  <text x="379.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">rules</text>
+  <path d="M297 41.0H309" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m12)"/>
+  <rect x="463" y="16" width="134" height="50" rx="7" style="fill:var(--bad-s);stroke:var(--bad)"/>
+  <text x="530.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">torn last line</text>
+  <text x="530.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">reported</text>
+  <path d="M448 41.0H460" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m12)"/>
+  <text x="10" y="98" text-anchor="start" style="fill:var(--ink2);font-size:10px">Durability mostly falls out of event sourcing.</text>
+</svg></div>
+<figcaption>Figure 12. Kimi Code. Resumable by construction.</figcaption>
+</figure>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 116" width="760" style="max-width:100%;height:auto" role="img" aria-label="Qwen Code">
+  <defs><marker id="m13" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="16" width="134" height="50" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="77.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">recording</text>
+  <rect x="161" y="16" width="134" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="228.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">classify on load</text>
+  <path d="M146 41.0H158" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m13)"/>
+  <rect x="312" y="16" width="134" height="50" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="379.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">repair plan</text>
+  <path d="M297 41.0H309" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m13)"/>
+  <rect x="463" y="16" width="134" height="50" rx="7" style="fill:var(--bad-s);stroke:var(--bad)"/>
+  <text x="530.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">writer lease</text>
+  <path d="M448 41.0H460" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m13)"/>
+  <text x="10" y="98" text-anchor="start" style="fill:var(--ink2);font-size:10px">Synthesised results, dropped duplicates, marked gaps.</text>
+</svg></div>
+<figcaption>Figure 13. Qwen Code. Repair, then continue.</figcaption>
+</figure>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 116" width="760" style="max-width:100%;height:auto" role="img" aria-label="Trae Agent">
+  <defs><marker id="m14" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="16" width="134" height="50" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="77.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">trajectory</text>
+  <rect x="161" y="16" width="134" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="228.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">crash: rerun</text>
+  <text x="228.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">the task</text>
+  <path d="M146 41.0H158" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m14)"/>
+  <text x="10" y="98" text-anchor="start" style="fill:var(--ink2);font-size:10px">Benchmarks are cheap to repeat.</text>
+</svg></div>
+<figcaption>Figure 14. Trae Agent. None needed.</figcaption>
+</figure>
+
+<h2 id="compare">4. All nine in one table</h2>
+<div class="tbl"><table>
+  <tr><th>Harness</th><th>Granularity</th><th>Unknown effects</th><th>Store</th><th>Single writer</th><th>Authority after resume</th></tr>
+  <tr><td>Pi</td><td>CLI: session; Durable: every commit</td><td>Effect sandwich</td><td>Memory, SQLite, JSONL, IndexedDB</td><td>Atomic commits</td><td>Not described here</td></tr>
+  <tr><td>eve</td><td>Every step</td><td>Workflow replay</td><td>Local files, Postgres</td><td>One run per session</td><td>Durable approvals by design</td></tr>
+  <tr><td>fx</td><td>Session file</td><td>Turn lost</td><td>Local files</td><td>Not described here</td><td>Not described here</td></tr>
+  <tr><td>nanocode</td><td>Every model and tool call</td><td>Journal</td><td>JSONL, SQLite, Postgres, Durable Objects, D1</td><td>Residency limits</td><td>Not described here</td></tr>
+  <tr><td>Codex</td><td>Rollout records</td><td>Not journaled per effect</td><td>Rollout + SQLite</td><td>Not described here</td><td>Approvals per session</td></tr>
+  <tr><td>Claude Code</td><td>Transcript</td><td>Not described</td><td>JSONL</td><td>Not described here</td><td>Temporary grants dropped</td></tr>
+  <tr><td>Kimi Code</td><td>Every event</td><td>Unanswered calls detected</td><td>JSONL per agent</td><td>Not described here</td><td>Session approval policy</td></tr>
+  <tr><td>Qwen Code</td><td>Recording</td><td>Synthesised results, repair plan</td><td>Files + sidecars</td><td>Writer lease</td><td>Per session</td></tr>
+  <tr><td>Trae Agent</td><td>Trajectory</td><td>Rerun</td><td>JSON</td><td>n/a</td><td>n/a</td></tr>
+</table></div>
+
+<h2 id="choose">5. Choosing a durability design</h2>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 274" width="760" style="max-width:100%;height:auto" role="img" aria-label="Choosing durability">
+  <defs><marker id="m15" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="10" width="280" height="52" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="150.0" y="32.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Is a person watching</text>
+  <text x="150.0" y="46.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">every run?</text>
+  <rect x="340" y="10" width="410" height="52" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="545.0" y="32.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Session file and resume are enough;</text>
+  <text x="545.0" y="46.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">repair open calls on load</text>
+  <path d="M292 36H336" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m15)"/>
+  <text x="300" y="30" text-anchor="start" style="fill:var(--ink2);font-size:10px">yes</text>
+  <rect x="10" y="76" width="280" height="52" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="150.0" y="98.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Do runs outlive a process</text>
+  <text x="150.0" y="112.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">(server, schedule, days)?</text>
+  <rect x="340" y="76" width="410" height="52" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="545.0" y="98.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Journal every model and tool call with</text>
+  <text x="545.0" y="112.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">intent and outcome records</text>
+  <path d="M292 102H336" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m15)"/>
+  <text x="300" y="96" text-anchor="start" style="fill:var(--ink2);font-size:10px">yes</text>
+  <rect x="10" y="142" width="280" height="52" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="150.0" y="164.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Do effects reach other</text>
+  <text x="150.0" y="178.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">people or money?</text>
+  <rect x="340" y="142" width="410" height="52" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="545.0" y="164.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Make each effect idempotent or checkable;</text>
+  <text x="545.0" y="178.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">never re-run an unknown effect blindly</text>
+  <path d="M292 168H336" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m15)"/>
+  <text x="300" y="162" text-anchor="start" style="fill:var(--ink2);font-size:10px">yes</text>
+  <rect x="10" y="208" width="280" height="52" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="150.0" y="230.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Will code be deployed while</text>
+  <text x="150.0" y="244.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">sessions run?</text>
+  <rect x="340" y="208" width="410" height="52" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="545.0" y="230.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Move idle sessions at safe points; retire</text>
+  <text x="545.0" y="244.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">sessions older code cannot continue</text>
+  <path d="M292 234H336" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m15)"/>
+  <text x="300" y="228" text-anchor="start" style="fill:var(--ink2);font-size:10px">yes</text>
+</svg></div>
+<figcaption>Figure 15. Durability is cheap to add early and painful to add later, because every effect must be written around it.</figcaption>
+</figure>
+
+<p>This book's journal: an append-only JSONL file with intent and outcome records around every model call and tool call, a tolerant reader, a recovery pass that classifies the session and synthesises honest "outcome unknown" results, a writer lock, and no saved temporary permissions.</p>
+
+<h2 id="research">6. Research and the Chinese view</h2>
+<ul>
+  <li><strong>Durable execution is an old idea.</strong> Workflow engines such as Temporal and AWS Step Functions have used journals and replay for years; 2026 harnesses apply them to agents, where every model call is a slow, expensive, non-deterministic effect worth recording.</li>
+  <li><strong>Long-horizon work needs it.</strong> Anthropic's long-running harness and the Dive into Claude Code paper both name horizon scaling, from single sessions to multi-day programs, as an open direction.</li>
+  <li><strong>Chinese practice.</strong> Kimi Code shows that event sourcing gives most of durability for free; Qwen Code's recovery classification is the most explicit repair design read for this book. Taiwanese and Chinese tech press covered Pi Durable's release as an agent framework that reads saved progress after a restart, handles unfinished work, and lets several people join one task.</li>
+</ul>
+
+<h2 id="build">7. Build: a journal with the effect sandwich</h2>
 <pre>&quot;&quot;&quot;Durable execution: journal every model and tool call; commit intent, do the effect, commit the outcome.&quot;&quot;&quot;
 import json, sqlite3, time
 
@@ -166,30 +559,36 @@ def run_durable(journal, session, initial_state, step_fn, done):
   <li>Post the result, and the one bug you found. There is always one.</li>
 </ol>
 
-<h2 id="exercises">6. Exercises</h2>
+
+<h2 id="exercises">8. Exercises</h2>
 <ol>
-  <li>Add an idempotency key to a <code>create_issue</code> tool (search for an issue with the key in its body before creating one). Now it can be safely re-run.</li>
-  <li>Add a <code>wait_for_human</code> effect that parks the session in the journal and resumes when an answer row appears, even days later.</li>
-  <li>Implement the background compaction from Chapter 5 as its own durable task.</li>
+  <li><strong>Kill test.</strong> Run a 20-step task and kill the process at a random step, ten times. Every restart must finish the task without repeating a completed effect.</li>
+  <li><strong>Unknown outcome.</strong> Kill the process between intent and outcome for a file write. On restart, synthesise an honest "unknown" result and check the model looks before it writes again.</li>
+  <li><strong>Torn line.</strong> Truncate the last line of your journal by a few bytes. Your reader must report it and load everything before it.</li>
+  <li><strong>Two writers.</strong> Start two processes on the same session. Your lock must make the second wait or fail clearly.</li>
+  <li><strong>Idempotent effect.</strong> Make a "create pull request" tool check for an existing one with the same branch before creating. Repeat the kill test.</li>
 </ol>
 
-<h2 id="quiz">7. Check yourself</h2>
+<h2 id="quiz">9. Check yourself</h2>
 <div class="widget quiz" data-quiz="qz11"></div>
 <script type="application/json" id="qz11">[
-{"q":"What does Pi Durable's effect sandwich consist of?","o":["Retry, backoff, retry","Commit intent, perform the external effect, commit the outcome","Lock, write, unlock","Plan, act, review"],"a":1,"e":"Reopening in the intent phase signals that the effect may have happened."},
-{"q":"Pi Durable's invariant about external effects says they:","o":["Run inside the commit transaction","Do not run inside the Session mutation transaction","Are forbidden","Are always idempotent"],"a":1,"e":"Effects take time and can fail independently; transactions stay short and local."},
-{"q":"How is an eve session made durable?","o":["Each session runs as a workflow on the Workflow SDK that saves progress at step boundaries","It writes a JSONL file","It keeps a hot standby process","It does not survive crashes"],"a":0,"e":"The kernel returns { session, next }; the engine checkpoints each step."},
-{"q":"On restart, a journal entry shows intent but no outcome for 'send_email'. What is safest?","o":["Send it again","Report the outcome as unknown so the agent checks before repeating, or poll an external handle","Delete the entry","Mark it done"],"a":1,"e":"Blind repetition can double the effect."},
-{"q":"Which state belongs in a checkpoint?","o":["Open file handles","JSON-serializable data such as messages, checkpoint text and counters","Running subprocesses","Network sockets"],"a":1,"e":"Anything that cannot be serialized must be recreated on start."}
+{"q":"Why is restoring the agent's mind after a crash easy?","o":["Models cache state","The model keeps nothing; replaying the history the harness wrote restores it","Providers resume sessions","It is not easy"],"a":1,"e":"The hard part is the world outside the process."},
+{"q":"What are the three steps of the effect sandwich?","o":["Plan, act, check","Commit intent, perform the effect, commit the outcome","Read, write, verify","Lock, write, unlock"],"a":1,"e":"A restart with an intent and no outcome means the effect may have happened."},
+{"q":"What should a harness do with an effect whose outcome is unknown?","o":["Always re-run it","Always skip it","Re-run only if idempotent, check an external handle, or tell the agent it is unknown","Delete the session"],"a":2,"e":"Durability detects the risk; idempotency makes acting on it safe."},
+{"q":"How does Qwen Code handle a session that crashed mid-turn?","o":["Discards it","Classifies it (clean, interrupted prompt, interrupted turn, degraded) and applies a repair plan","Asks the model","Restarts the task"],"a":1,"e":"For example, it synthesises a result for a call that never got one."},
+{"q":"Why does Claude Code not save the permission-bypass flag to the transcript?","o":["It is too large","Durable state and durable authority are different; a temporary grant should not outlive its process","It is a secret","A bug"],"a":1,"e":"A resumed session may run later, elsewhere, unwatched."},
+{"q":"What does eve do with a session built by an older eve version that cannot be continued safely?","o":["Replays it anyway","Marks it stranded and retires it","Deletes the user's data","Upgrades the model"],"a":1,"e":"Idle sessions move to the new deployment on their next message."},
+{"q":"Which Pi Durable invariant prevents readers from seeing half a step?","o":["IDs are reused","One commit is atomic across all its writes and only committed state is observable","Effects run inside the transaction","No storage"],"a":1,"e":"External effects never run inside the mutation transaction."},
+{"q":"When is durability not worth the complexity?","o":["Never","When runs are cheap to repeat or a person is watching, like a benchmark task or a terminal session","Always","Only on servers"],"a":1,"e":"It pays off when nobody is watching or effects reach other people."}
 ]</script>
 
-<h2 id="refs">8. References</h2>
+<h2 id="refs">10. References</h2>
 <ul>
-  <li>Pi Durable: <code>packages/durable/docs/spec.md</code> (sections 1, 4, 5.2, 8, 13), <code>README.md</code>, <code>src/storage/</code>.</li>
-  <li>eve: <code>docs/concepts/execution-model-and-durability.mdx</code>; <a href="https://vercel.com/docs/agent-harnesses/eve">Running eve agents durably</a>.</li>
-  <li>nanocode: <code>README.md</code>, <code>crates/README.md</code> (durability), <code>crates/core/durability-core</code>.</li>
-  <li><a href="https://www.withone.ai/blog/pi-durable-crash-safe-one-cli/md">We killed a Pi Durable agent after a Gmail write</a>, withone.ai.</li>
-  <li><a href="https://developers.cloudflare.com/changelog/post/2026-10-02-pi-harness/">Run the Pi Durable harness on Cloudflare</a>, Cloudflare, Oct 2026.</li>
+  <li>Pi and Pi Durable: <a href="https://github.com/earendil-works/pi">github.com/earendil-works/pi</a> (fb248c7), including the durable runtime specification. eve: <a href="https://github.com/vercel/eve">github.com/vercel/eve</a> (5c52fbf), execution model and durability documentation. fx: <a href="https://github.com/vercel-labs/fx">github.com/vercel-labs/fx</a> (cbe7daf). nanocode: <a href="https://github.com/gakonst/nanocode">github.com/gakonst/nanocode</a> (015cbfa).</li>
+  <li>Codex CLI: <a href="https://github.com/openai/codex">github.com/openai/codex</a> (50aeac2).</li>
+  <li>Claude Code: Dive into Claude Code, arXiv 2604.14228.</li>
+  <li>Kimi Code: <a href="https://github.com/MoonshotAI/kimi-code">github.com/MoonshotAI/kimi-code</a> (111aae2). Qwen Code: <a href="https://github.com/QwenLM/qwen-code">github.com/QwenLM/qwen-code</a> (c56424fc). Trae Agent: <a href="https://github.com/bytedance/trae-agent">github.com/bytedance/trae-agent</a> (e839e55).</li>
+  <li>Workflow SDK; Temporal; Cloudflare Agents SDK.</li>
 </ul>
 
 <div class="navfoot"></div>
