@@ -15,97 +15,754 @@
 <main><article>
 <div class="kicker">Stage 1 · Foundations · Chapter 3</div>
 <h1>Tools and the action interface</h1>
-<p class="lede">The model only writes text (fact 1). A tool is a contract that says which text the harness will turn into which action, so their design decides what the agent can do, how often it fails, and how many tokens it burns. This chapter compares Pi's four tools, fx's toolbox with capability search, eve's sandboxed built-ins and nanocode's Code Mode, then builds a typed tool registry with validation, truncation, safe multi-edits and background jobs. It closes Stage 1: your harness is now a real coding agent.</p>
+<p class="lede">The model only writes text (fact 1). A tool is a contract that says which text the harness will turn into which action, and what text comes back. That makes a tool two things at once: the model's hands and the model's only eyes on what its hands did. This chapter derives what a good tool looks like from that double role, then takes the design decisions one at a time: shell or dedicated tools, how the shell behaves, the edit format, read-before-write, how big a result may be, how many tools the model sees, and how descriptions are written. It shows how nine harnesses answered each, and ends with a typed tool registry you build.</p>
 <div class="meta">
   <span class="chip">Level: intermediate</span>
   <span class="chip">Time: about 20 hours with the build</span>
-  <span class="chip">Needs: Chapters 1 and 2</span>
-  <span class="chip">Code read at: Pi fb248c7, eve 5c52fbf, fx cbe7daf, nanocode 015cbfa</span>
+  <span class="chip">Needs: Chapters 1 and 2, Python 3.11+</span>
+  <span class="chip">Harnesses read: Pi, eve, fx, nanocode, Codex, Claude Code, Kimi Code, Qwen Code, Trae Agent</span>
 </div>
 
 <div class="box skip">
   <span class="lbl">Before you start: skip check</span>
   <ol>
-    <li>Why does Pi's edit tool require each old text to be unique in the file?</li>
-    <li>A test command prints 80,000 lines. What should the model see?</li>
-    <li>What is the difference between listing all tools and tool search?</li>
+    <li>Codex has no read or search tool at all. How does its model read a file, and why might that be a good design?</li>
+    <li>A command is still running when its time limit arrives. Name three things a harness could do, and one harness that does each.</li>
+    <li>Why do Pi and eve accept an edit whose search text differs from the file only in smart quotes or trailing spaces, while Claude Code's Edit tool refuses it?</li>
+    <li>A tool printed 2 MB. What are the two ways to keep that from reaching the model while still letting the model see any part of it later?</li>
   </ol>
   <details><summary>Answers</summary><ol>
-    <li>If the text appears twice, the edit is ambiguous and may change the wrong place. Rejecting it with a clear error makes the model add surrounding lines.</li>
-    <li>A bounded slice (for example the last 2,000 lines or 50 KB, plus the head) and a path to the full output, so it can read more only if needed.</li>
-    <li>Listing puts every tool schema in every request. Tool search puts a small search tool in the request and loads a tool's schema only when the model asks for it.</li>
+    <li>Through the shell (<code>cat</code>, <code>rg</code>, <code>sed -n</code>). Models are heavily trained on shell use, one general tool costs less context than several, and the harness can still bound the output.</li>
+    <li>Kill it (Trae Agent's shell must then be restarted), keep it running and hand back a handle to poll (Codex, fx, eve), or move it to the background automatically and report where its output goes (Claude Code).</li>
+    <li>A tolerant match recovers from the model's typing habits (it often normalises quotes and whitespace), at the small risk of matching something unintended. An exact match never surprises, at the cost of more failed edits. Both are defensible; each harness chose one.</li>
+    <li>Save the full output to a file and tell the model its path (Pi, Claude Code, Kimi Code, Qwen Code), or keep it in the session behind a handle that a dedicated tool can read in ranges or search (fx).</li>
   </ol></details>
 </div>
 
-<h2 id="aci">1. The agent-computer interface</h2>
-<p>Ask what the model actually perceives when it uses a tool. It sees a name, a description and a schema, all as text in its input. It writes a call as text. It then sees the result as text. It never sees the screen, the file system or the process; it sees only what the tool chose to print. So a tool is two things at once: an action in the world and the model's only sense organ for that action.</p>
-<p>That explains SWE-agent's 2024 finding that the interface you give a model matters as much as the model. A raw Linux shell was designed for humans who can scroll, glance and remember: it prints too much, fails silently and hides state. A model can do none of those things. A good <strong>agent-computer interface (ACI)</strong> has simple actions, informative error messages and outputs sized for a context window.</p>
-<p>Every tool decision is a trade between three costs, and each one comes straight from a fact:</p>
-<ul>
-  <li><strong>Context cost (facts 3 and 4).</strong> The model cannot use a tool it has not been told about, so every tool schema is in every request, paid for every time. Playwright's MCP server alone is about 13.7k tokens of definitions.</li>
-  <li><strong>Error cost (fact 5).</strong> The model picks a tool and writes arguments by sampling, so it will sometimes pick wrong. A vague tool gets misused more. An edit tool that silently changes the wrong line is worse than one that refuses, because a refusal is information the model can act on and a silent mistake is not.</li>
-  <li><strong>Round-trip cost (facts 2 and 4).</strong> The model only learns a result on its next call, and each call resends the whole history. Ten reads in ten steps cost ten times the prefix.</li>
-</ul>
 
-<h2 id="tour">2. Code tour</h2>
-<h3>Pi: few tools, carefully bounded</h3>
-<p><code>packages/coding-agent/src/core/tools/</code> contains <code>read.ts</code>, <code>write.ts</code>, <code>edit.ts</code>, <code>bash.ts</code>, plus <code>grep.ts</code>, <code>find.ts</code> and <code>ls.ts</code>, which are off by default. The core prompt and tools stay under 1,000 tokens. Three details are worth copying:</p>
-<ul>
-  <li><strong>Truncation</strong> (<code>truncate.ts</code>): <code>DEFAULT_MAX_LINES = 2000</code> and <code>DEFAULT_MAX_BYTES = 50 * 1024</code>. The bash tool description tells the model this up front, and when output is cut the result names the line range kept and a file with the full output.</li>
-  <li><strong>Multi-edit</strong> (<code>edit.ts</code>): one call carries several <code>edits[]</code>; each <code>oldText</code> must match a unique, non-overlapping region. Line endings are normalized to LF for matching and the original endings and BOM are restored when writing.</li>
-  <li><strong>File mutation queue</strong> (<code>file-mutation-queue.ts</code>): writes to the same real path are serialized, writes to different files run in parallel. This is how Pi keeps parallel tool batches safe.</li>
-</ul>
-<h3>fx: a toolbox with search</h3>
-<p><code>src/tools/</code> groups tools by kind: <code>filesystem/</code> (read, write, edit, glob, grep), <code>shell/</code>, <code>web/</code> (search and fetch with an HTML-to-Markdown converter and a URL policy), <code>agent/</code> (subagent, vision, ask the user), <code>skills/</code> and <code>capabilities/</code>. <code>capability_search.zig</code> searches skills and MCP tools on request and loads the matching schemas only for the next step. Tool results are capped at 64 KB by default (<code>src/core/tooling/tool_result_limits.zig</code>) with a visible cut marker.</p>
-<h3>eve: tools that proxy into a sandbox</h3>
-<p>eve's built-in <code>bash</code>, <code>read_file</code>, <code>write_file</code> and <code>edit_file</code> run in the trusted app runtime and proxy into the sandbox (<code>docs/concepts/built-in-tools.md</code>). <code>bash</code> waits 60 seconds by default and at most 120 (to leave time for the model call inside a serverless function). A command still running after that keeps going as its own process group and returns <code>status: "running"</code>, a pid and an output directory under <code>/tmp/.eve/jobs/</code>; the model checks it later with <code>tail</code> and <code>cat .../exit</code>. Each stream keeps its last 2,000 lines or 50 KB. Any tool can be replaced by a file of the same name in <code>agent/tools/</code>, or removed with <code>disableTool()</code>.</p>
-<h3>nanocode: Code Mode</h3>
-<p>nanocode's answer to round-trip cost is to change the interface itself. In Code Mode only two tools are top level, <code>exec</code> and <code>wait</code> (<code>crates/backends/claude/prompts/code_mode.md</code>). The model writes JavaScript that calls every other tool through a <code>tools</code> object, for example <code>await tools.Bash({ command: "ls" })</code>, uses <code>Promise.all</code> for independent calls, and returns only what the next decision needs. Cells run in a QuickJS worker with a fresh context each time (<code>crates/runtime/code-mode-engine</code>). Pi has the same idea in <code>packages/codemode</code>. Chapter 9 builds it.</p>
+<h2 id="what">1. What a tool is, from the model's side</h2>
+<p>Ask what the model actually perceives. It sees each tool as a name, a description and a schema, all text in its input. It writes a call as text. It sees the result as text (or an image). It never sees the screen, the file system or the process; it sees only what the tool chose to return. So every tool has two jobs: do the action safely, and report it in a form the model can use. Most tool bugs are failures of the second job.</p>
 
-<h3>Codex: a patch grammar and a lock for parallelism</h3>
-<p>Codex's edit tool is <code>apply_patch</code>, and <code>codex-rs/apply-patch/src/parser.rs</code> opens with its formal Lark grammar: <code>*** Begin Patch</code>, then <code>Add File</code>, <code>Delete File</code> or <code>Update File</code> hunks with <code>@@</code> context lines, then <code>*** End Patch</code>. A file can be added, deleted, edited and moved in one call. <code>seek_sequence.rs</code> finds each hunk with decreasing strictness: exact match, then ignoring trailing whitespace, then ignoring leading and trailing whitespace. The parser is lenient for all models because one model (gpt-4.1, per the comment) needs it. That is the price of fact 5: a format the model was trained on still arrives with variations.</p>
-<p>Shell access is two tools, <code>exec_command</code> and <code>write_stdin</code> (<code>core/src/unified_exec/</code>). A command runs in a process that can outlive the call: the model waits up to <code>yield_time_ms</code> (10 seconds by default), gets what was printed, and can later send input or read more. Output to the model defaults to 10,000 tokens, kept in a head-and-tail buffer split 50/50. Parallel tool calls are controlled by a single read-write lock in <code>core/src/tools/parallel.rs</code>: a tool that supports parallel calls takes the read lock, any other takes the write lock. Reads overlap; a write waits for everything else. It is the "parallel unless a tool shares state" rule from Chapter 1 in four lines.</p>
-<h3>Claude Code: a tool pool assembled per request</h3>
-<p>The paper counts up to 54 built-in tools in v2.1.88 and describes a five-step assembly of the tool pool on every request: enumerate the base tools, filter by mode, remove denied tools before the model ever sees them, add MCP tools, deduplicate. Removing denied tools from the list, rather than refusing them later, saves context and stops the model from planning around a tool it cannot use. When tools do not stream, <code>runTools</code> sorts calls into concurrency-safe and exclusive groups.</p>
-<h3>Kimi Code: Claude-style tools with hard output budgets</h3>
-<p>Kimi Code's tools in <code>agent-core-v2/src/agent/tools/</code> will look familiar: Read, Write, Edit, Bash, Glob, Grep, FetchURL, WebSearch, Agent, AskUserQuestion, task tools and a <code>select-tools</code> tool for loading more tools on demand. Edit is an exact replacement that must be unique unless <code>replace_all</code> is set. The budgets are explicit: a read returns at most 100,000 characters; a bash command times out after 60 seconds by default; a long tool result is previewed as its first 4,096 and last 1,024 characters with lines capped at 2,000 characters, and results over 50,000 characters are saved to a file whose path goes to the model.</p>
-<h3>Qwen Code: read before you write</h3>
-<p>Qwen Code's <code>tools/</code> folder has over 100 source files and dozens of model-facing tools, from <code>edit</code> and <code>shell</code> to <code>lsp</code>, <code>cron-create</code>, <code>enter-worktree</code> and <code>team-create</code>. The most transferable idea is <code>tools/priorReadEnforcement.ts</code>: a tool that changes an existing file is rejected unless the session's file-read cache shows the model read that file and the file's fingerprint has not changed since. It answers a question that comes straight from fact 2: if the model never saw the current contents, its edit is a guess about text it cannot see.</p>
-<h3>Trae Agent: five tools</h3>
-<p>Trae Agent's default tool set in <code>trae_agent.py</code> is <code>bash</code>, <code>str_replace_based_edit_tool</code>, <code>json_edit_tool</code>, <code>sequentialthinking</code> and <code>task_done</code>; an optional <code>ckg</code> tool queries a code knowledge graph of functions and classes. Outputs are clipped at 16,000 characters and marked <code>&lt;response clipped&gt;</code>. A small, stable set makes ablations meaningful: change one tool and you know what changed.</p>
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 270" width="760" style="max-width:100%;height:auto" role="img" aria-label="The life of one tool call">
+  <defs><marker id="m1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="20" width="130" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="75.0" y="41.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">1. Schema in</text>
+  <text x="75.0" y="55.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">the request</text>
+  <rect x="160" y="20" width="130" height="50" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="225.0" y="41.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">2. Model writes</text>
+  <text x="225.0" y="55.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">the call</text>
+  <path d="M142 45.0H157" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m1)"/>
+  <rect x="310" y="20" width="130" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="375.0" y="41.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">3. Validate</text>
+  <text x="375.0" y="55.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">arguments</text>
+  <path d="M292 45.0H307" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m1)"/>
+  <rect x="460" y="20" width="130" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="525.0" y="41.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">4. Permission</text>
+  <text x="525.0" y="55.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">check</text>
+  <path d="M442 45.0H457" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m1)"/>
+  <rect x="610" y="20" width="130" height="50" rx="7" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="675.0" y="48.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">5. Execute</text>
+  <path d="M592 45.0H607" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m1)"/>
+  <rect x="10" y="130" width="130" height="50" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="75.0" y="151.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">10. Next call</text>
+  <text x="75.0" y="165.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">reads it</text>
+  <rect x="160" y="130" width="130" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="225.0" y="151.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">9. Append in</text>
+  <text x="225.0" y="165.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">request order</text>
+  <rect x="310" y="130" width="130" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="375.0" y="151.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">8. Shape for the</text>
+  <text x="375.0" y="165.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">model: bound, format</text>
+  <rect x="460" y="130" width="130" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="525.0" y="151.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">7. Keep the full</text>
+  <text x="525.0" y="165.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">result somewhere</text>
+  <rect x="610" y="130" width="130" height="50" rx="7" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="675.0" y="151.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">6. Capture output,</text>
+  <text x="675.0" y="165.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">exit code, files</text>
+  <path d="M158 155H143" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m1)"/>
+  <path d="M308 155H293" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m1)"/>
+  <path d="M458 155H443" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m1)"/>
+  <path d="M608 155H593" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m1)"/>
+  <path d="M675 72V126" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m1)"/>
+  <rect x="470" y="210" width="280" height="46" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="610.0" y="229.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">UI or channel view: full detail,</text>
+  <text x="610.0" y="243.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">diffs, progress</text>
+  <path d="M535 182V206" style="fill:none;stroke:var(--ink2);stroke-width:1.3;stroke-dasharray:4 3" marker-end="url(#m1)"/>
+  <text x="10" y="216" text-anchor="start" style="fill:var(--ink2);font-size:10px">Steps 3, 4, 7 and 8 are where harnesses</text>
+  <text x="10" y="232" text-anchor="start" style="fill:var(--ink2);font-size:10px">differ most. eve makes step 8 explicit: one</text>
+  <text x="10" y="248" text-anchor="start" style="fill:var(--ink2);font-size:10px">function decides what the model sees.</text>
+</svg></div>
+<figcaption>Figure 1. Ten steps for one call. The model is involved twice (writing the call, reading the result); everything else is harness design.</figcaption>
+</figure>
 
-<h2 id="decisions">3. Design decisions compared</h2>
+<p>SWE-agent's 2024 finding still frames the subject: the interface you give a model matters as much as the model, and a shell designed for humans (prints too much, fails silently, hides state) is a poor interface for a model that cannot scroll, glance or remember. Anthropic's guidance on writing tools for agents makes the same point in practice: use pagination, range selection, filtering, or truncation with sensible defaults, and describe each tool as you would to a new team member, making implicit context explicit.</p>
+<p>Every tool decision trades three costs, each from a fact in Chapter 0:</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 150" width="760" style="max-width:100%;height:auto" role="img" aria-label="Three costs every tool decision trades">
+  <defs><marker id="m2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="10" width="238" height="120" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="129.0" y="45.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Context cost</text>
+  <text x="129.0" y="59.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">facts 3 and 4</text>
+  <text x="129.0" y="73.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px"></text>
+  <text x="129.0" y="87.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">every schema is in every request,</text>
+  <text x="129.0" y="101.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">and every result stays in history</text>
+  <rect x="260" y="10" width="238" height="120" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="379.0" y="45.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Error cost</text>
+  <text x="379.0" y="59.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">fact 5</text>
+  <text x="379.0" y="73.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px"></text>
+  <text x="379.0" y="87.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">calls are sampled: wrong tool, bad</text>
+  <text x="379.0" y="101.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">arguments, a silent wrong edit</text>
+  <rect x="510" y="10" width="238" height="120" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="629.0" y="45.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Round-trip cost</text>
+  <text x="629.0" y="59.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">facts 2 and 4</text>
+  <text x="629.0" y="73.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px"></text>
+  <text x="629.0" y="87.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">the model learns a result only on</text>
+  <text x="629.0" y="101.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">its next call, which resends everything</text>
+</svg></div>
+<figcaption>Figure 2. More tools raise context cost and lower round-trip cost; fewer, more general tools do the opposite. Tolerant tools lower error cost at the risk of a wrong action.</figcaption>
+</figure>
+
+<h2 id="decisions">2. The decisions, one at a time</h2>
+<h3 id="d-shell">Decision 1. The shell, or dedicated tools?</h3>
+<p>A coding agent can do almost everything through one tool, the shell: read with <code>cat</code>, search with <code>rg</code>, edit with <code>sed</code> or a heredoc. Or the harness can provide a dedicated tool for each action: Read, Grep, Glob, Edit, Write. This is the most visible split between harnesses, and it is moving.</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 210" width="760" style="max-width:100%;height:auto" role="img" aria-label="Spectrum from shell-first to dedicated-first">
+  <defs><marker id="m3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <path d="M20 60H740" style="fill:none;stroke:var(--ink2);stroke-width:2"/>
+  <text x="20" y="40" text-anchor="start" style="fill:var(--ink);font-size:11px;font-weight:600">shell-first</text>
+  <text x="740" y="40" text-anchor="end" style="fill:var(--ink);font-size:11px;font-weight:600">dedicated-first</text>
+  <circle cx="70" cy="60" r="6" style="fill:var(--kv)"/>
+  <text x="70" y="86" text-anchor="middle" style="fill:var(--ink);font-size:11px;font-weight:600">Codex</text>
+  <text x="70" y="102" text-anchor="middle" style="fill:var(--ink2);font-size:9px">shell + patch;</text>
+  <text x="70" y="115" text-anchor="middle" style="fill:var(--ink2);font-size:9px">no read tool</text>
+  <circle cx="194" cy="60" r="6" style="fill:var(--kv)"/>
+  <text x="194" y="86" text-anchor="middle" style="fill:var(--ink);font-size:11px;font-weight:600">Claude Code</text>
+  <text x="194" y="102" text-anchor="middle" style="fill:var(--ink2);font-size:9px">Glob, Grep off</text>
+  <text x="194" y="115" text-anchor="middle" style="fill:var(--ink2);font-size:9px">on Unix</text>
+  <circle cx="318" cy="60" r="6" style="fill:var(--kv)"/>
+  <text x="318" y="86" text-anchor="middle" style="fill:var(--ink);font-size:11px;font-weight:600">Pi</text>
+  <text x="318" y="102" text-anchor="middle" style="fill:var(--ink2);font-size:9px">4 core tools;</text>
+  <text x="318" y="115" text-anchor="middle" style="fill:var(--ink2);font-size:9px">grep, find off</text>
+  <circle cx="442" cy="60" r="6" style="fill:var(--kv)"/>
+  <text x="442" y="86" text-anchor="middle" style="fill:var(--ink);font-size:11px;font-weight:600">Trae Agent</text>
+  <text x="442" y="102" text-anchor="middle" style="fill:var(--ink2);font-size:9px">bash + one</text>
+  <text x="442" y="115" text-anchor="middle" style="fill:var(--ink2);font-size:9px">editor tool</text>
+  <circle cx="566" cy="60" r="6" style="fill:var(--kv)"/>
+  <text x="566" y="86" text-anchor="middle" style="fill:var(--ink);font-size:11px;font-weight:600">Kimi Code</text>
+  <text x="566" y="102" text-anchor="middle" style="fill:var(--ink2);font-size:9px">bash told to use</text>
+  <text x="566" y="115" text-anchor="middle" style="fill:var(--ink2);font-size:9px">Read, Glob, Grep</text>
+  <circle cx="690" cy="60" r="6" style="fill:var(--kv)"/>
+  <text x="690" y="86" text-anchor="middle" style="fill:var(--ink);font-size:11px;font-weight:600">fx</text>
+  <text x="690" y="102" text-anchor="middle" style="fill:var(--ink2);font-size:9px">use file tools,</text>
+  <text x="690" y="115" text-anchor="middle" style="fill:var(--ink2);font-size:9px">not ls, cat</text>
+  <text x="20" y="150" text-anchor="start" style="fill:var(--ink2);font-size:10px">nanocode's Claude driver has per-model guidance: newest models are steered to Bash</text>
+  <text x="20" y="166" text-anchor="start" style="fill:var(--ink2);font-size:10px">(cat, sed -n, grep, heredocs) over Read, Edit and Write; older models get the opposite.</text>
+  <text x="20" y="190" text-anchor="start" style="fill:var(--ink2);font-size:10px">eve and Qwen Code sit in the middle: dedicated tools and a shell, no rule against either.</text>
+</svg></div>
+<figcaption>Figure 3. Where each harness sits. The direction of travel in 2026 is toward the shell for reading and searching.</figcaption>
+</figure>
+
+<p>Derive the trade-off. For the shell: models have seen enormous amounts of shell use in training, so they use it fluently; one general tool costs less context than five specific ones; and any new command-line program is usable with no harness change. Against the shell: its output is unbounded and unstructured; permission rules on raw command text are hard (Chapter 7); and the harness loses track of what the model has read, which matters for read-before-write (decision 4).</p>
+<p>The harnesses that lean on the shell recover the lost properties another way. Claude Code's documentation says that on macOS, Linux and WSL it leaves Glob and Grep out of the default tool set, and in its shell <code>find</code> and <code>grep</code> run embedded versions of <code>bfs</code> and <code>ugrep</code>, so searches still reach permission rules and hooks as shell calls. It also counts a small set of single-file shell views (<code>cat</code>, <code>head</code>, <code>tail</code>, <code>sed -n</code>, <code>grep</code>, <code>rg</code> and a few more, with no pipes) as reads for the purpose of read-before-edit. Codex bounds shell output and offers a patch tool for edits, so the one thing it does not leave to the shell is writing. The harnesses that lean on dedicated tools say so in the shell's own description: Kimi Code's tells the model to translate <code>cat</code>, <code>find</code> and <code>grep</code> into Read, Glob and Grep, and fx's says to use its file tools rather than <code>ls</code>, <code>find</code>, <code>grep</code> or <code>cat</code>.</p>
+
+<h3 id="d-shellmodel">Decision 2. What is the shell, exactly?</h3>
+<p>Once there is a shell tool, three questions remain: does state (working directory, variables) carry from one call to the next, what happens to a command that outlives its time limit, and how big may a command's output be. The answers form three models.</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 250" width="760" style="max-width:100%;height:auto" role="img" aria-label="Three shell models">
+  <defs><marker id="m4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <text x="10" y="18" text-anchor="start" style="fill:var(--ink);font-size:12px;font-weight:600">A. One persistent shell</text>
+  <text x="10" y="34" text-anchor="start" style="fill:var(--ink2);font-size:10px">Trae Agent</text>
+  <rect x="10" y="44" width="238" height="110" rx="7" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="129.0" y="88.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">state carries over</text>
+  <text x="129.0" y="102.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">120 s limit, then the</text>
+  <text x="129.0" y="116.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">shell must restart</text>
+  <rect x="10" y="166" width="238" height="34" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="129.0" y="186.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">a hung command kills the session</text>
+  <text x="260" y="18" text-anchor="start" style="fill:var(--ink);font-size:12px;font-weight:600">B. Fresh shell per call</text>
+  <text x="260" y="34" text-anchor="start" style="fill:var(--ink2);font-size:10px">fx, Kimi Code, Pi, Claude Code*</text>
+  <rect x="260" y="44" width="238" height="110" rx="7" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="379.0" y="88.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">cd and export reset</text>
+  <text x="379.0" y="102.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">(Claude Code keeps cd</text>
+  <text x="379.0" y="116.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">inside the project)</text>
+  <rect x="260" y="166" width="238" height="34" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="379.0" y="186.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">predictable; long jobs need care</text>
+  <text x="510" y="18" text-anchor="start" style="fill:var(--ink);font-size:12px;font-weight:600">C. Process sessions</text>
+  <text x="510" y="34" text-anchor="start" style="fill:var(--ink2);font-size:10px">Codex, fx, eve</text>
+  <rect x="510" y="44" width="238" height="110" rx="7" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="629.0" y="88.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">yield after a wait,</text>
+  <text x="629.0" y="102.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">return a handle,</text>
+  <text x="629.0" y="116.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">poll or send input</text>
+  <rect x="510" y="166" width="238" height="34" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="629.0" y="186.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">long jobs are first-class</text>
+  <text x="10" y="224" text-anchor="start" style="fill:var(--ink2);font-size:10px">* Claude Code: a separate process per command, but cd carries over inside the project;</text>
+  <text x="10" y="240" text-anchor="start" style="fill:var(--ink2);font-size:10px">  environment variables never carry over.</text>
+</svg></div>
+<figcaption>Figure 4. Persistent shells are convenient and fragile; fresh shells are predictable; process sessions make long-running commands a normal case instead of an error.</figcaption>
+</figure>
+
+<p>The long-running case is where the models differ most, and where the details matter.</p>
 <div class="tbl"><table>
-  <tr><th>Decision</th><th>Pi</th><th>fx</th><th>eve</th><th>nanocode</th></tr>
-  <tr><td>Default tool count</td><td>4 (plus 3 optional)</td><td>~15 across 7 groups</td><td>bash, files, glob, grep, sleep, catalog tools</td><td>Vendor's own set, or exec and wait</td></tr>
-  <tr><td>Edit format</td><td>Exact multi-replace</td><td>Exact replace</td><td>Exact replace, in sandbox</td><td>Vendor's (Claude string replace, Codex apply_patch)</td></tr>
-  <tr><td>Output bound</td><td>2,000 lines or 50 KB, full output saved</td><td>64 KB with cut marker</td><td>2,000 lines or 50 KB per stream</td><td>Per tool, file handle for the rest</td></tr>
-  <tr><td>Long commands</td><td>Use tmux (no background bash)</td><td>Dev servers can keep running</td><td>Background after timeout, job directory</td><td>Background after timeout, reported by the next exec or wait</td></tr>
-  <tr><td>Many tools</td><td>Avoid; CLIs with READMEs</td><td>Capability search</td><td>Catalog search tools</td><td>BM25 search over MCP tools</td></tr>
+  <tr><th>Harness</th><th>Default wait</th><th>When the wait runs out</th><th>Output to the model</th></tr>
+  <tr><td>Codex</td><td>10 s (range 0.25 to 30 s)</td><td>Returns a session ID; the model reads more or sends input with a second tool. Up to 64 live processes.</td><td>10,000 tokens by default, head and tail kept</td></tr>
+  <tr><td>fx</td><td>A model-chosen wait</td><td>Returns a session ID to interact with or stop. Its description says "Never rerun it". A quiet command is never killed; the model is asked to check it.</td><td>64 KB per result, rest behind a handle</td></tr>
+  <tr><td>eve</td><td>60 s, at most 120</td><td>The command keeps running in its own process group; the result gives a process ID and a job directory with stdout, stderr and an exit file.</td><td>Last 2,000 lines or 50 KB per stream</td></tr>
+  <tr><td>Claude Code</td><td>2 min, at most 10</td><td>Moved to the background automatically, with the task ID and output path. Unattended sessions limit background commands to 30 min by default, 2 h at most.</td><td>About 30,000 characters inline for a success, about 10,000 for a failure</td></tr>
+  <tr><td>Pi</td><td>No default timeout</td><td>Runs until done unless the model passed a timeout</td><td>Last 2,000 lines or 50 KB, full output saved to a file</td></tr>
+  <tr><td>Kimi Code</td><td>60 s</td><td>Background guidance in the tool description</td><td>Head 4,096 and tail 1,024 characters; over 50,000 saved to a file</td></tr>
+  <tr><td>Trae Agent</td><td>120 s</td><td>The shell reports a timeout and must be restarted</td><td>Clipped at 16,000 characters</td></tr>
 </table></div>
-<p>The same decisions in the five reference harnesses:</p>
-<div class="tbl"><table>
-  <tr><th>Decision</th><th>Codex</th><th>Claude Code</th><th>Kimi Code</th><th>Qwen Code</th><th>Trae Agent</th></tr>
-<tr><td>Edit format</td><td><code>apply_patch</code> grammar, fuzzy hunk matching</td><td>Exact string replacement</td><td>Exact replacement, unique or <code>replace_all</code></td><td>Edit plus prior-read check</td><td><code>str_replace</code> edit tool</td></tr>
-<tr><td>Shell</td><td><code>exec_command</code> + <code>write_stdin</code>, long-lived processes</td><td>Bash tool with sandbox</td><td>Bash, 60 s default timeout, background tasks</td><td>Shell with background registry</td><td>One persistent bash</td></tr>
-<tr><td>Output bound</td><td>10,000 tokens, head and tail</td><td>Per-message size caps</td><td>4,096 head + 1,024 tail chars; over 50k saved to file</td><td>Output size and retention services</td><td>16,000 chars</td></tr>
-<tr><td>Parallelism</td><td>Read-write lock</td><td>Concurrency-safe vs exclusive</td><td>Tool scheduler</td><td>Tool scheduler</td><td>Sequential</td></tr>
-<tr><td>Tool count</td><td>About 28 handler modules</td><td>Up to 54</td><td>About 15 core</td><td>Dozens (100+ source files)</td><td>5</td></tr>
-</table></div>
-<div class="grid2">
-  <div class="box ex"><span class="lbl">Few general tools</span><p><strong>Pro:</strong> tiny prompt, high cache hit rate, the model writes its own tools in bash. <strong>Con:</strong> weaker models need more guidance; bash output is noisy.</p></div>
-  <div class="box ex"><span class="lbl">Many specialized tools</span><p><strong>Pro:</strong> clear actions, validation and good errors per action. <strong>Con:</strong> schemas fill the context; more ways to choose wrong.</p></div>
-</div>
+<p>The reasoning behind process sessions is worth spelling out. A time limit exists to keep the loop responsive, not because the command is wrong. Killing a test suite at 120 seconds throws away the work and teaches the model to retry the same slow command. Returning a handle keeps the work and turns "wait" into an ordinary action the model can choose. eve adds one more reason: its harness runs inside serverless functions with their own time limit, so a shell call must return in time for the model call that follows.</p>
+<p>Claude Code adds a detail that shows how much a description must say: exit code 1 counts as success only for commands where it is a normal answer (<code>grep</code>, <code>rg</code>, <code>find</code>, <code>diff</code>, <code>test</code> and a few others); for everything else it is a failure and gets the shorter, head-and-tail output. A model told "the command failed" behaves differently from one told "no matches".</p>
 
-<h2 id="research">4. Research and the Chinese view</h2>
+<h3 id="d-edit">Decision 3. What does an edit look like?</h3>
+<p>Writing whole files is simple and wasteful: a one-line change to a 2,000-line file resends 2,000 lines and risks silently dropping some. So every harness offers a partial edit. Three formats exist, and the choice is a bet about how models fail.</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 256" width="760" style="max-width:100%;height:auto" role="img" aria-label="Three edit formats">
+  <defs><marker id="m5" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <text x="10" y="18" text-anchor="start" style="fill:var(--ink);font-size:12px;font-weight:600">Exact replacement</text>
+  <text x="10" y="34" text-anchor="start" style="fill:var(--ink2);font-size:10px">Claude Code, fx, Kimi Code, Qwen, Trae</text>
+  <rect x="10" y="44" width="238" height="110" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="129.0" y="88.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">old text → new text</text>
+  <text x="129.0" y="102.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">must appear exactly once</text>
+  <text x="129.0" y="116.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">(or replace all)</text>
+  <text x="260" y="18" text-anchor="start" style="fill:var(--ink);font-size:12px;font-weight:600">Multi-edit with tolerance</text>
+  <text x="260" y="34" text-anchor="start" style="fill:var(--ink2);font-size:10px">Pi, eve</text>
+  <rect x="260" y="44" width="238" height="110" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="379.0" y="81.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">several {old, new} pairs</text>
+  <text x="379.0" y="95.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">matched against the original,</text>
+  <text x="379.0" y="109.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">unique, non-overlapping;</text>
+  <text x="379.0" y="123.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">exact first, then normalised</text>
+  <text x="510" y="18" text-anchor="start" style="fill:var(--ink);font-size:12px;font-weight:600">Patch grammar</text>
+  <text x="510" y="34" text-anchor="start" style="fill:var(--ink2);font-size:10px">Codex</text>
+  <rect x="510" y="44" width="238" height="110" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="629.0" y="81.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">*** Begin Patch</text>
+  <text x="629.0" y="95.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Add / Delete / Update File</text>
+  <text x="629.0" y="109.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">@@ context lines</text>
+  <text x="629.0" y="123.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">*** End Patch</text>
+  <rect x="10" y="166" width="740" height="76" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="380.0" y="186.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">When the search text does not match exactly:</text>
+  <text x="380.0" y="200.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">Claude Code and fx refuse.</text>
+  <text x="380.0" y="214.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">Pi and eve retry after normalising trailing spaces, smart quotes, dashes and special spaces.</text>
+  <text x="380.0" y="228.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">Codex retries a hunk ignoring trailing, then leading and trailing, whitespace.</text>
+</svg></div>
+<figcaption>Figure 5. Formats and their failure policy. The policy matters as much as the format.</figcaption>
+</figure>
+
 <ul>
-  <li><strong>SWE-agent</strong> (<a href="https://arxiv.org/abs/2405.15793v2">arXiv 2405.15793</a>): simple actions, informative errors and history processors beat a raw shell.</li>
-  <li><strong>Minimal works too.</strong> Terminus 2, a reference agent that sends raw keystrokes to tmux, ranks competitively on Terminal-Bench 2.0; Mario Zechner cites it as evidence for Pi's minimalism.</li>
-  <li><strong>Tool masking.</strong> Manus does not add or remove tools mid-task because tool definitions sit near the front of the context and any change breaks the KV cache; it masks tools instead.</li>
-  <li><strong>Chinese practice.</strong> Chinese write-ups summarize Claude Code's architecture as one loop plus a short list of tools (bash, read, write, edit, glob, grep, browser) plus on-demand skills and compression (<a href="https://www.gitlink.org.cn/mirrors/analysis_claude_code">Learn Claude Code mirror</a>), the same minimal-core-plus-extensions shape as Pi.</li>
+  <li><strong>Exact replacement</strong> is the most common because it is the easiest to explain and verify: the search text must appear exactly once, or the model must add context or ask to replace every occurrence. Claude Code's documentation states it plainly: no regex, no fuzzy matching, and a single character of whitespace difference is enough to miss. The cost is failed edits, which cost a round trip each.</li>
+  <li><strong>Multi-edit with tolerance</strong> (Pi, and eve's edit tool with the same rules) batches several replacements into one call, all matched against the file as it was before the call, so the model does not have to predict how earlier edits shift later ones. Overlaps are rejected with a message that names both edits. If no exact match exists, it normalises the text the way models tend to mangle it (Unicode normalisation, trailing spaces, smart quotes to straight quotes, Unicode dashes to hyphens, special spaces to plain spaces) and tries again. Line endings and a byte-order mark are preserved on write.</li>
+  <li><strong>A patch grammar</strong> (Codex) lets one call add, delete, update and move several files, with context lines instead of line numbers. It suits models trained to produce it; Codex's parser is lenient about the envelope for at least one model that needs it, and finds hunks with decreasing strictness.</li>
+</ul>
+<p>The error message is part of the format. Pi's says how many times the text occurred and asks for more context; its overlap error names the two edits and tells the model to merge them or target disjoint regions. An error that says exactly what to do next turns a failed edit into one extra step instead of a spiral.</p>
+
+<h3 id="d-read">Decision 4. Must the model read a file before it changes it?</h3>
+<p>Fact 2 again: the model only knows a file's contents if they are in its context. An edit to a file it never read is a guess about text it cannot see, and an edit based on a read from twenty minutes ago may overwrite changes made since (by the person, a formatter or another agent). Harnesses track what the model has seen to catch both.</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 232" width="760" style="max-width:100%;height:auto" role="img" aria-label="What a harness tracks about each file">
+  <defs><marker id="m6" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="30" width="150" height="50" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="85.0" y="59.0" text-anchor="middle" style="fill:var(--ink);font-size:11px">never read</text>
+  <rect x="220" y="30" width="170" height="50" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="305.0" y="59.0" text-anchor="middle" style="fill:var(--ink);font-size:11px">read, matches disk</text>
+  <rect x="450" y="30" width="170" height="50" rx="7" style="fill:var(--bad-s);stroke:var(--bad)"/>
+  <text x="535.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">read, disk changed</text>
+  <text x="535.0" y="65.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">since (stale)</text>
+  <path d="M162 55H216" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m6)"/>
+  <text x="170" y="48" text-anchor="start" style="fill:var(--ink2);font-size:10px">read</text>
+  <path d="M392 55H446" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m6)"/>
+  <text x="400" y="48" text-anchor="start" style="fill:var(--ink2);font-size:10px">changed</text>
+  <path d="M535 82V110H305V84" style="fill:none;stroke:var(--ink2);stroke-width:1.3;stroke-dasharray:4 3" marker-end="url(#m6)"/>
+  <text x="330" y="106" text-anchor="start" style="fill:var(--ink2);font-size:10px">read again</text>
+  <rect x="10" y="126" width="740" height="96" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="380.0" y="156.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Qwen Code: rejects a change unless the file was read and its fingerprint still matches.</text>
+  <text x="380.0" y="170.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">eve: write requires a read and detects stale reads; edit does not require a read.</text>
+  <text x="380.0" y="184.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Claude Code: older models must read first; newer ones may edit an unread file when reading needs no prompt;</text>
+  <text x="380.0" y="198.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">an edit to a changed file is allowed if the search text still matches the current contents exactly once.</text>
+</svg></div>
+<figcaption>Figure 6. Three states per file. Every policy is a rule about which state allows which change.</figcaption>
+</figure>
+
+<p>The trend in Claude Code's documentation is instructive: the strict rule (always read first) applies to older models, while newer models may edit an unread file when reading it would not need a permission prompt, and a partial read never counts. The strict rule cost round trips that capable models did not need; the relaxation keeps the safety where it matters (unreadable files, partial reads, stale search text).</p>
+<p>A related problem is two writes to one file at once. Pi serialises all changes to the same real path through a per-file queue while letting changes to different files run in parallel; Chapter 1 showed how Codex and Claude Code reach the same result with locks and concurrency classes.</p>
+
+<h3 id="d-bounds">Decision 5. How big may a result be, and where does the rest go?</h3>
+<p>Output is the largest single source of context growth. A test run can print 40,000 lines; left in history, it is resent on every later step and dilutes attention (facts 3 and 4). So every harness bounds results. The design question is what happens to the part that is cut.</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 230" width="760" style="max-width:100%;height:auto" role="img" aria-label="Three truncation strategies">
+  <defs><marker id="m7" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <text x="10" y="18" text-anchor="start" style="fill:var(--ink);font-size:12px;font-weight:600">A. Cut and drop</text>
+  <text x="10" y="34" text-anchor="start" style="fill:var(--ink2);font-size:10px">Trae Agent (16,000 chars)</text>
+  <rect x="10" y="44" width="238" height="90" rx="7" style="fill:var(--bad-s);stroke:var(--bad)"/>
+  <text x="129.0" y="78.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">model sees a prefix</text>
+  <text x="129.0" y="92.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">and a clipped marker;</text>
+  <text x="129.0" y="106.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">the rest is gone</text>
+  <text x="260" y="18" text-anchor="start" style="fill:var(--ink);font-size:12px;font-weight:600">B. Cut and save to a file</text>
+  <text x="260" y="34" text-anchor="start" style="fill:var(--ink2);font-size:10px">Pi, Claude Code, Kimi, Qwen, eve</text>
+  <rect x="260" y="44" width="238" height="90" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="379.0" y="78.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">model sees head and/or tail</text>
+  <text x="379.0" y="92.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">plus a path to the full</text>
+  <text x="379.0" y="106.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">output; reads it in ranges</text>
+  <text x="510" y="18" text-anchor="start" style="fill:var(--ink);font-size:12px;font-weight:600">C. Cut and keep a handle</text>
+  <text x="510" y="34" text-anchor="start" style="fill:var(--ink2);font-size:10px">fx</text>
+  <rect x="510" y="44" width="238" height="90" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="629.0" y="78.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">model sees 64 KB and a</text>
+  <text x="629.0" y="92.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">handle; a tool searches or</text>
+  <text x="629.0" y="106.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">reads byte ranges by handle</text>
+  <rect x="10" y="150" width="740" height="64" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="380.0" y="171.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Which end to keep: a log's useful part is usually the end (the error), a file's is the start.</text>
+  <text x="380.0" y="185.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Pi keeps the last lines of shell output but the first lines of a read; Codex and Claude Code keep head and tail of failures;</text>
+  <text x="380.0" y="199.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Qwen Code adds a hash of the full output so its loop detector can tell two different long outputs apart.</text>
+</svg></div>
+<figcaption>Figure 7. Strategy A loses information; B and C make truncation lossless, because the model can always ask for the part it needs.</figcaption>
+</figure>
+
+<div class="tbl"><table>
+  <tr><th>Harness</th><th>Shell result</th><th>File read</th><th>Where the rest goes</th></tr>
+  <tr><td>Pi</td><td>Last 2,000 lines or 50 KB</td><td>First 2,000 lines or 50 KB, with offset and limit</td><td>Temp file, path in the result</td></tr>
+  <tr><td>eve</td><td>Last 2,000 lines or 50 KB per stream; lines cut at 2,000 characters</td><td>Line-numbered; images to 3 MiB, PDFs to 20 MiB</td><td>Job directory for long commands</td></tr>
+  <tr><td>Claude Code</td><td>About 30,000 characters (success) or 10,000 (failure)</td><td>25,000 tokens per call; a whole file over 256 KB is refused</td><td>Session file with a 2,000-character preview</td></tr>
+  <tr><td>Codex</td><td>10,000 tokens, head and tail</td><td>Through the shell</td><td>Process buffer of 1 MiB</td></tr>
+  <tr><td>fx</td><td>64 KB per tool result (configurable, minimum 1 KB)</td><td>Line ranges</td><td>Session; read by handle, by query or byte range</td></tr>
+  <tr><td>Kimi Code</td><td>Head 4,096 and tail 1,024 characters</td><td>Up to 100,000 characters</td><td>File for results over 50,000 characters</td></tr>
+  <tr><td>Qwen Code</td><td>25,000 characters or 1,000 lines by default</td><td>Paged</td><td>File (up to 50 MB each, 500 MB per session), with a hash of the full output</td></tr>
+  <tr><td>Trae Agent</td><td>16,000 characters</td><td>Editor view</td><td>Dropped</td></tr>
+</table></div>
+<p>Anthropic's tool-writing guidance gives the default behind Claude Code's read limit: "we restrict tool responses to 25,000 tokens by default". The numbers cluster at about 10,000 to 30,000 tokens' worth between harnesses built by very different teams.</p>
+
+<h3 id="d-many">Decision 6. How many tools does the model see?</h3>
+<p>Every tool definition is in every request. Connect a few MCP servers and the definitions alone can run to tens of thousands of tokens, most of which the model never uses. Worse, adding or removing a tool mid-session changes the start of the request and breaks the prompt cache (Chapter 2). Both problems have the same fix: keep a small, fixed list of tools in the request, and let the model find the rest.</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 214" width="760" style="max-width:100%;height:auto" role="img" aria-label="Deferred tools and tool search">
+  <defs><marker id="m8" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="20" width="220" height="120" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="120.0" y="62.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Always in the request</text>
+  <text x="120.0" y="76.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">core tools</text>
+  <text x="120.0" y="90.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">+ a search tool</text>
+  <text x="120.0" y="104.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">+ a call-by-name tool</text>
+  <rect x="280" y="20" width="200" height="54" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="380.0" y="43.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Model asks the search tool</text>
+  <text x="380.0" y="57.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">"linear issues"</text>
+  <rect x="280" y="86" width="200" height="54" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="380.0" y="109.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Search returns names,</text>
+  <text x="380.0" y="123.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">descriptions, signatures</text>
+  <rect x="530" y="20" width="220" height="120" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="640.0" y="69.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Catalog (not in the request)</text>
+  <text x="640.0" y="83.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">MCP tools, rare built-ins,</text>
+  <text x="640.0" y="97.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">deferred skills</text>
+  <path d="M232 47H276" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m8)"/>
+  <path d="M482 47H526" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m8)"/>
+  <path d="M526 113H484" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m8)"/>
+  <path d="M278 113H234" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m8)"/>
+  <text x="10" y="168" text-anchor="start" style="fill:var(--ink2);font-size:10px">Claude Code (ToolSearch), Codex (tool_search), Qwen Code (ToolSearch), eve (eve__search,</text>
+  <text x="10" y="184" text-anchor="start" style="fill:var(--ink2);font-size:10px">eve__tool), Kimi Code (select tools), fx (toolbox). The request's list never changes, so the</text>
+  <text x="10" y="200" text-anchor="start" style="fill:var(--ink2);font-size:10px">cache survives tools arriving or leaving.</text>
+</svg></div>
+<figcaption>Figure 8. Progressive disclosure for tools. The model pays for a tool's full schema only when it decides it needs it.</figcaption>
+</figure>
+
+<p>The variations are in how a found tool is called. In eve and Qwen Code, the search returns a signature and the model calls the tool through a generic call-by-name tool, so the request's tool list stays fixed. Claude Code's documentation describes the cache consequence directly: with tools deferred, the tool list from the conversation's first request stays fixed, and a server that connects later supplies its tools as deferred definitions. Pi takes a different route: changes to the available tools are declared in the transcript as a system message, so replaying the transcript always reproduces the tools offered at each point.</p>
+
+<h3 id="d-desc">Decision 7. What goes in a tool's description and result?</h3>
+<p>A description is a prompt the model reads on every call. It is the cheapest place to prevent a misuse, and the most often neglected.</p>
+<ul>
+  <li><strong>Say the limits.</strong> Pi's shell description tells the model the output is cut to the last 2,000 lines or 50 KB and that the full output is saved, so the model is not surprised by a truncated log.</li>
+  <li><strong>Say what not to do.</strong> fx's shell description: each call starts a new shell, so <code>cd</code> and <code>export</code> do not carry over; a command still running returns a session ID, never rerun it. Kimi Code's tells the model which shell commands to translate into dedicated tools and to issue independent read-only commands as parallel calls.</li>
+  <li><strong>Keep it short, enforce it.</strong> fx checks at build time that the shell description fits the description length limit, because a longer one would be cut before it reaches the model.</li>
+  <li><strong>Shape the result for the model, not the UI.</strong> eve separates what a tool returns from what the model sees: a channel may need rich data, the model only the gist. Codex's patch results and Claude Code's moved-to-background notices are written as instructions for the next step.</li>
+  <li><strong>Make errors actionable.</strong> Every harness returns tool errors as results, never as crashes (Chapter 1). The good ones say what to do: provide more context, merge two edits, read the file first, use a longer timeout.</li>
 </ul>
 
-<h2 id="build">5. Build: a typed tool registry</h2>
+<h2 id="harnesses">3. The nine tool sets, harness by harness</h2>
+<p>Each diagram shows the tools the model sees by default, grouped by job. Indigo marks tools that reach the outside world or other agents; amber marks tools that act on the local environment.</p>
+
+<h3 id="h-pi">Pi: four tools and a strong opinion</h3>
+<p>Pi's default set is read, write, edit and bash; grep, find and ls exist but are off by default. The reasoning is Pi's general position: a small core costs little context and leaves the model to use the shell for everything else. The care goes into the four: bounded and saved output, multi-edit with tolerant matching and preserved line endings, image reading, and a per-file queue for concurrent changes.</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 120" width="760" style="max-width:100%;height:auto" role="img" aria-label="Pi tools">
+  <defs><marker id="m9" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <text x="10" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">files</text>
+  <rect x="10" y="24" width="110" height="22" rx="4" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="65.0" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">read</text>
+  <rect x="10" y="50" width="110" height="22" rx="4" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="65.0" y="64.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">write</text>
+  <rect x="10" y="76" width="110" height="22" rx="4" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="65.0" y="90.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">edit</text>
+  <text x="132" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">shell</text>
+  <rect x="132" y="24" width="110" height="22" rx="4" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="187.0" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">bash</text>
+  <text x="254" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">off by default</text>
+  <rect x="254" y="24" width="110" height="22" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="309.0" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">grep</text>
+  <rect x="254" y="50" width="110" height="22" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="309.0" y="64.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">find</text>
+  <rect x="254" y="76" width="110" height="22" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="309.0" y="90.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">ls</text>
+</svg></div>
+<figcaption>Figure 9. Pi. Everything else, including web access and subagents, comes from extensions.</figcaption>
+</figure>
+
+<h3 id="h-eve">eve: tools that run outside the sandbox and reach into it</h3>
+<p>eve's file and shell tools run in the trusted application runtime and act on a separate sandbox, so credentials and integration code never sit in model-controlled compute (Chapter 7). The default set adds web fetch and search and the agent tool; opt-ins include ask-the-user, glob, grep, a no-reply tool for scheduled checks that find nothing, and a sleep that survives restarts. Any tool can be marked deferred and found through its catalog tools.</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 120" width="760" style="max-width:100%;height:auto" role="img" aria-label="eve tools">
+  <defs><marker id="m10" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <text x="10" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">files</text>
+  <rect x="10" y="24" width="110" height="22" rx="4" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="65.0" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">read_file</text>
+  <rect x="10" y="50" width="110" height="22" rx="4" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="65.0" y="64.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">write_file</text>
+  <rect x="10" y="76" width="110" height="22" rx="4" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="65.0" y="90.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">edit_file</text>
+  <text x="132" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">shell</text>
+  <rect x="132" y="24" width="110" height="22" rx="4" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="187.0" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">bash</text>
+  <text x="254" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">web</text>
+  <rect x="254" y="24" width="110" height="22" rx="4" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="309.0" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">web_fetch</text>
+  <rect x="254" y="50" width="110" height="22" rx="4" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="309.0" y="64.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">web_search</text>
+  <text x="376" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">agents, catalog</text>
+  <rect x="376" y="24" width="110" height="22" rx="4" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="431.0" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">agent</text>
+  <rect x="376" y="50" width="110" height="22" rx="4" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="431.0" y="64.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">eve__search</text>
+  <rect x="376" y="76" width="110" height="22" rx="4" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="431.0" y="90.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">eve__tool</text>
+  <text x="498" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">opt-in</text>
+  <rect x="498" y="24" width="110" height="22" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="553.0" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">glob</text>
+  <rect x="498" y="50" width="110" height="22" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="553.0" y="64.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">grep</text>
+  <rect x="498" y="76" width="110" height="22" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="553.0" y="90.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">ask_question</text>
+</svg></div>
+<figcaption>Figure 10. eve. Long commands become jobs with a directory the model can inspect later.</figcaption>
+</figure>
+
+<h3 id="h-fx">fx: dedicated tools with lossless results</h3>
+<p>fx has file tools (glob with a count-only mode, literal-text grep, read with line ranges and images, write, edit), a process-session shell, web fetch and search with a URL policy and HTML-to-Markdown conversion, subagents, vision, ask-the-user, and a toolbox for skills and MCP servers. Results over 64 KB are cut with a marker and stay readable through a dedicated tool by handle, by search query or by byte range, which also finds earlier tool calls after compaction.</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 140" width="760" style="max-width:100%;height:auto" role="img" aria-label="fx tools">
+  <defs><marker id="m11" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <text x="10" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">files</text>
+  <rect x="10" y="24" width="110" height="22" rx="4" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="65.0" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">read_file</text>
+  <rect x="10" y="50" width="110" height="22" rx="4" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="65.0" y="64.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">write_file</text>
+  <rect x="10" y="76" width="110" height="22" rx="4" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="65.0" y="90.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">edit_file</text>
+  <rect x="10" y="102" width="110" height="22" rx="4" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="65.0" y="116.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">glob_files</text>
+  <text x="132" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">search, shell</text>
+  <rect x="132" y="24" width="110" height="22" rx="4" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="187.0" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">grep_files</text>
+  <rect x="132" y="50" width="110" height="22" rx="4" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="187.0" y="64.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">shell</text>
+  <text x="254" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">web</text>
+  <rect x="254" y="24" width="110" height="22" rx="4" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="309.0" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">web_fetch</text>
+  <rect x="254" y="50" width="110" height="22" rx="4" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="309.0" y="64.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">web_search</text>
+  <text x="376" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">agents</text>
+  <rect x="376" y="24" width="131" height="22" rx="4" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="441.5" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">subagent</text>
+  <rect x="376" y="50" width="131" height="22" rx="4" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="441.5" y="64.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">vision</text>
+  <rect x="376" y="76" width="131" height="22" rx="4" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="441.5" y="90.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">ask_user_question</text>
+  <text x="519" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">session</text>
+  <rect x="519" y="24" width="124" height="22" rx="4" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="581.0" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">read_tool_result</text>
+  <rect x="519" y="50" width="124" height="22" rx="4" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="581.0" y="64.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">toolbox</text>
+</svg></div>
+<figcaption>Figure 11. fx. The read_tool_result tool is what makes its truncation lossless.</figcaption>
+</figure>
+
+<h3 id="h-nano">nanocode: the vendor's tools, or two tools and a program</h3>
+<p>nanocode's drivers reproduce each vendor's own tool set (Chapter 2). Its distinctive option is Code Mode: only <code>exec</code> and <code>wait</code> are top-level tools, and the model writes JavaScript that calls every other tool through a <code>tools</code> object, running independent calls together and returning only what the next decision needs. Chapter 9 covers it; here it is the extreme answer to round-trip cost.</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 140" width="760" style="max-width:100%;height:auto" role="img" aria-label="nanocode Code Mode">
+  <defs><marker id="m12" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <text x="10" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">top level</text>
+  <rect x="10" y="24" width="110" height="22" rx="4" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="65.0" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">exec</text>
+  <rect x="10" y="50" width="110" height="22" rx="4" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="65.0" y="64.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">wait</text>
+  <text x="132" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">called from code</text>
+  <rect x="132" y="24" width="110" height="22" rx="4" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="187.0" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">tools.Bash</text>
+  <rect x="132" y="50" width="110" height="22" rx="4" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="187.0" y="64.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">tools.Read</text>
+  <rect x="132" y="76" width="110" height="22" rx="4" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="187.0" y="90.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">tools.Edit</text>
+  <rect x="132" y="102" width="110" height="22" rx="4" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="187.0" y="116.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">tools.Write</text>
+</svg></div>
+<figcaption>Figure 12. nanocode in Code Mode. Many tool calls become one model step.</figcaption>
+</figure>
+
+<h3 id="h-codex">Codex: a shell, a patch, and very little else</h3>
+<p>Codex gives the model a process-session shell (start a command, read more or send input with a second tool), the patch tool for every change, image viewing, a plan tool, a question tool, tool search for MCP tools, and a handful of session tools such as checking the remaining context. Reading and searching go through the shell. The bet is that a model trained in this harness is best served by the tools it was trained with.</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 120" width="760" style="max-width:100%;height:auto" role="img" aria-label="Codex tools">
+  <defs><marker id="m13" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <text x="10" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">shell</text>
+  <rect x="10" y="24" width="110" height="22" rx="4" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="65.0" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">exec_command</text>
+  <rect x="10" y="50" width="110" height="22" rx="4" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="65.0" y="64.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">write_stdin</text>
+  <text x="132" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">edit</text>
+  <rect x="132" y="24" width="110" height="22" rx="4" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="187.0" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">apply_patch</text>
+  <text x="254" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">planning, people</text>
+  <rect x="254" y="24" width="138" height="22" rx="4" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="323.0" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">update_plan</text>
+  <rect x="254" y="50" width="138" height="22" rx="4" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="323.0" y="64.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">request_user_input</text>
+  <text x="404" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">other</text>
+  <rect x="404" y="24" width="117" height="22" rx="4" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="462.5" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">view_image</text>
+  <rect x="404" y="50" width="117" height="22" rx="4" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="462.5" y="64.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">tool_search</text>
+  <rect x="404" y="76" width="117" height="22" rx="4" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="462.5" y="90.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">spawn_agent ...</text>
+</svg></div>
+<figcaption>Figure 13. Codex. Read and search are shell commands; writing is always a patch.</figcaption>
+</figure>
+
+<h3 id="h-cc">Claude Code: a large, curated set that is shrinking where the shell suffices</h3>
+<p>Claude Code's tools reference lists dozens of tools: Bash and PowerShell, Read, Edit, Write and NotebookEdit, web fetch and search, Agent and messaging tools, task tools, plan mode, worktrees, LSP, Monitor for streaming a background command's output, scheduling tools, and ToolSearch for deferred tools. Glob and Grep are absent by default on macOS, Linux and WSL, where search runs through the shell; they return when the shell is removed, for example for a subagent that lists them without Bash.</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 140" width="760" style="max-width:100%;height:auto" role="img" aria-label="Claude Code tools">
+  <defs><marker id="m14" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <text x="10" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">files</text>
+  <rect x="10" y="24" width="110" height="22" rx="4" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="65.0" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Read</text>
+  <rect x="10" y="50" width="110" height="22" rx="4" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="65.0" y="64.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Edit</text>
+  <rect x="10" y="76" width="110" height="22" rx="4" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="65.0" y="90.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Write</text>
+  <rect x="10" y="102" width="110" height="22" rx="4" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="65.0" y="116.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">NotebookEdit</text>
+  <text x="132" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">shell</text>
+  <rect x="132" y="24" width="110" height="22" rx="4" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="187.0" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Bash</text>
+  <rect x="132" y="50" width="110" height="22" rx="4" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="187.0" y="64.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Monitor</text>
+  <rect x="132" y="76" width="110" height="22" rx="4" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="187.0" y="90.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">LSP</text>
+  <text x="254" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">web</text>
+  <rect x="254" y="24" width="110" height="22" rx="4" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="309.0" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">WebFetch</text>
+  <rect x="254" y="50" width="110" height="22" rx="4" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="309.0" y="64.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">WebSearch</text>
+  <text x="376" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">agents, tasks</text>
+  <rect x="376" y="24" width="110" height="22" rx="4" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="431.0" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Agent</text>
+  <rect x="376" y="50" width="110" height="22" rx="4" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="431.0" y="64.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">SendMessage</text>
+  <rect x="376" y="76" width="110" height="22" rx="4" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="431.0" y="90.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">TaskCreate ...</text>
+  <text x="498" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">catalog</text>
+  <rect x="498" y="24" width="110" height="22" rx="4" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="553.0" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">ToolSearch</text>
+  <rect x="498" y="50" width="110" height="22" rx="4" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="553.0" y="64.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Skill</text>
+</svg></div>
+<figcaption>Figure 14. Claude Code (a subset). Permission rules address tools by these names.</figcaption>
+</figure>
+
+<h3 id="h-kimi">Kimi Code: dedicated tools with explicit budgets</h3>
+<p>Kimi Code's core set is Read, Write, Edit, Bash, Glob and Grep, plus web fetch and search, media reading, the Agent tool, ask-the-user, task tools and a tool for loading more tools. Its descriptions are separate documents and read like instructions to a colleague: call Read directly on a known path without checking first, read several files in parallel, use Bash only for real shell semantics.</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 140" width="760" style="max-width:100%;height:auto" role="img" aria-label="Kimi Code tools">
+  <defs><marker id="m15" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <text x="10" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">files</text>
+  <rect x="10" y="24" width="110" height="22" rx="4" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="65.0" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Read</text>
+  <rect x="10" y="50" width="110" height="22" rx="4" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="65.0" y="64.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Write</text>
+  <rect x="10" y="76" width="110" height="22" rx="4" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="65.0" y="90.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Edit</text>
+  <text x="132" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">search, shell</text>
+  <rect x="132" y="24" width="110" height="22" rx="4" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="187.0" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Glob</text>
+  <rect x="132" y="50" width="110" height="22" rx="4" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="187.0" y="64.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Grep</text>
+  <rect x="132" y="76" width="110" height="22" rx="4" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="187.0" y="90.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Bash</text>
+  <text x="254" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">web, media</text>
+  <rect x="254" y="24" width="110" height="22" rx="4" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="309.0" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">FetchURL</text>
+  <rect x="254" y="50" width="110" height="22" rx="4" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="309.0" y="64.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">WebSearch</text>
+  <rect x="254" y="76" width="110" height="22" rx="4" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="309.0" y="90.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">ReadMediaFile</text>
+  <text x="376" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">agents</text>
+  <rect x="376" y="24" width="117" height="22" rx="4" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="434.5" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Agent</text>
+  <rect x="376" y="50" width="117" height="22" rx="4" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="434.5" y="64.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">AskUserQuestion</text>
+  <text x="505" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">catalog</text>
+  <rect x="505" y="24" width="110" height="22" rx="4" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="560.0" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">select tools</text>
+  <rect x="505" y="50" width="110" height="22" rx="4" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="560.0" y="64.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">task tools</text>
+</svg></div>
+<figcaption>Figure 15. Kimi Code. Every budget (read size, shell timeout, result size) is stated in the code and the descriptions.</figcaption>
+</figure>
+
+<h3 id="h-qwen">Qwen Code: everything, with deferral</h3>
+<p>Qwen Code has the broadest set in this book: file tools with read-before-write enforcement, ripgrep search, a shell with a background registry, LSP, web fetch and search (including a DashScope search backend), memory tools, cron, worktrees, teams, plan mode, image tools and more. It keeps the request small by deferring MCP tools and low-frequency built-ins behind a tool search that supports exact selection or keyword scoring.</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 140" width="760" style="max-width:100%;height:auto" role="img" aria-label="Qwen Code tools">
+  <defs><marker id="m16" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <text x="10" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">files</text>
+  <rect x="10" y="24" width="110" height="22" rx="4" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="65.0" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">read-file</text>
+  <rect x="10" y="50" width="110" height="22" rx="4" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="65.0" y="64.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">write-file</text>
+  <rect x="10" y="76" width="110" height="22" rx="4" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="65.0" y="90.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">edit</text>
+  <text x="132" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">search, shell</text>
+  <rect x="132" y="24" width="110" height="22" rx="4" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="187.0" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">ripGrep</text>
+  <rect x="132" y="50" width="110" height="22" rx="4" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="187.0" y="64.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">glob</text>
+  <rect x="132" y="76" width="110" height="22" rx="4" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="187.0" y="90.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">shell</text>
+  <text x="254" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">code, web</text>
+  <rect x="254" y="24" width="110" height="22" rx="4" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="309.0" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">lsp</text>
+  <rect x="254" y="50" width="110" height="22" rx="4" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="309.0" y="64.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">web-fetch</text>
+  <rect x="254" y="76" width="110" height="22" rx="4" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="309.0" y="90.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">web-search</text>
+  <text x="376" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">agents, teams</text>
+  <rect x="376" y="24" width="110" height="22" rx="4" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="431.0" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">agent</text>
+  <rect x="376" y="50" width="110" height="22" rx="4" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="431.0" y="64.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">team-create</text>
+  <rect x="376" y="76" width="110" height="22" rx="4" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="431.0" y="90.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">send-message</text>
+  <text x="498" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">catalog</text>
+  <rect x="498" y="24" width="110" height="22" rx="4" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="553.0" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">tool-search</text>
+  <rect x="498" y="50" width="110" height="22" rx="4" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="553.0" y="64.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">skill</text>
+</svg></div>
+<figcaption>Figure 16. Qwen Code (a subset). Breadth is affordable only because most of it is deferred.</figcaption>
+</figure>
+
+<h3 id="h-trae">Trae Agent: five tools for experiments</h3>
+<p>Trae Agent uses a persistent bash session (state carries over; a command past 120 seconds forces a restart), one editor tool with view, create and replace commands, a JSON editing tool, a sequential-thinking tool for planning, and <code>task_done</code>. An optional code knowledge graph tool queries functions and classes. A fixed, small set keeps experiments comparable.</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 120" width="760" style="max-width:100%;height:auto" role="img" aria-label="Trae Agent tools">
+  <defs><marker id="m17" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <text x="10" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">shell</text>
+  <rect x="10" y="24" width="110" height="22" rx="4" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="65.0" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">bash</text>
+  <text x="132" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">edit</text>
+  <rect x="132" y="24" width="201" height="22" rx="4" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="232.5" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">str_replace_based_edit_tool</text>
+  <rect x="132" y="50" width="201" height="22" rx="4" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="232.5" y="64.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">json_edit_tool</text>
+  <text x="345" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">thinking</text>
+  <rect x="345" y="24" width="138" height="22" rx="4" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="414.0" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">sequentialthinking</text>
+  <text x="495" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">finish</text>
+  <rect x="495" y="24" width="110" height="22" rx="4" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="550.0" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">task_done</text>
+  <text x="617" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">optional</text>
+  <rect x="617" y="24" width="110" height="22" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="672.0" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">ckg</text>
+</svg></div>
+<figcaption>Figure 17. Trae Agent. The editor tool follows the view-create-replace pattern popularised by Anthropic's text editor tool.</figcaption>
+</figure>
+
+<h2 id="compare">4. All nine in one table</h2>
+<div class="tbl"><table>
+  <tr><th>Harness</th><th>Lean</th><th>Shell model</th><th>Edit format</th><th>Mismatch policy</th><th>Read-before-write</th><th>Truncation</th><th>Deferred tools</th></tr>
+  <tr><td>Pi</td><td>Minimal, shell for the rest</td><td>Fresh; no default timeout</td><td>Multi-edit</td><td>Normalise, then retry</td><td>Per-file queue only</td><td>Save to file</td><td>Tool changes declared in transcript</td></tr>
+  <tr><td>eve</td><td>Dedicated + shell</td><td>Jobs after 60 to 120 s</td><td>Multi-edit</td><td>Normalise, then retry</td><td>Write yes, edit no; stale detection</td><td>Per stream; job files</td><td>Search + call by name</td></tr>
+  <tr><td>fx</td><td>Dedicated first</td><td>Process sessions</td><td>Exact, unique</td><td>Refuse</td><td>Not described here</td><td>64 KB + handle</td><td>Toolbox</td></tr>
+  <tr><td>nanocode</td><td>Vendor's own; Code Mode option</td><td>Per vendor</td><td>Per vendor</td><td>Per vendor</td><td>Per vendor</td><td>Per vendor</td><td>Via Code Mode</td></tr>
+  <tr><td>Codex</td><td>Shell first</td><td>Process sessions, 10 s yield</td><td>Patch grammar</td><td>Whitespace-tolerant hunks</td><td>Not required</td><td>10,000 tokens head + tail</td><td>Tool search</td></tr>
+  <tr><td>Claude Code</td><td>Moving to shell for search</td><td>Per call, cd kept; auto-background</td><td>Exact, unique or all</td><td>Refuse</td><td>By model; staleness rules</td><td>Save to file</td><td>ToolSearch</td></tr>
+  <tr><td>Kimi Code</td><td>Dedicated first</td><td>Fresh, 60 s</td><td>Exact, unique or all</td><td>Refuse</td><td>Not described here</td><td>Head + tail; file over 50k</td><td>Select tools</td></tr>
+  <tr><td>Qwen Code</td><td>Everything, deferred</td><td>Background registry</td><td>Exact edit</td><td>Refuse</td><td>Required, fingerprinted</td><td>Save to file + hash</td><td>ToolSearch</td></tr>
+  <tr><td>Trae Agent</td><td>Five tools</td><td>Persistent, 120 s</td><td>View / create / replace</td><td>Refuse</td><td>No</td><td>Clip at 16,000</td><td>None</td></tr>
+</table></div>
+
+<h2 id="choose">5. Choosing a tool interface</h2>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 280" width="760" style="max-width:100%;height:auto" role="img" aria-label="Choosing a tool interface">
+  <defs><marker id="m18" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="10" width="280" height="52" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="150.0" y="32.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Is your model strong</text>
+  <text x="150.0" y="46.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">at shell use?</text>
+  <rect x="340" y="10" width="410" height="52" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="545.0" y="32.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Shell for reading and searching;</text>
+  <text x="545.0" y="46.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">dedicated edit tool; bound output</text>
+  <path d="M292 36H336" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m18)"/>
+  <text x="300" y="30" text-anchor="start" style="fill:var(--ink2);font-size:10px">yes</text>
+  <rect x="10" y="76" width="280" height="52" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="150.0" y="98.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Do you need per-path</text>
+  <text x="150.0" y="112.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">permissions or read tracking?</text>
+  <rect x="340" y="76" width="410" height="52" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="545.0" y="98.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Dedicated Read, Edit, Write</text>
+  <text x="545.0" y="112.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">(path rules are easy on them)</text>
+  <path d="M292 102H336" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m18)"/>
+  <text x="300" y="96" text-anchor="start" style="fill:var(--ink2);font-size:10px">yes</text>
+  <rect x="10" y="142" width="280" height="52" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="150.0" y="164.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Will commands run longer</text>
+  <text x="150.0" y="178.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">than a minute?</text>
+  <rect x="340" y="142" width="410" height="52" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="545.0" y="164.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Process sessions: yield</text>
+  <text x="545.0" y="178.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">a handle, never kill silently</text>
+  <path d="M292 168H336" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m18)"/>
+  <text x="300" y="162" text-anchor="start" style="fill:var(--ink2);font-size:10px">yes</text>
+  <rect x="10" y="208" width="280" height="52" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="150.0" y="230.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Will you connect many</text>
+  <text x="150.0" y="244.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">MCP servers?</text>
+  <rect x="340" y="208" width="410" height="52" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="545.0" y="230.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Fixed core list + tool search;</text>
+  <text x="545.0" y="244.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">never change the list mid-session</text>
+  <path d="M292 234H336" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m18)"/>
+  <text x="300" y="228" text-anchor="start" style="fill:var(--ink2);font-size:10px">yes</text>
+</svg></div>
+<figcaption>Figure 18. Four questions. They are independent: a harness can be shell-first for reading and still use dedicated, permissioned tools for writing, which is Codex's and Claude Code's current shape.</figcaption>
+</figure>
+
+<p>For this book's harness: read, write, multi-edit and bash, with bounded output saved to a file, a per-file lock and background jobs. That is Pi's minimal set plus eve's job model, and it is what the build below implements. Exercises add a process-session shell, read tracking and a search tool for deferred tools.</p>
+
+<h2 id="research">6. Research and the Chinese view</h2>
+<ul>
+  <li><strong>SWE-agent (2024)</strong> named the agent-computer interface and showed that interface design moves results as much as the model: simple actions, informative errors, output sized for a context window.</li>
+  <li><strong>Anthropic's guidance</strong> on writing tools for agents adds practice: consolidate multi-step operations into single tools, group related tools under shared prefixes by service and resource, and prioritize high-signal, human-readable information like names over low-level identifiers like UUIDs.</li>
+  <li><strong>The shell turn.</strong> Across 2026 the production harnesses moved reading and searching into the shell (Codex from the start, Claude Code by removing Glob and Grep on Unix, nanocode's per-model guidance). The reason is the facts, not fashion: newer models use the shell well, and one tool costs less context than five.</li>
+  <li><strong>Chinese practice.</strong> Kimi Code and Qwen Code both chose dedicated tools with explicit budgets and strict read-before-write, closer to Claude Code's earlier design. Qwen Code's tool results carry a hash of the full output so its loop detector stays correct after truncation, and it ships a DashScope web-search backend for users in China, where some Western search providers are not reachable.</li>
+</ul>
+
+<h2 id="build">7. Build: a typed tool registry</h2>
 <p>Replace Chapter 1's tools with a registry. Each tool is a Python function plus a pydantic model for its arguments; the schema comes from the model, so code and schema never drift.</p>
 <pre>pip install pydantic</pre>
 <pre>&quot;&quot;&quot;A typed tool registry: schemas from type hints, validation, truncation, safe edits, background jobs.&quot;&quot;&quot;
@@ -244,7 +901,7 @@ def bash(a: BashArgs):
 <ul>
   <li><strong>Errors as text, everywhere.</strong> Unknown tool, invalid arguments and exceptions all return readable strings, including the list of valid tool names.</li>
   <li><strong>Truncation</strong> keeps 200 head lines and the tail up to 2,000 lines or 50 KB, and saves the full output to a file the agent can read with <code>read(offset, limit)</code>. Pi's limits.</li>
-  <li><strong>Multi-edit</strong> with uniqueness, overlap checks and preserved line endings: Pi's <code>edit.ts</code>.</li>
+  <li><strong>Multi-edit</strong> with uniqueness, overlap checks and preserved line endings: Pi's edit tool.</li>
   <li><strong>Per-file locks</strong>: Pi's file mutation queue. <strong><code>sequential=True</code></strong>: Pi's per-tool execution mode.</li>
   <li><strong>Background bash</strong> with a job directory: eve's design.</li>
   <li><strong>Read with line numbers</strong>: the model can cite and target exact lines.</li>
@@ -254,32 +911,42 @@ def bash(a: BashArgs):
 <h3>Stage 1 gate</h3>
 <p>Rerun your 10 test tasks with both models and compare with the Chapter 1 baseline. Record pass rate, steps per task and tokens per task. Stage 1 is done when the agent passes most tasks and you can explain every failure by reading its transcript.</p>
 
-<h2 id="exercises">6. Exercises</h2>
+
+<h2 id="exercises">8. Exercises</h2>
 <ol>
-  <li>Add <code>grep</code> and <code>glob</code> tools. Do pass rate or token use change on your tasks? Pi keeps them off by default; decide with data.</li>
-  <li>Count the tokens of your tool schemas (<code>len(json.dumps(specs)) / 4</code> is a fair estimate). How much of each request are they?</li>
-  <li>Write an <code>apply_patch</code> tool in the V4A format Codex uses, and compare GPT and Claude models on both edit tools.</li>
+  <li><strong>Process sessions.</strong> Change <code>bash</code> so that a command still running after 10 seconds returns a job ID instead of blocking. Add a tool that reads new output from a job or stops it. Run a 2-minute test suite through it.</li>
+  <li><strong>Read tracking.</strong> Record a hash of each file when the model reads it. Refuse an edit to a file that was never read, or whose hash changed since, with an error that says to read it again. Measure how often your tasks trip it.</li>
+  <li><strong>Tolerant edits.</strong> Add Pi's normalisation (trailing spaces, smart quotes, dashes, special spaces) as a fallback when the exact match fails. Log every fallback match for a week of tasks. Did any match the wrong place?</li>
+  <li><strong>Lossless truncation by handle.</strong> Instead of a temp-file path, store each long result under a handle and add a tool that searches it or reads a byte range, as fx does. Compare step counts with the file approach.</li>
+  <li><strong>Shell-first.</strong> Disable your read tool and tell the model to use <code>cat</code>, <code>sed -n</code> and <code>rg</code>. Compare pass rate, steps and tokens on your 10 tasks with both of your models.</li>
 </ol>
 
-<h2 id="quiz">7. Check yourself</h2>
+<h2 id="quiz">9. Check yourself</h2>
 <div class="widget quiz" data-quiz="qz3"></div>
 <script type="application/json" id="qz3">[
-{"q":"Pi's default output limit for bash is:","o":["1,000 lines","2,000 lines or 50 KB, whichever comes first","64 KB only","No limit"],"a":1,"e":"truncate.ts sets DEFAULT_MAX_LINES = 2000 and DEFAULT_MAX_BYTES = 50 KB, and saves the full output to a file."},
-{"q":"What does Pi's file mutation queue guarantee?","o":["All tools run in order","Writes to the same file are serialized; different files can run in parallel","Files are backed up","Edits are undoable"],"a":1,"e":"It keys a queue on the real path, so parallel batches stay safe without slowing unrelated writes."},
-{"q":"What happens when eve's bash command runs past its timeout?","o":["It is killed","It keeps running as its own process group and returns status running with a job directory","The session fails","The model is asked to retry"],"a":1,"e":"The model checks stdout and the exit file in later calls, so long builds never block a turn."},
-{"q":"In nanocode's Code Mode, which tools are top level?","o":["All vendor tools","exec and wait","Bash only","read and write"],"a":1,"e":"Everything else is called from JavaScript inside exec, and only the returned result enters the context."},
-{"q":"Why does Manus mask tools instead of removing them mid-task?","o":["Removal is not supported by APIs","Tool definitions sit near the start of the context, so changing them breaks the KV cache","Masking is faster to code","To hide tools from users"],"a":1,"e":"A stable prefix keeps cache hits; masking constrains choice without changing the prefix."}
+{"q":"Why does every tool have two jobs?","o":["For logging","It must perform the action and report it in a form the model can use, because the result is the model's only view of what happened","Providers require two outputs","One job is for the UI"],"a":1,"e":"The model never sees the screen or the file system; it sees only what the tool returns."},
+{"q":"On macOS and Linux, how does Claude Code search files by default, according to its documentation?","o":["With Glob and Grep tools","Through the Bash tool, where find and grep run embedded versions of bfs and ugrep","It cannot search","Through an MCP server"],"a":1,"e":"Glob and Grep come back when Bash is removed, for example for a subagent that lists them without Bash."},
+{"q":"What does Codex's shell do when a command is still running after its wait?","o":["Kills it","Returns a session ID; the model reads more output or sends input with a second tool","Restarts the shell","Moves it to a new process silently"],"a":1,"e":"The default wait is 10 seconds and up to 64 processes may be live."},
+{"q":"What do Pi and eve do when an edit's search text does not match exactly?","o":["Refuse immediately","Normalise trailing spaces, smart quotes, Unicode dashes and special spaces, then try again","Use a regex","Ask the user"],"a":1,"e":"Claude Code's Edit tool, by contrast, does no fuzzy matching."},
+{"q":"Which truncation strategy loses information?","o":["Saving the full output to a file","Keeping it behind a handle a tool can read","Cutting it and dropping the rest","None of them"],"a":2,"e":"Saving to a file or a handle makes truncation lossless, because the model can read the part it needs later."},
+{"q":"Why do several harnesses keep a fixed tool list and add a tool-search tool?","o":["Search is faster","Every definition costs context on every request, and changing the list mid-session breaks the prompt cache","Providers limit tools to five","To hide tools from the user"],"a":1,"e":"The model pays for a tool's schema only when it looks it up, and the request's start stays stable."},
+{"q":"When may a newer model in Claude Code edit a file it has not read, per the documentation?","o":["Never","Always","When reading it would not need a permission prompt and the Read tool is available; partial reads never count","Only in plan mode"],"a":2,"e":"Older models always require the read."},
+{"q":"Why does Qwen Code attach a hash of the full output to a truncated tool result?","o":["For security","So its loop detector can tell two different long outputs apart even when their visible previews look the same","To compress it","Providers require it"],"a":1,"e":"Fingerprinting only the preview would make different outputs look identical."}
 ]</script>
 
-<h2 id="refs">8. References</h2>
+<h2 id="refs">10. References</h2>
 <ul>
-  <li>Pi: <code>packages/coding-agent/src/core/tools/</code> (<code>truncate.ts</code>, <code>edit.ts</code>, <code>file-mutation-queue.ts</code>, <code>bash.ts</code>).</li>
-  <li>fx: <code>src/tools/</code>, <code>src/tools/capabilities/capability_search.zig</code>, <code>src/core/tooling/tool_result_limits.zig</code>.</li>
-  <li>eve: <code>docs/concepts/built-in-tools.md</code>.</li>
-  <li>nanocode: <code>crates/backends/claude/prompts/code_mode.md</code>, <code>crates/runtime/code-mode-engine/README.md</code>.</li>
-  <li><a href="https://arxiv.org/abs/2405.15793v2">SWE-agent: Agent-Computer Interfaces Enable Automated Software Engineering</a>, 2024.</li>
-  <li><a href="https://www.mariozechner.at/posts/2025-11-30-pi-coding-agent/">What I learned building an opinionated and minimal coding agent</a>, Mario Zechner, Nov 2025.</li>
-  <li><a href="https://manus.im/blog/Context-Engineering-for-AI-Agents-Lessons-from-Building-Manus">Context Engineering for AI Agents: Lessons from Building Manus</a>, Jul 2025.</li>
+  <li>Pi, Earendil Works: <a href="https://github.com/earendil-works/pi">github.com/earendil-works/pi</a> (read at fb248c7).</li>
+  <li>eve, Vercel: <a href="https://github.com/vercel/eve">github.com/vercel/eve</a> (read at 5c52fbf), including its built-in tools documentation.</li>
+  <li>fx, Vercel Labs: <a href="https://github.com/vercel-labs/fx">github.com/vercel-labs/fx</a> (read at cbe7daf).</li>
+  <li>nanocode: <a href="https://github.com/gakonst/nanocode">github.com/gakonst/nanocode</a> (read at 015cbfa).</li>
+  <li>Codex CLI, OpenAI: <a href="https://github.com/openai/codex">github.com/openai/codex</a> (read at 50aeac2).</li>
+  <li>Claude Code: <a href="https://code.claude.com/docs/en/tools-reference">Tools reference</a>, Anthropic documentation, checked 24 Nov 2026.</li>
+  <li>Kimi Code CLI, Moonshot AI: <a href="https://github.com/MoonshotAI/kimi-code">github.com/MoonshotAI/kimi-code</a> (read at 111aae2).</li>
+  <li>Qwen Code, Alibaba Qwen team: <a href="https://github.com/QwenLM/qwen-code">github.com/QwenLM/qwen-code</a> (read at c56424fc).</li>
+  <li>Trae Agent, ByteDance: <a href="https://github.com/bytedance/trae-agent">github.com/bytedance/trae-agent</a> (read at e839e55).</li>
+  <li><a href="https://www.anthropic.com/engineering/writing-tools-for-agents">Writing effective tools for AI agents</a>, Anthropic, Sep 2025.</li>
+  <li>Yang et al., SWE-agent: Agent-Computer Interfaces Enable Automated Software Engineering, 2024.</li>
 </ul>
 
 <div class="navfoot"></div>
