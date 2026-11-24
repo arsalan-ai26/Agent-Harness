@@ -15,112 +15,692 @@
 <main><article>
 <div class="kicker">Stage 2 · Context · Chapter 5</div>
 <h1>Context management and compaction</h1>
-<p class="lede">The window is finite (fact 3) and every step appends to it, so every long session eventually fills it. Compaction replaces old turns with a summary so the agent can keep working. It is also where harnesses quietly lose information. This chapter reads four real compactors with their exact thresholds, shows why fx verifies its own summaries and why Pi Durable compacts in the background, then builds a compactor with turn handles, a lint pass and recallable raw history.</p>
+<p class="lede">Every step resends the whole history (fact 2), the window has a hard limit and quality drops well before it (fact 3), and every resent token costs money unless it is a cached prefix (fact 4). A long task therefore runs into a wall. This chapter derives the ladder of ways to stay under it, from cheapest and safest to most lossy, then takes the design decisions one at a time: when to compact, what to keep word for word, who writes the summary and what it must say, how to check it, whether raw history stays reachable, and whether compaction blocks the user. It shows the compaction flow of nine harnesses and keeps the compactor you build.</p>
 <div class="meta">
-  <span class="chip">Level: intermediate to advanced</span>
-  <span class="chip">Time: about 20 hours with the build</span>
-  <span class="chip">Needs: Chapters 2 and 4</span>
-  <span class="chip">Code read at: Pi fb248c7, eve 5c52fbf, fx cbe7daf, nanocode 015cbfa</span>
+  <span class="chip">Level: intermediate</span>
+  <span class="chip">Time: about 14 hours with the build</span>
+  <span class="chip">Needs: Chapters 1 to 4</span>
+  <span class="chip">Harnesses read: Pi, eve, fx, nanocode, Codex, Claude Code, Kimi Code, Qwen Code, Trae Agent</span>
 </div>
 
 <div class="box skip">
   <span class="lbl">Before you start: skip check</span>
   <ol>
-    <li>Why not simply drop the oldest messages when the window is full?</li>
-    <li>A summary says "tests passed in step 14", but they never did. How could the harness catch that?</li>
-    <li>Why must compaction never split a tool call from its tool result?</li>
+    <li>Why does the total number of tokens sent over a session grow with the square of the number of steps?</li>
+    <li>Claude Code runs five reductions before a model call. Why is a model-written summary the last of them?</li>
+    <li>Codex introduces its summary to the next call as the work of another model. Why?</li>
+    <li>What turns lossy compaction into lossless compaction in Kimi Code and fx?</li>
   </ol>
   <details><summary>Answers</summary><ol>
-    <li>The oldest messages usually hold the goal and the user's constraints. Dropping them loses the task; summarizing keeps the meaning.</li>
-    <li>Give every turn and tool call a handle, ask the summary to cite handles, and check that each cited handle exists and supports the claim (fx's lint pass).</li>
-    <li>Providers reject histories with a tool result whose call is missing, or a call with no result. The kept tail must start at a clean boundary.</li>
+    <li>Step k resends everything from steps 1 to k-1. Summing 1 + 2 + ... + n gives about n²/2.</li>
+    <li>Each stage loses more than the one before. A summary is a sample (fact 5) that can drop or invent details, so the cheaper, deterministic reductions (capping results, trimming, clearing old tool output) go first.</li>
+    <li>So the model treats it as a handoff to build on, not as its own words to repeat or second-guess.</li>
+    <li>The raw history stays on disk and the model is told how to reach it: Kimi Code tells it the log file and how to grep it; fx gives every turn and tool call a handle that a tool can read back.</li>
   </ol></details>
 </div>
 
-<h2 id="why">1. The problem</h2>
-<p>Do the arithmetic first. Each step appends a model reply and a tool result, and the next step resends everything (fact 2). If a session has <em>n</em> steps of roughly equal size, the total tokens sent are about 1 + 2 + ... + <em>n</em>, which grows with <em>n</em>&sup2;. Manus measured about 50 tool calls per task and about 100 input tokens for every output token, which is exactly what that arithmetic predicts. Long before the hard limit, a second effect hits: attention is spread over every token in the window, so the more irrelevant tokens there are, the less weight the relevant ones get (often called context rot).</p>
-<p>So the window is a budget, and there are only two ways to stay inside a budget: spend less, or throw some away. Throwing away is dangerous because of fact 2: whatever leaves the window, the model has truly forgotten, and it does not know that it has forgotten. That gives the order of preference. The harness has four tools, in rising order of what is lost:</p>
-<ol>
-  <li><strong>Bound tool output</strong> at the source (Chapter 3: 2,000 lines or 50 KB, full output saved to a file).</li>
-  <li><strong>Offload</strong>: keep large content in files and keep only the path in context (Manus calls this restorable compression).</li>
-  <li><strong>Isolate</strong>: do exploration in a subagent and bring back only its conclusion (Chapter 9).</li>
-  <li><strong>Compact</strong>: summarize old turns into a checkpoint and keep a recent tail word for word.</li>
-</ol>
+
+<h2 id="why">1. The wall, from first principles</h2>
+<p>Each step appends a model reply and a tool result, and the next step sends everything again. If steps are roughly equal in size, step k sends k units, and a session of n steps sends about n²/2 units in total. Manus reported about 50 tool calls per task and about 100 input tokens for every output token, which is what this arithmetic predicts. Caching makes the repeated part cheaper but not free, and does nothing for the window limit.</p>
+
 <figure>
-<div class="svgwrap"><svg viewBox="0 0 760 210" width="760" style="max-width:100%;height:auto" role="img" aria-label="Before and after compaction">
-  <text x="24" y="22" style="fill:var(--ink);font-size:13px;font-weight:600">Before: 90% of the window</text>
-  <rect x="24" y="32" width="64" height="36" style="fill:var(--kv-s);stroke:var(--kv)"/><text x="56" y="55" text-anchor="middle" style="fill:var(--ink);font-size:10px">prefix</text>
-  <rect x="88" y="32" width="450" height="36" style="fill:var(--panel2);stroke:var(--line)"/><text x="313" y="55" text-anchor="middle" style="fill:var(--ink2);font-size:11px">old turns: goal, decisions, tool results</text>
-  <rect x="538" y="32" width="150" height="36" style="fill:var(--dec-s);stroke:var(--dec)"/><text x="613" y="55" text-anchor="middle" style="fill:var(--ink);font-size:11px">recent tail</text>
-  <rect x="688" y="32" width="48" height="36" style="fill:var(--bg);stroke:var(--line);stroke-dasharray:3 3"/>
-  <text x="24" y="112" style="fill:var(--ink);font-size:13px;font-weight:600">After: under 50%</text>
-  <rect x="24" y="122" width="64" height="36" style="fill:var(--kv-s);stroke:var(--kv)"/><text x="56" y="145" text-anchor="middle" style="fill:var(--ink);font-size:10px">prefix</text>
-  <rect x="88" y="122" width="96" height="36" style="fill:var(--pre-s);stroke:var(--pre)"/><text x="136" y="145" text-anchor="middle" style="fill:var(--ink);font-size:11px">checkpoint</text>
-  <rect x="184" y="122" width="150" height="36" style="fill:var(--dec-s);stroke:var(--dec)"/><text x="259" y="145" text-anchor="middle" style="fill:var(--ink);font-size:11px">recent tail</text>
-  <rect x="334" y="122" width="402" height="36" style="fill:var(--bg);stroke:var(--line);stroke-dasharray:3 3"/><text x="535" y="145" text-anchor="middle" style="fill:var(--ink2);font-size:11px">free room for the next turns</text>
-  <rect x="88" y="170" width="450" height="30" rx="4" style="fill:none;stroke:var(--line);stroke-dasharray:4 3"/>
-  <text x="100" y="190" style="fill:var(--ink2);font-size:11px">raw old turns archived on disk, recallable by handle</text>
+<div class="svgwrap"><svg viewBox="0 0 760 210" width="760" style="max-width:100%;height:auto" role="img" aria-label="Tokens per step and cumulative">
+  <defs><marker id="m1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="40" y="162" width="22" height="8" rx="2" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="51.0" y="170.0" text-anchor="middle" style="fill:var(--ink);font-size:11px"></text>
+  <rect x="64" y="168.4" width="22" height="1.6" rx="2" style="fill:var(--bad-s);stroke:var(--bad)"/>
+  <text x="75.0" y="173.2" text-anchor="middle" style="fill:var(--ink);font-size:11px"></text>
+  <rect x="96" y="154" width="22" height="16" rx="2" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="107.0" y="166.0" text-anchor="middle" style="fill:var(--ink);font-size:11px"></text>
+  <rect x="120" y="165.2" width="22" height="4.800000000000001" rx="2" style="fill:var(--bad-s);stroke:var(--bad)"/>
+  <text x="131.0" y="171.6" text-anchor="middle" style="fill:var(--ink);font-size:11px"></text>
+  <rect x="152" y="146" width="22" height="24" rx="2" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="163.0" y="162.0" text-anchor="middle" style="fill:var(--ink);font-size:11px"></text>
+  <rect x="176" y="160.4" width="22" height="9.600000000000001" rx="2" style="fill:var(--bad-s);stroke:var(--bad)"/>
+  <text x="187.0" y="169.2" text-anchor="middle" style="fill:var(--ink);font-size:11px"></text>
+  <rect x="208" y="138" width="22" height="32" rx="2" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="219.0" y="158.0" text-anchor="middle" style="fill:var(--ink);font-size:11px"></text>
+  <rect x="232" y="154.0" width="22" height="16.0" rx="2" style="fill:var(--bad-s);stroke:var(--bad)"/>
+  <text x="243.0" y="166.0" text-anchor="middle" style="fill:var(--ink);font-size:11px"></text>
+  <rect x="264" y="130" width="22" height="40" rx="2" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="275.0" y="154.0" text-anchor="middle" style="fill:var(--ink);font-size:11px"></text>
+  <rect x="288" y="146.0" width="22" height="24.0" rx="2" style="fill:var(--bad-s);stroke:var(--bad)"/>
+  <text x="299.0" y="162.0" text-anchor="middle" style="fill:var(--ink);font-size:11px"></text>
+  <rect x="320" y="122" width="22" height="48" rx="2" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="331.0" y="150.0" text-anchor="middle" style="fill:var(--ink);font-size:11px"></text>
+  <rect x="344" y="136.4" width="22" height="33.6" rx="2" style="fill:var(--bad-s);stroke:var(--bad)"/>
+  <text x="355.0" y="157.2" text-anchor="middle" style="fill:var(--ink);font-size:11px"></text>
+  <rect x="376" y="114" width="22" height="56" rx="2" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="387.0" y="146.0" text-anchor="middle" style="fill:var(--ink);font-size:11px"></text>
+  <rect x="400" y="125.19999999999999" width="22" height="44.800000000000004" rx="2" style="fill:var(--bad-s);stroke:var(--bad)"/>
+  <text x="411.0" y="151.6" text-anchor="middle" style="fill:var(--ink);font-size:11px"></text>
+  <rect x="432" y="106" width="22" height="64" rx="2" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="443.0" y="142.0" text-anchor="middle" style="fill:var(--ink);font-size:11px"></text>
+  <rect x="456" y="112.4" width="22" height="57.6" rx="2" style="fill:var(--bad-s);stroke:var(--bad)"/>
+  <text x="467.0" y="145.2" text-anchor="middle" style="fill:var(--ink);font-size:11px"></text>
+  <rect x="488" y="98" width="22" height="72" rx="2" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="499.0" y="138.0" text-anchor="middle" style="fill:var(--ink);font-size:11px"></text>
+  <rect x="512" y="98.0" width="22" height="72.0" rx="2" style="fill:var(--bad-s);stroke:var(--bad)"/>
+  <text x="523.0" y="138.0" text-anchor="middle" style="fill:var(--ink);font-size:11px"></text>
+  <rect x="544" y="90" width="22" height="80" rx="2" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="555.0" y="134.0" text-anchor="middle" style="fill:var(--ink);font-size:11px"></text>
+  <rect x="568" y="82.0" width="22" height="88.0" rx="2" style="fill:var(--bad-s);stroke:var(--bad)"/>
+  <text x="579.0" y="130.0" text-anchor="middle" style="fill:var(--ink);font-size:11px"></text>
+  <rect x="600" y="82" width="22" height="88" rx="2" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="611.0" y="130.0" text-anchor="middle" style="fill:var(--ink);font-size:11px"></text>
+  <rect x="624" y="64.39999999999999" width="22" height="105.60000000000001" rx="2" style="fill:var(--bad-s);stroke:var(--bad)"/>
+  <text x="635.0" y="121.2" text-anchor="middle" style="fill:var(--ink);font-size:11px"></text>
+  <rect x="656" y="74" width="22" height="96" rx="2" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="667.0" y="126.0" text-anchor="middle" style="fill:var(--ink);font-size:11px"></text>
+  <rect x="680" y="45.19999999999999" width="22" height="124.80000000000001" rx="2" style="fill:var(--bad-s);stroke:var(--bad)"/>
+  <text x="691.0" y="111.6" text-anchor="middle" style="fill:var(--ink);font-size:11px"></text>
+  <path d="M30 170H720" style="fill:none;stroke:var(--ink2);stroke-width:1"/>
+  <path d="M30 30H720" style="fill:none;stroke:var(--bad);stroke-width:1;stroke-dasharray:4 3"/>
+  <text x="34" y="26" text-anchor="start" style="fill:var(--ink2);font-size:10px">window limit</text>
+  <text x="40" y="192" text-anchor="start" style="fill:var(--ink2);font-size:10px">steps 1 to 12</text>
+  <text x="300" y="192" text-anchor="start" style="fill:var(--ink2);font-size:10px">indigo: tokens sent this step     red: tokens sent so far</text>
+  <text x="300" y="18" text-anchor="start" style="fill:var(--ink2);font-size:10px">Each step's request grows linearly; the total sent grows with the square.</text>
 </svg></div>
-<figcaption>Compaction trades a long middle for a short checkpoint. The summary is written by the model, so it is a sample (fact 5) and can drop or invent details; that is why the best compactors check it. The prefix stays cached; the raw history leaves the context but not the disk.</figcaption>
+<figcaption>Figure 1. The request reaches the window limit eventually; the bill and the attention cost grow faster. Long before the limit, irrelevant tokens dilute the relevant ones (often called context rot).</figcaption>
 </figure>
 
-<h2 id="tour">2. Four compactors, with their real numbers</h2>
+<p>There are only two ways to stay inside a budget: spend less, or throw some away. Throwing away is dangerous because of fact 2: what leaves the window, the model has truly forgotten, and it does not know it has forgotten. That gives an order of preference, from least to most lost.</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 230" width="760" style="max-width:100%;height:auto" role="img" aria-label="The ladder of context reductions">
+  <defs><marker id="m2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="10" width="250" height="34" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="135.0" y="30.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">1. Bound at the source</text>
+  <text x="272" y="31" text-anchor="start" style="fill:var(--ink2);font-size:10px">cap each tool result; save the rest to a file (Ch. 3)</text>
+  <rect x="40" y="52" width="250" height="34" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="165.0" y="72.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">2. Offload</text>
+  <text x="302" y="73" text-anchor="start" style="fill:var(--ink2);font-size:10px">keep large content in files, keep only the path</text>
+  <rect x="70" y="94" width="250" height="34" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="195.0" y="114.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">3. Isolate</text>
+  <text x="332" y="115" text-anchor="start" style="fill:var(--ink2);font-size:10px">explore in a subagent, bring back the conclusion (Ch. 9)</text>
+  <rect x="100" y="136" width="250" height="34" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="225.0" y="156.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">4. Clear old tool output</text>
+  <text x="362" y="157" text-anchor="start" style="fill:var(--ink2);font-size:10px">drop stale results, keep the calls</text>
+  <rect x="130" y="178" width="250" height="34" rx="7" style="fill:var(--bad-s);stroke:var(--bad)"/>
+  <text x="255.0" y="198.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">5. Summarise</text>
+  <text x="392" y="199" text-anchor="start" style="fill:var(--ink2);font-size:10px">replace old turns with a model-written checkpoint</text>
+  <text x="10" y="222" text-anchor="start" style="fill:var(--ink2);font-size:10px">Higher rungs lose nothing or lose only what can be fetched again; the last rung loses detail and can invent it.</text>
+</svg></div>
+<figcaption>Figure 2. Use the cheapest rung that works. Compaction proper is the last resort, not the first tool.</figcaption>
+</figure>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 200" width="760" style="max-width:100%;height:auto" role="img" aria-label="Before and after compaction">
+  <defs><marker id="m3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <text x="10" y="16" text-anchor="start" style="fill:var(--ink);font-size:11px;font-weight:600">Before: about 90% full</text>
+  <rect x="10" y="24" width="90" height="36" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="55.0" y="45.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">prefix</text>
+  <rect x="102" y="24" width="430" height="36" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="317.0" y="45.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">old turns: goal, decisions, tool results</text>
+  <rect x="534" y="24" width="130" height="36" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="599.0" y="45.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">recent tail</text>
+  <text x="10" y="92" text-anchor="start" style="fill:var(--ink);font-size:11px;font-weight:600">After: well under half</text>
+  <rect x="10" y="100" width="90" height="36" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="55.0" y="121.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">prefix</text>
+  <rect x="102" y="100" width="120" height="36" rx="7" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="162.0" y="121.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">checkpoint</text>
+  <rect x="224" y="100" width="130" height="36" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="289.0" y="121.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">recent tail</text>
+  <rect x="356" y="100" width="394" height="36" rx="7" style="fill:none;stroke:var(--line);stroke-dasharray:4 3"/>
+  <text x="553.0" y="121.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">free room for the next turns</text>
+  <path d="M300 62L160 98" style="fill:none;stroke:var(--ink2);stroke-width:1.3;stroke-dasharray:4 3" marker-end="url(#m3)"/>
+  <text x="10" y="170" text-anchor="start" style="fill:var(--ink2);font-size:10px">The raw old turns leave the request, not the disk. Where the harness keeps them, the model can be told how to look them up.</text>
+</svg></div>
+<figcaption>Figure 3. Compaction trades a long middle for a short checkpoint. The prefix stays cached; the tail stays word for word.</figcaption>
+</figure>
+
+<h2 id="decisions">2. The decisions, one at a time</h2>
+<h3 id="d-stages">Decision 1. One compactor, or a pipeline of reductions?</h3>
+<p>The simplest design has one step: when the window is nearly full, summarise. The Claude Code paper describes a different shape: five stages applied in order before each model call, each with its own condition, each losing more than the one before.</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 150" width="760" style="max-width:100%;height:auto" role="img" aria-label="Claude Code five stages">
+  <defs><marker id="m4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="20" width="130" height="50" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="75.0" y="41.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Budget</text>
+  <text x="75.0" y="55.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">reduction</text>
+  <rect x="162" y="20" width="130" height="50" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="227.0" y="48.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Snip</text>
+  <path d="M142 45.0H159" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m4)"/>
+  <rect x="314" y="20" width="130" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="379.0" y="48.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Microcompact</text>
+  <path d="M294 45.0H311" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m4)"/>
+  <rect x="466" y="20" width="130" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="531.0" y="41.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Context</text>
+  <text x="531.0" y="55.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">collapse</text>
+  <path d="M446 45.0H463" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m4)"/>
+  <rect x="618" y="20" width="130" height="50" rx="7" style="fill:var(--bad-s);stroke:var(--bad)"/>
+  <text x="683.0" y="48.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Auto-compact</text>
+  <path d="M598 45.0H615" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m4)"/>
+  <text x="75" y="90" text-anchor="middle" style="fill:var(--ink2);font-size:9px">caps each tool result</text>
+  <text x="227" y="90" text-anchor="middle" style="fill:var(--ink2);font-size:9px">trims older history</text>
+  <text x="379" y="90" text-anchor="middle" style="fill:var(--ink2);font-size:9px">clears old tool results</text>
+  <text x="531" y="90" text-anchor="middle" style="fill:var(--ink2);font-size:9px">projection at read time</text>
+  <text x="683" y="90" text-anchor="middle" style="fill:var(--ink2);font-size:9px">model writes a summary</text>
+  <text x="10" y="124" text-anchor="start" style="fill:var(--ink2);font-size:10px">Compact boundaries are recorded in the transcript and applied when it is loaded; nothing on disk is rewritten.</text>
+</svg></div>
+<figcaption>Figure 4. Claude Code, per the paper. Each stage runs only if the cheaper ones before it did not make enough room.</figcaption>
+</figure>
+
+<p>The reasoning is the ladder in Figure 2. A deterministic stage (cut a result, drop an old tool output) never invents anything; a summary might. Running the cheap stages first means many sessions never need the expensive one. Context collapse is the subtle stage: it changes what the model is shown without changing what is stored, so it can be undone. The other harnesses mostly have one summarising compactor plus Chapter 3's output bounds, which together cover rungs 1 and 5.</p>
+
+<h3 id="d-trigger">Decision 2. When does compaction start?</h3>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 250" width="760" style="max-width:100%;height:auto" role="img" aria-label="Compaction thresholds">
+  <defs><marker id="m5" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <text x="10" y="31" text-anchor="start" style="fill:var(--ink);font-size:10px">fx</text>
+  <rect x="110" y="14" width="400" height="24" rx="3" style="fill:none;stroke:var(--line)"/>
+  <text x="310.0" y="30.0" text-anchor="middle" style="fill:var(--ink);font-size:11px"></text>
+  <rect x="110" y="14" width="320" height="24" rx="3" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="270.0" y="29.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">80%</text>
+  <text x="520" y="31" text-anchor="start" style="fill:var(--ink2);font-size:9px">default; 10 to 80% allowed</text>
+  <text x="10" y="65" text-anchor="start" style="fill:var(--ink);font-size:10px">Kimi Code</text>
+  <rect x="110" y="48" width="400" height="24" rx="3" style="fill:none;stroke:var(--line)"/>
+  <text x="310.0" y="64.0" text-anchor="middle" style="fill:var(--ink);font-size:11px"></text>
+  <rect x="110" y="48" width="340" height="24" rx="3" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="280.0" y="63.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">85%</text>
+  <text x="520" y="65" text-anchor="start" style="fill:var(--ink2);font-size:9px">or when under a 50,000-token reserve</text>
+  <text x="10" y="99" text-anchor="start" style="fill:var(--ink);font-size:10px">Qwen Code</text>
+  <rect x="110" y="82" width="400" height="24" rx="3" style="fill:none;stroke:var(--line)"/>
+  <text x="310.0" y="98.0" text-anchor="middle" style="fill:var(--ink);font-size:11px"></text>
+  <rect x="110" y="82" width="340" height="24" rx="3" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="280.0" y="97.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">85%</text>
+  <text x="520" y="99" text-anchor="start" style="fill:var(--ink2);font-size:9px">buffers documented as matching Claude Code</text>
+  <text x="10" y="133" text-anchor="start" style="fill:var(--ink);font-size:10px">eve</text>
+  <rect x="110" y="116" width="400" height="24" rx="3" style="fill:none;stroke:var(--line)"/>
+  <text x="310.0" y="132.0" text-anchor="middle" style="fill:var(--ink);font-size:11px"></text>
+  <rect x="110" y="116" width="360" height="24" rx="3" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="290.0" y="131.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">90%</text>
+  <text x="520" y="133" text-anchor="start" style="fill:var(--ink2);font-size:9px">configurable</text>
+  <text x="10" y="167" text-anchor="start" style="fill:var(--ink);font-size:10px">Codex</text>
+  <rect x="110" y="150" width="400" height="24" rx="3" style="fill:none;stroke:var(--line)"/>
+  <text x="310.0" y="166.0" text-anchor="middle" style="fill:var(--ink);font-size:11px"></text>
+  <rect x="110" y="150" width="360" height="24" rx="3" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="290.0" y="165.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">90%</text>
+  <path d="M370 148V176" style="fill:none;stroke:var(--pre);stroke-width:2"/>
+  <text x="520" y="167" text-anchor="start" style="fill:var(--ink2);font-size:9px">async speculative start at 65%</text>
+  <text x="10" y="201" text-anchor="start" style="fill:var(--ink);font-size:10px">Pi CLI</text>
+  <rect x="110" y="184" width="400" height="24" rx="3" style="fill:none;stroke:var(--line)"/>
+  <text x="310.0" y="200.0" text-anchor="middle" style="fill:var(--ink);font-size:11px"></text>
+  <rect x="110" y="184" width="368" height="24" rx="3" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="294.0" y="199.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">92%</text>
+  <text x="520" y="201" text-anchor="start" style="fill:var(--ink2);font-size:9px">window minus 16,384 (92% of 200k)</text>
+  <text x="10" y="232" text-anchor="start" style="fill:var(--ink2);font-size:10px">Trae Agent does not compact; nanocode follows each vendor's own limit per model.</text>
+</svg></div>
+<figcaption>Figure 5. Thresholds cluster between 80 and 92 percent. The Pi figure assumes a 200,000-token window.</figcaption>
+</figure>
+
 <div class="tbl"><table>
-  <tr><th>Harness</th><th>Trigger</th><th>Kept word for word</th><th>Distinctive idea</th><th>Where</th></tr>
-  <tr><td>eve</td><td>90% of the window (configurable)</td><td>Recent messages up to 20,000 tokens or half the threshold; their tool results cut to 2,000 chars</td><td>Must land under 50% of the window; falls back to text-only tail, then summary only; then moves the idle session to a fresh workflow run</td><td><code>src/harness/compaction/engine.ts</code>, <code>config.ts</code></td></tr>
-  <tr><td>fx</td><td>80% by default (10 to 80% allowed)</td><td>User messages and final replies exactly</td><td>Handles M1, T1 for every turn and tool call; a lint pass checks notes against saved turns; full text stays on disk for lookup</td><td><code>src/core/compactor/</code></td></tr>
-  <tr><td>Pi CLI</td><td>Window minus 16,384 reserve tokens</td><td>About 20,000 recent tokens</td><td>Branch summarization when you move in the session tree</td><td><code>coding-agent/src/core/compaction/</code></td></tr>
-  <tr><td>Pi Durable</td><td>Background threshold, blocking threshold, or overflow</td><td>Per model (<code>keepRecentTokens</code>, e.g. 8,000 for a 32k model)</td><td>Background compaction runs while the conversation keeps working</td><td><code>durable/docs/spec.md</code> section 8.7</td></tr>
-  <tr><td>nanocode</td><td>Per backend</td><td>Per backend</td><td>Each vendor driver owns compaction with its own prompt and a per-model auto-compact token limit</td><td><code>crates/backends/*/prompts/compact.md</code></td></tr>
+  <tr><th></th><th>Early (80%)</th><th>Late (90% or a fixed reserve)</th></tr>
+  <tr><td>Pro</td><td>Each compaction loses less; headroom for one big tool result; attention stays sharper</td><td>Uses the window fully; fewer lossy summaries</td></tr>
+  <tr><td>Con</td><td>Compacts more often</td><td>One large result can overflow before the check</td></tr>
 </table></div>
+<p>A fixed reserve (Pi's 16,384 tokens, Kimi Code's 50,000) is a better rule than a percentage when windows vary widely: the summary call itself needs room, and that room does not shrink with a small window. Kimi Code uses both, whichever comes first.</p>
 
-<h3>eve: compaction with a size contract</h3>
-<p>eve measures size against the provider's last reported input tokens plus an estimate for new messages, and scales its character estimate by the ratio between the two (<code>DEFAULT_ESTIMATE_RATIO = 1.6</code> until calibrated). The summary prompt separates completed progress and decisions from remaining work and keeps constraints, preferences, data and references. A later compaction passes the previous summary in full and replaces it. Memory stays outside history, so the summarizer never sees it. If instructions, tools and memory alone do not fit, eve does not call the provider at all; the turn fails with <code>COMPACTION_FAILED</code>.</p>
-<h3>fx: compaction you can check</h3>
-<p>The header of <code>src/core/compactor/compactor.zig</code> lists the pipeline: <code>window.zig</code> chooses what to compact; <code>summarize.zig</code> keeps user messages and final replies exact and gives every turn and tool call a handle; <code>ledger.zig</code> asks the model for notes; <code>lint.zig</code> checks every note against the saved turns and marks what it cannot confirm; <code>model.zig</code> calls the conversation's model at its lowest reasoning with a fallback; <code>records.zig</code> saves the records and searches them. Manual <code>/compact</code>, automatic compaction and provider-overflow recovery all use the same path.</p>
-<h3>Pi Durable: compaction that does not block</h3>
-<p>Spec section 8.7 defines three starts: a manual <code>Conversation.compact()</code>, a background start above one threshold, and a blocking start above a higher threshold or on overflow. Only the blocking one makes the run wait. Background summaries are placed like any passive write at a turn boundary, and several compactions may run at once. Raw history always stays in storage; the summary entry just marks the first kept entry as its head.</p>
+<h3 id="d-keep">Decision 3. What stays word for word?</h3>
+<p>The most recent turns are the most relevant and the hardest to summarise well (they are still in motion). So every compactor keeps a tail verbatim. What counts as "the tail" differs.</p>
 
-<h3>Codex: 90% by default, a handoff prompt, and compaction in the background</h3>
-<p>Codex compacts when the context passes <code>auto_compact_token_limit()</code>, which in <code>protocol/src/openai_models.rs</code> is 90% of the model's window unless configured lower. The local compactor's prompt (<code>prompts/templates/compact/prompt.md</code>) asks for a "handoff summary for another LLM that will resume the task": progress and decisions, constraints and preferences, what remains, and the data needed to continue. The summary is then introduced to the next call with a prefix that frames it as another model's work, so the model builds on it instead of repeating it. Recent user messages are kept up to 20,000 tokens. For providers that support it, Codex can ask the server to compact (<code>compact_remote_v2.rs</code>), with a 64,000-token budget for retained messages. An experimental async mode starts a speculative compaction in the background at 65% of the window, so the summary is ready when the limit arrives instead of blocking the user.</p>
-<h3>Claude Code: five stages, cheapest first</h3>
-<p>The paper's best single lesson on compaction: Claude Code does not have one compactor but five stages, applied in order before a model call, each under its own conditions. Budget reduction caps the size of individual tool results; snip trims older history; microcompact clears old tool results; context collapse is a non-destructive projection applied when the context is read, not written; auto-compact asks the model for a summary. The order follows the cost of being wrong: each stage loses more than the one before. Compact boundaries are recorded in the transcript, and the loader patches the message chain at read time, so nothing on disk is rewritten.</p>
-<h3>Kimi Code: compaction that tells the model where the raw log is</h3>
-<p>Kimi Code's defaults are in <code>agent/fullCompaction/strategy.ts</code>: compact at 85% of the window, or earlier if the remaining space would drop under a 50,000-token reserve; keep the last 4 messages, up to 20% of the window; try at most 3 times on overflow. The instruction (<code>compaction-instruction.md</code>) is one of the best in any harness. It asks for the summary in the conversation's language, exact commands, paths and results rather than descriptions of them, decisions kept separate from open questions, an explicit list of what is still unknown, and a careful forward plan, because "right now you hold more context on this task than you ever will again". Then <code>context-recovery-footer.md</code> tells the model that everything compacted is still on disk in an append-only <code>wire.jsonl</code>, and how to grep it. That turns lossy compaction into lossless compaction plus a cache, which is the design our build uses.</p>
-<p>Kimi's archived Python CLI tried something more radical, still worth knowing: a <code>SendDMail</code> tool (named after <em>Steins;Gate</em>) let the model revert its own context to an earlier checkpoint and leave itself a note with only the useful result. The model, not the harness, decided what to forget.</p>
-<h3>Qwen Code: Claude Code's numbers, plus CJK</h3>
-<p><code>services/chatCompressionService.ts</code> compacts at 85% (<code>DEFAULT_PCT</code>) and reserves 20,000 tokens for the summary. Its buffers (13,000 tokens before the window for auto-compaction, 20,000 for a warning, 3,000 hard) are documented in the comments as matching Claude Code's. After 3 consecutive failures a circuit breaker stops trying. The summary is an XML <code>&lt;state_snapshot&gt;</code> written after an <code>&lt;analysis&gt;</code> block, a format inherited from Gemini CLI. One detail no Western harness has: the token estimator counts CJK characters as 1.5 tokens, because Chinese text tokenizes differently and a count based on characters per token would underestimate it.</p>
-<h3>Trae Agent: none</h3>
-<p>Trae Agent does not compact. It clips tool output at 16,000 characters and relies on the 200-step cap and a large window. For short benchmark tasks that is enough, and it keeps experiments free of a lossy step.</p>
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 150" width="760" style="max-width:100%;height:auto" role="img" aria-label="What is kept verbatim">
+  <defs><marker id="m6" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <text x="10" y="18" text-anchor="start" style="fill:var(--ink);font-size:12px;font-weight:600">Recent messages by tokens</text>
+  <text x="10" y="34" text-anchor="start" style="fill:var(--ink2);font-size:10px">eve, Codex, Pi</text>
+  <rect x="10" y="44" width="238" height="96" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="129.0" y="74.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">eve: up to 20,000 tokens or half</text>
+  <text x="129.0" y="88.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">the threshold; their tool results</text>
+  <text x="129.0" y="102.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">cut to 2,000 characters</text>
+  <text x="129.0" y="116.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Codex, Pi: about 20,000 tokens</text>
+  <text x="260" y="18" text-anchor="start" style="fill:var(--ink);font-size:12px;font-weight:600">Recent messages by count</text>
+  <text x="260" y="34" text-anchor="start" style="fill:var(--ink2);font-size:10px">Kimi Code</text>
+  <rect x="260" y="44" width="238" height="96" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="379.0" y="88.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">the last 4 messages,</text>
+  <text x="379.0" y="102.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">up to 20% of the window</text>
+  <text x="510" y="18" text-anchor="start" style="fill:var(--ink);font-size:12px;font-weight:600">By kind</text>
+  <text x="510" y="34" text-anchor="start" style="fill:var(--ink2);font-size:10px">fx, Codex</text>
+  <rect x="510" y="44" width="238" height="96" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="629.0" y="74.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">fx: every user message and</text>
+  <text x="629.0" y="88.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">final reply, exactly;</text>
+  <text x="629.0" y="102.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Codex: user messages kept</text>
+  <text x="629.0" y="116.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">up to 20,000 tokens</text>
+</svg></div>
+<figcaption>Figure 6. Keeping the user's own words is a strong default: they are the goal and its corrections, and summaries paraphrase them badly.</figcaption>
+</figure>
 
-<h2 id="decisions">3. Design decisions</h2>
-<div class="tbl"><table>
-  <tr><th>Choice</th><th>Pro</th><th>Con</th><th>Who</th></tr>
-  <tr><td>Early trigger (80%)</td><td>Each compaction loses less; headroom for big tool results</td><td>Compacts more often</td><td>fx</td></tr>
-  <tr><td>Late trigger (90%)</td><td>Uses the window fully</td><td>Risk of overflow on one big result</td><td>eve</td></tr>
-  <tr><td>Verified summary</td><td>Catches invented facts</td><td>Extra pass, more code</td><td>fx</td></tr>
-  <tr><td>Background compaction</td><td>No pause for the user</td><td>Summary may race with new work</td><td>Pi Durable</td></tr>
-  <tr><td>Vendor-specific compaction</td><td>Matches what each model was trained with</td><td>One compactor per vendor to maintain; summaries not portable</td><td>nanocode (Codex CLI's server-side path is the extreme case)</td></tr>
-  <tr><td>No compaction, fresh sessions plus files</td><td>No summary drift</td><td>Agent must write progress files</td><td>Early Pi, Anthropic's long-running harness</td></tr>
-</table></div>
-<p>The same decisions in the five reference harnesses:</p>
-<div class="tbl"><table>
-  <tr><th>Decision</th><th>Codex</th><th>Claude Code</th><th>Kimi Code</th><th>Qwen Code</th><th>Trae Agent</th></tr>
-<tr><td>Trigger</td><td>90% of window (configurable); async at 65%</td><td>Five stages, each with its own condition</td><td>85%, or a 50,000-token reserve</td><td>85%, buffers matching Claude Code</td><td>None</td></tr>
-<tr><td>What is kept</td><td>User messages up to 20,000 tokens</td><td>Recent tail; boundaries patched at read time</td><td>Last 4 messages, up to 20% of window</td><td>Retained tail</td><td>Everything until the cap</td></tr>
-<tr><td>Summary</td><td>Handoff summary for "another LLM"</td><td>Model summary as the last stage</td><td>Detailed handoff with unknowns and plan</td><td><code>&lt;state_snapshot&gt;</code> XML</td><td>n/a</td></tr>
-<tr><td>Raw history</td><td>Rollout on disk</td><td>Transcript on disk</td><td>Model told how to grep <code>wire.jsonl</code></td><td>Transcript hint after compaction</td><td>Trajectory file</td></tr>
-<tr><td>Unusual idea</td><td>Server-side and speculative compaction</td><td>Non-destructive context collapse</td><td>Recovery footer</td><td>CJK token weighting</td><td>n/a</td></tr>
-</table></div>
+<h3 id="d-summary">Decision 4. What must the summary say?</h3>
+<p>A summary is a prompt written by the model for a future model that knows nothing (fact 2). The best summary prompts ask for the same parts.</p>
 
-<h2 id="research">4. Research and the Chinese view</h2>
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 230" width="760" style="max-width:100%;height:auto" role="img" aria-label="Anatomy of a handoff summary">
+  <defs><marker id="m7" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="10" width="365" height="58" rx="7" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="192.5" y="35.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Goal and constraints</text>
+  <text x="192.5" y="49.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">what the user asked, preferences, limits</text>
+  <rect x="385" y="10" width="365" height="58" rx="7" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="567.5" y="35.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Done and decided</text>
+  <text x="567.5" y="49.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">progress, decisions and why</text>
+  <rect x="10" y="80" width="365" height="58" rx="7" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="192.5" y="105.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Exact facts</text>
+  <text x="192.5" y="119.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">commands, paths, numbers, results, not descriptions</text>
+  <rect x="385" y="80" width="365" height="58" rx="7" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="567.5" y="105.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Unknowns</text>
+  <text x="567.5" y="119.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">what is still not known, open questions</text>
+  <rect x="10" y="150" width="365" height="58" rx="7" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="192.5" y="175.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Next steps</text>
+  <text x="192.5" y="189.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">a forward plan</text>
+  <rect x="385" y="150" width="365" height="58" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="567.5" y="175.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Where the raw record is</text>
+  <text x="567.5" y="189.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">how to look up anything dropped</text>
+</svg></div>
+<figcaption>Figure 7. The six parts. Codex asks for a handoff for another LLM; Kimi Code's prompt is the most complete, adding the language of the conversation and a careful plan.</figcaption>
+</figure>
+
+<p>Kimi Code's instruction is worth reading as a model of the genre. It asks for the summary in the conversation's language; exact commands, paths and results rather than descriptions of them; decisions kept separate from open questions; an explicit list of what is still unknown; and a careful forward plan, because, in its words, right now you hold more context on this task than you ever will again. Qwen Code, inheriting Gemini CLI's format, asks for an analysis block followed by an XML state snapshot. eve's prompt separates completed progress and decisions from remaining work, and on a second compaction passes the previous summary in full and replaces it, so summaries do not nest.</p>
+<p>Codex adds a framing trick: the summary is introduced to the next call with text presenting it as another model's work, so the model builds on it rather than repeating it.</p>
+
+<h3 id="d-check">Decision 5. Is the summary checked?</h3>
+<p>A summary can invent a file name or a test result that never happened, and the next model will trust it. fx is the only harness here that checks.</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 190" width="760" style="max-width:100%;height:auto" role="img" aria-label="fx compaction pipeline">
+  <defs><marker id="m8" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="20" width="134" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="77.0" y="41.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Choose the</text>
+  <text x="77.0" y="55.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">window</text>
+  <rect x="161" y="20" width="134" height="50" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="228.0" y="41.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Keep user msgs,</text>
+  <text x="228.0" y="55.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">final replies exact</text>
+  <path d="M146 45.0H158" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m8)"/>
+  <rect x="312" y="20" width="134" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="379.0" y="41.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Handle every</text>
+  <text x="379.0" y="55.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">turn and call</text>
+  <path d="M297 45.0H309" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m8)"/>
+  <rect x="463" y="20" width="134" height="50" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="530.0" y="41.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Model writes</text>
+  <text x="530.0" y="55.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">notes</text>
+  <path d="M448 45.0H460" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m8)"/>
+  <rect x="614" y="20" width="134" height="50" rx="7" style="fill:var(--bad-s);stroke:var(--bad)"/>
+  <text x="681.0" y="41.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Lint notes</text>
+  <text x="681.0" y="55.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">against turns</text>
+  <path d="M599 45.0H611" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m8)"/>
+  <rect x="10" y="96" width="740" height="76" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="380.0" y="123.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Notes cite handles (a turn, a tool call). The lint pass checks each note against the saved record and marks what it</text>
+  <text x="380.0" y="137.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">cannot confirm. The summariser runs on the conversation's own model at its lowest reasoning setting, with a fallback.</text>
+  <text x="380.0" y="151.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Manual compaction, automatic compaction and recovery from a provider overflow all go through the same path.</text>
+</svg></div>
+<figcaption>Figure 8. fx treats the summary as a claim to verify. Handles make that possible: a note that cites a turn can be checked against it.</figcaption>
+</figure>
+
+<h3 id="d-lossless">Decision 6. Can the model get back what was dropped?</h3>
+<p>If raw history stays on disk and the model knows how to reach it, compaction is a cache in front of a complete record rather than a loss.</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 150" width="760" style="max-width:100%;height:auto" role="img" aria-label="Reaching dropped history">
+  <defs><marker id="m9" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <text x="10" y="18" text-anchor="start" style="fill:var(--ink);font-size:12px;font-weight:600">Tell it where the log is</text>
+  <text x="10" y="34" text-anchor="start" style="fill:var(--ink2);font-size:10px">Kimi Code</text>
+  <rect x="10" y="44" width="238" height="96" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="129.0" y="74.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">a footer after the summary</text>
+  <text x="129.0" y="88.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">says everything is still in an</text>
+  <text x="129.0" y="102.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">append-only log, and how</text>
+  <text x="129.0" y="116.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">to grep it</text>
+  <text x="260" y="18" text-anchor="start" style="fill:var(--ink);font-size:12px;font-weight:600">Give everything a handle</text>
+  <text x="260" y="34" text-anchor="start" style="fill:var(--ink2);font-size:10px">fx</text>
+  <rect x="260" y="44" width="238" height="96" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="379.0" y="74.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">turns and tool calls have</text>
+  <text x="379.0" y="88.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">handles; a tool reads or</text>
+  <text x="379.0" y="102.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">searches them after</text>
+  <text x="379.0" y="116.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">compaction</text>
+  <text x="510" y="18" text-anchor="start" style="fill:var(--ink);font-size:12px;font-weight:600">Keep it, do not advertise it</text>
+  <text x="510" y="34" text-anchor="start" style="fill:var(--ink2);font-size:10px">Claude Code, Codex, Pi, eve</text>
+  <rect x="510" y="44" width="238" height="96" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="629.0" y="74.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">transcript or rollout on</text>
+  <text x="629.0" y="88.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">disk; boundaries applied</text>
+  <text x="629.0" y="102.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">on load; the model is not</text>
+  <text x="629.0" y="116.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">pointed at it</text>
+</svg></div>
+<figcaption>Figure 9. The difference between the first two columns and the third is one paragraph of instructions.</figcaption>
+</figure>
+
+<p>Manus calls this restorable compression: drop a page's content but keep its URL, drop a file's content but keep its path. Trae Agent does not compact at all; it keeps the trajectory on disk for analysis, clips tool output at 16,000 characters and relies on its step cap.</p>
+
+<h3 id="d-block">Decision 7. Does compaction make the user wait?</h3>
+<p>A summary call takes seconds to a minute. Done at the moment the limit arrives, it stalls the conversation.</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 190" width="760" style="max-width:100%;height:auto" role="img" aria-label="Blocking and background compaction">
+  <defs><marker id="m10" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <path d="M20 40H740" style="fill:none;stroke:var(--ink2);stroke-width:1"/>
+  <text x="20" y="28" text-anchor="start" style="fill:var(--ink2);font-size:10px">window use over time</text>
+  <path d="M260 34V60" style="fill:none;stroke:var(--pre);stroke-width:2"/>
+  <text x="260" y="74" text-anchor="middle" style="fill:var(--ink2);font-size:9px">65%: Codex starts a speculative summary</text>
+  <path d="M520 34V60" style="fill:none;stroke:var(--pre);stroke-width:2"/>
+  <text x="520" y="74" text-anchor="middle" style="fill:var(--ink2);font-size:9px">background threshold (Pi Durable)</text>
+  <path d="M660 34V60" style="fill:none;stroke:var(--pre);stroke-width:2"/>
+  <text x="660" y="86" text-anchor="middle" style="fill:var(--ink2);font-size:9px">blocking threshold or overflow</text>
+  <rect x="260" y="96" width="400" height="30" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="460.0" y="114.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">summary prepared while work continues</text>
+  <rect x="660" y="96" width="90" height="30" rx="7" style="fill:var(--bad-s);stroke:var(--bad)"/>
+  <text x="705.0" y="114.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">wait</text>
+  <text x="20" y="150" text-anchor="start" style="fill:var(--ink2);font-size:10px">Pi Durable defines three starts: manual, background above one threshold, blocking above a higher one or on overflow.</text>
+  <text x="20" y="166" text-anchor="start" style="fill:var(--ink2);font-size:10px">Only the blocking start makes the run wait; several compactions may run at once and are applied at turn boundaries.</text>
+</svg></div>
+<figcaption>Figure 10. Background compaction hides the cost. The risk is that the summary describes a state that has since moved on.</figcaption>
+</figure>
+
+<h3 id="d-fail">Decision 8. What if compaction fails?</h3>
 <ul>
-  <li><strong>Externalize memory.</strong> Anthropic's long-running harness has each session read a progress file and git log instead of relying on a summary. Chinese readings of that post put it bluntly: the context window is not reliable memory; reliable memory must be externalized (<a href="https://aicoding.csdn.net/6a3ceb0610ee7a33f2824176.html">CSDN</a>).</li>
-  <li><strong>Restorable compression.</strong> Manus drops a page's content but keeps its URL, or a file's content but keeps its path, so nothing is truly lost (<a href="https://manus.im/blog/Context-Engineering-for-AI-Agents-Lessons-from-Building-Manus">Manus</a>).</li>
-  <li><strong>Long-horizon harness work.</strong> Alibaba's DreamX team's LongHorizon-Harness asks how much long-task performance changes when only the harness changes; compaction policy is a major lever.</li>
+  <li><strong>eve</strong> requires the result to land under 50% of the window. If it does not, it falls back to a text-only tail, then to the summary alone; if instructions, tools and memory alone do not fit, it does not call the provider and the turn fails with a compaction error.</li>
+  <li><strong>Qwen Code</strong> stops trying after 3 consecutive failures, a circuit breaker so a broken summariser does not burn money on every step.</li>
+  <li><strong>Kimi Code</strong> tries at most 3 times on an overflow.</li>
+  <li><strong>fx</strong> uses the same path for provider-overflow recovery as for planned compaction, so the rare case is exercised by the common one.</li>
 </ul>
 
-<h2 id="build">5. Build: a compactor with handles, lint and recall</h2>
+<h3 id="d-measure">Decision 9. How does the harness know how full the window is?</h3>
+<p>The only exact count is the provider's, and it arrives after the call. Harnesses estimate before.</p>
+<ul>
+  <li><strong>eve</strong> starts from the provider's last reported input tokens, estimates only the new messages, and scales its character-based estimate by the observed ratio between the two (1.6 until calibrated).</li>
+  <li><strong>Qwen Code</strong> counts CJK characters as 1.5 tokens each, because Chinese text tokenises differently and a characters-per-token rule tuned on English would underestimate it badly.</li>
+</ul>
+
+<h3 id="d-self">Decision 10. Who decides what to forget?</h3>
+<p>Every harness above lets the harness decide. Kimi's earlier Python CLI tried the opposite: a tool (named after the D-Mail in Steins;Gate) let the model revert its own context to an earlier checkpoint and leave itself a note with only the useful result, for example after a long dead-end exploration. The model knows better than the harness which turns were wasted; the cost is one more tool the model must learn to use well. Subagents (Chapter 9) are the mainstream version of the same idea: exploration happens in a context that is thrown away.</p>
+
+<h2 id="harnesses">3. Compaction in each harness</h2>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 132" width="760" style="max-width:100%;height:auto" role="img" aria-label="Pi compaction">
+  <defs><marker id="m11" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="16" width="134" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="77.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">window minus</text>
+  <text x="77.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">16,384 reserve</text>
+  <rect x="161" y="16" width="134" height="50" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="228.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">keep about</text>
+  <text x="228.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">20,000 recent</text>
+  <path d="M146 41.0H158" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m11)"/>
+  <rect x="312" y="16" width="134" height="50" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="379.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">summarise</text>
+  <text x="379.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">the rest</text>
+  <path d="M297 41.0H309" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m11)"/>
+  <rect x="463" y="16" width="134" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="530.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">summary marks</text>
+  <text x="530.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">first kept entry</text>
+  <path d="M448 41.0H460" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m11)"/>
+  <rect x="614" y="16" width="134" height="50" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="681.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">raw entries</text>
+  <text x="681.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">stay stored</text>
+  <path d="M599 41.0H611" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m11)"/>
+  <text x="10" y="98" text-anchor="start" style="fill:var(--ink2);font-size:10px">Moving to another branch of the session tree summarises the branch you leave (Chapter 6).</text>
+  <text x="10" y="114" text-anchor="start" style="fill:var(--ink2);font-size:10px">Pi Durable adds background and blocking starts, per-model kept tokens (e.g. 8,000 for a 32k model).</text>
+</svg></div>
+<figcaption>Figure 11. Pi. Compaction is an entry in the session log, never a rewrite.</figcaption>
+</figure>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 132" width="760" style="max-width:100%;height:auto" role="img" aria-label="eve compaction">
+  <defs><marker id="m12" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="16" width="134" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="77.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">90% of window</text>
+  <rect x="161" y="16" width="134" height="50" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="228.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">keep recent: 20k</text>
+  <text x="228.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">tokens or half</text>
+  <path d="M146 41.0H158" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m12)"/>
+  <rect x="312" y="16" width="134" height="50" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="379.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">summary: done,</text>
+  <text x="379.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">decided, remaining</text>
+  <path d="M297 41.0H309" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m12)"/>
+  <rect x="463" y="16" width="134" height="50" rx="7" style="fill:var(--bad-s);stroke:var(--bad)"/>
+  <text x="530.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">must land</text>
+  <text x="530.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">under 50%</text>
+  <path d="M448 41.0H460" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m12)"/>
+  <rect x="614" y="16" width="134" height="50" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="681.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">fallbacks, then</text>
+  <text x="681.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">fail cleanly</text>
+  <path d="M599 41.0H611" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m12)"/>
+  <text x="10" y="98" text-anchor="start" style="fill:var(--ink2);font-size:10px">Memory stays outside history, so the summariser never sees or rewrites it.</text>
+  <text x="10" y="114" text-anchor="start" style="fill:var(--ink2);font-size:10px">When a session goes idle after compaction, eve moves it to a fresh durable workflow run (Chapter 11).</text>
+</svg></div>
+<figcaption>Figure 12. eve. A size contract: compaction that does not free enough room counts as a failure.</figcaption>
+</figure>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 116" width="760" style="max-width:100%;height:auto" role="img" aria-label="fx compaction">
+  <defs><marker id="m13" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="16" width="134" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="77.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">80% default</text>
+  <rect x="161" y="16" width="134" height="50" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="228.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">user msgs and final</text>
+  <text x="228.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">replies exact</text>
+  <path d="M146 41.0H158" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m13)"/>
+  <rect x="312" y="16" width="134" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="379.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">handles for turns</text>
+  <text x="379.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">and calls</text>
+  <path d="M297 41.0H309" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m13)"/>
+  <rect x="463" y="16" width="134" height="50" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="530.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">notes by the</text>
+  <text x="530.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">model</text>
+  <path d="M448 41.0H460" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m13)"/>
+  <rect x="614" y="16" width="134" height="50" rx="7" style="fill:var(--bad-s);stroke:var(--bad)"/>
+  <text x="681.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">lint against</text>
+  <text x="681.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">saved turns</text>
+  <path d="M599 41.0H611" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m13)"/>
+  <text x="10" y="98" text-anchor="start" style="fill:var(--ink2);font-size:10px">Full text stays on disk and is searchable by handle after compaction.</text>
+</svg></div>
+<figcaption>Figure 13. fx. The only compactor that checks its own summary.</figcaption>
+</figure>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 116" width="760" style="max-width:100%;height:auto" role="img" aria-label="nanocode compaction">
+  <defs><marker id="m14" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="16" width="134" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="77.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">vendor's limit</text>
+  <text x="77.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">per model</text>
+  <rect x="161" y="16" width="134" height="50" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="228.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">vendor's own</text>
+  <text x="228.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">compact prompt</text>
+  <path d="M146 41.0H158" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m14)"/>
+  <rect x="312" y="16" width="134" height="50" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="379.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">vendor's</text>
+  <text x="379.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">tail rules</text>
+  <path d="M297 41.0H309" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m14)"/>
+  <text x="10" y="98" text-anchor="start" style="fill:var(--ink2);font-size:10px">Each backend driver owns compaction, so a Claude session compacts like Claude Code and a Codex session like Codex.</text>
+</svg></div>
+<figcaption>Figure 14. nanocode. Matching the vendor matters most for the summary format the model was trained to continue from.</figcaption>
+</figure>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 116" width="760" style="max-width:100%;height:auto" role="img" aria-label="Codex compaction">
+  <defs><marker id="m15" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="16" width="134" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="77.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">90% (or set);</text>
+  <text x="77.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">async at 65%</text>
+  <rect x="161" y="16" width="134" height="50" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="228.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">user messages</text>
+  <text x="228.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">up to 20k tokens</text>
+  <path d="M146 41.0H158" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m15)"/>
+  <rect x="312" y="16" width="134" height="50" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="379.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">handoff summary</text>
+  <text x="379.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">for another LLM</text>
+  <path d="M297 41.0H309" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m15)"/>
+  <rect x="463" y="16" width="134" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="530.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">framed as another</text>
+  <text x="530.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">model's work</text>
+  <path d="M448 41.0H460" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m15)"/>
+  <rect x="614" y="16" width="134" height="50" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="681.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">or server-side</text>
+  <text x="681.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">compaction</text>
+  <path d="M599 41.0H611" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m15)"/>
+  <text x="10" y="98" text-anchor="start" style="fill:var(--ink2);font-size:10px">Where the provider supports it, the server compacts, with a 64,000-token budget for retained messages.</text>
+</svg></div>
+<figcaption>Figure 15. Codex. Both a local summariser and a provider-side path.</figcaption>
+</figure>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 116" width="760" style="max-width:100%;height:auto" role="img" aria-label="Claude Code compaction">
+  <defs><marker id="m16" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="16" width="134" height="50" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="77.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">budget</text>
+  <text x="77.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">reduction</text>
+  <rect x="161" y="16" width="134" height="50" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="228.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">snip</text>
+  <path d="M146 41.0H158" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m16)"/>
+  <rect x="312" y="16" width="134" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="379.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">microcompact</text>
+  <path d="M297 41.0H309" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m16)"/>
+  <rect x="463" y="16" width="134" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="530.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">context</text>
+  <text x="530.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">collapse</text>
+  <path d="M448 41.0H460" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m16)"/>
+  <rect x="614" y="16" width="134" height="50" rx="7" style="fill:var(--bad-s);stroke:var(--bad)"/>
+  <text x="681.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">auto-compact</text>
+  <path d="M599 41.0H611" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m16)"/>
+  <text x="10" y="98" text-anchor="start" style="fill:var(--ink2);font-size:10px">After compaction the project-root CLAUDE.md is re-read from disk and re-injected (Chapter 4).</text>
+</svg></div>
+<figcaption>Figure 16. Claude Code. Five stages, cheapest first; boundaries are applied when the transcript is loaded.</figcaption>
+</figure>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 116" width="760" style="max-width:100%;height:auto" role="img" aria-label="Kimi Code compaction">
+  <defs><marker id="m17" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="16" width="134" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="77.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">85% or under</text>
+  <text x="77.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">50k reserve</text>
+  <rect x="161" y="16" width="134" height="50" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="228.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">keep last 4,</text>
+  <text x="228.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">up to 20%</text>
+  <path d="M146 41.0H158" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m17)"/>
+  <rect x="312" y="16" width="134" height="50" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="379.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">detailed</text>
+  <text x="379.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">handoff</text>
+  <path d="M297 41.0H309" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m17)"/>
+  <rect x="463" y="16" width="134" height="50" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="530.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">footer: raw log</text>
+  <text x="530.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">and how to grep</text>
+  <path d="M448 41.0H460" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m17)"/>
+  <rect x="614" y="16" width="134" height="50" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="681.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">3 tries on</text>
+  <text x="681.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">overflow</text>
+  <path d="M599 41.0H611" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m17)"/>
+  <text x="10" y="98" text-anchor="start" style="fill:var(--ink2);font-size:10px">The footer is what makes Kimi Code's compaction lossless in practice.</text>
+</svg></div>
+<figcaption>Figure 17. Kimi Code. The best summary prompt and the simplest recovery path.</figcaption>
+</figure>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 116" width="760" style="max-width:100%;height:auto" role="img" aria-label="Qwen Code compaction">
+  <defs><marker id="m18" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="16" width="134" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="77.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">85%; 20k for</text>
+  <text x="77.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">the summary</text>
+  <rect x="161" y="16" width="134" height="50" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="228.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">analysis, then</text>
+  <text x="228.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">state snapshot</text>
+  <path d="M146 41.0H158" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m18)"/>
+  <rect x="312" y="16" width="134" height="50" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="379.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">retained</text>
+  <text x="379.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">tail</text>
+  <path d="M297 41.0H309" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m18)"/>
+  <rect x="463" y="16" width="134" height="50" rx="7" style="fill:var(--bad-s);stroke:var(--bad)"/>
+  <text x="530.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">3 failures:</text>
+  <text x="530.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">stop trying</text>
+  <path d="M448 41.0H460" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m18)"/>
+  <rect x="614" y="16" width="134" height="50" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="681.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">CJK at 1.5</text>
+  <text x="681.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">tokens each</text>
+  <path d="M599 41.0H611" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m18)"/>
+  <text x="10" y="98" text-anchor="start" style="fill:var(--ink2);font-size:10px">Its buffers (13,000 tokens before the window for auto-compaction, 20,000 for a warning, 3,000 hard) follow Claude Code's.</text>
+</svg></div>
+<figcaption>Figure 18. Qwen Code. Claude Code's numbers, Gemini CLI's summary format, and a tokeniser fix for Chinese.</figcaption>
+</figure>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 116" width="760" style="max-width:100%;height:auto" role="img" aria-label="Trae Agent">
+  <defs><marker id="m19" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="16" width="134" height="50" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="77.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">clip results at</text>
+  <text x="77.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">16,000 chars</text>
+  <rect x="161" y="16" width="134" height="50" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="228.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">no</text>
+  <text x="228.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">compaction</text>
+  <path d="M146 41.0H158" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m19)"/>
+  <rect x="312" y="16" width="134" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="379.0" y="37.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">step cap and</text>
+  <text x="379.0" y="51.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">a large window</text>
+  <path d="M297 41.0H309" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m19)"/>
+  <text x="10" y="98" text-anchor="start" style="fill:var(--ink2);font-size:10px">Short benchmark tasks fit; experiments stay free of a lossy step.</text>
+</svg></div>
+<figcaption>Figure 19. Trae Agent. Not compacting is a valid choice when tasks are short.</figcaption>
+</figure>
+
+<h2 id="compare">4. All nine in one table</h2>
+<div class="tbl"><table>
+  <tr><th>Harness</th><th>Trigger</th><th>Kept verbatim</th><th>Summary</th><th>Checked</th><th>Raw history</th><th>Blocking</th><th>Failure handling</th></tr>
+  <tr><td>Pi</td><td>Window minus 16,384</td><td>About 20,000 tokens</td><td>Model summary</td><td>No</td><td>Stays in session log</td><td>CLI blocks; Durable has background</td><td>Not described here</td></tr>
+  <tr><td>eve</td><td>90%</td><td>20,000 tokens or half threshold</td><td>Done, decided, remaining</td><td>Size only (under 50%)</td><td>Durable log</td><td>Blocks</td><td>Fallbacks, then a clean failure</td></tr>
+  <tr><td>fx</td><td>80%</td><td>User messages, final replies</td><td>Notes with handles</td><td>Lint against turns</td><td>On disk, by handle</td><td>Blocks</td><td>Same path as overflow recovery</td></tr>
+  <tr><td>nanocode</td><td>Per vendor</td><td>Per vendor</td><td>Vendor prompt</td><td>No</td><td>Session store</td><td>Per vendor</td><td>Per vendor</td></tr>
+  <tr><td>Codex</td><td>90%; async 65%</td><td>User messages to 20,000 tokens</td><td>Handoff for another LLM</td><td>No</td><td>Rollout on disk</td><td>Optional background</td><td>Not described here</td></tr>
+  <tr><td>Claude Code</td><td>Five staged conditions</td><td>Recent tail</td><td>Last of five stages</td><td>No</td><td>Transcript, applied on load</td><td>Not described here</td><td>Not described here</td></tr>
+  <tr><td>Kimi Code</td><td>85% or 50,000 reserve</td><td>Last 4, up to 20%</td><td>Detailed handoff</td><td>No</td><td>Log + grep footer</td><td>Blocks</td><td>3 tries on overflow</td></tr>
+  <tr><td>Qwen Code</td><td>85%</td><td>Retained tail</td><td>Analysis + XML snapshot</td><td>No</td><td>Transcript</td><td>Blocks</td><td>Circuit breaker at 3</td></tr>
+  <tr><td>Trae Agent</td><td>None</td><td>Everything</td><td>None</td><td>n/a</td><td>Trajectory file</td><td>n/a</td><td>Step cap</td></tr>
+</table></div>
+
+<h2 id="choose">5. Choosing a compaction design</h2>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 274" width="760" style="max-width:100%;height:auto" role="img" aria-label="Choosing compaction">
+  <defs><marker id="m20" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="10" width="280" height="52" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="150.0" y="32.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Do tool results dominate</text>
+  <text x="150.0" y="46.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">your context?</text>
+  <rect x="340" y="10" width="410" height="52" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="545.0" y="32.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Bound and offload first (rungs 1 and 2);</text>
+  <text x="545.0" y="46.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">clear old results before summarising</text>
+  <path d="M292 36H336" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m20)"/>
+  <text x="300" y="30" text-anchor="start" style="fill:var(--ink2);font-size:10px">yes</text>
+  <rect x="10" y="76" width="280" height="52" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="150.0" y="105.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Do sessions run for hours?</text>
+  <rect x="340" y="76" width="410" height="52" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="545.0" y="98.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Summarise with a handoff prompt; keep the</text>
+  <text x="545.0" y="112.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">user's words verbatim; start early (80 to 85%)</text>
+  <path d="M292 102H336" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m20)"/>
+  <text x="300" y="96" text-anchor="start" style="fill:var(--ink2);font-size:10px">yes</text>
+  <rect x="10" y="142" width="280" height="52" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="150.0" y="164.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Would a wrong summary</text>
+  <text x="150.0" y="178.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">be costly?</text>
+  <rect x="340" y="142" width="410" height="52" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="545.0" y="164.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Keep raw history on disk with handles; tell the</text>
+  <text x="545.0" y="178.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">model how to look things up; lint the notes</text>
+  <path d="M292 168H336" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m20)"/>
+  <text x="300" y="162" text-anchor="start" style="fill:var(--ink2);font-size:10px">yes</text>
+  <rect x="10" y="208" width="280" height="52" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="150.0" y="237.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Do users wait on the agent?</text>
+  <rect x="340" y="208" width="410" height="52" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="545.0" y="230.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Start a background summary early so it is</text>
+  <text x="545.0" y="244.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">ready when the limit arrives</text>
+  <path d="M292 234H336" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m20)"/>
+  <text x="300" y="228" text-anchor="start" style="fill:var(--ink2);font-size:10px">yes</text>
+</svg></div>
+<figcaption>Figure 20. Most of the value is in the first and third answers: bound early, and never lose the raw record.</figcaption>
+</figure>
+
+<p>This book's compactor: trigger at 85% or a fixed reserve, keep user messages and the recent tail verbatim, ask for a handoff summary with the six parts in Figure 7, give every turn a handle, lint the notes against the saved turns, and append a footer telling the model where the raw log is.</p>
+
+<h2 id="research">6. Research and the Chinese view</h2>
+<ul>
+  <li><strong>Externalise memory.</strong> Anthropic's harness for long-running agents has each new session read a progress file and the git log instead of relying on a summary. Chinese readings of that post put it bluntly: the context window is not reliable memory, so reliable memory must be written down outside it.</li>
+  <li><strong>Restorable compression.</strong> Manus keeps a URL or a path when it drops content, so nothing is truly lost.</li>
+  <li><strong>Long-horizon harness studies.</strong> Alibaba's LongHorizon-Harness work asks how much long-task performance changes when only the harness changes; compaction policy is one of the largest levers.</li>
+  <li><strong>Chinese practice.</strong> Kimi Code's compaction prompt and recovery footer are the most complete design read for this chapter, and its earlier model-driven context revert is the boldest. Qwen Code's CJK token weighting is a reminder that a harness built and tested in English can quietly miscount for other languages.</li>
+</ul>
+
+<h2 id="build">7. Build: a compactor with handles, lint and recall</h2>
 <pre>&quot;&quot;&quot;Compaction: summarize old turns into a checkpoint, keep a verbatim tail, keep raw history recallable.&quot;&quot;&quot;
 import json, re
 
@@ -217,31 +797,35 @@ def maybe_compact(state, window, estimate, summarize, archive):
   <li>Read one checkpoint and mark every claim as true or false against the transcript. That number is your summary accuracy.</li>
 </ol>
 
-<h2 id="exercises">6. Exercises</h2>
+
+<h2 id="exercises">8. Exercises</h2>
 <ol>
-  <li>Make compaction run in a background thread when usage passes 70% and block only above 90%, as Pi Durable does. What can go wrong?</li>
-  <li>Keep user messages word for word inside the checkpoint, as fx does. Does accuracy improve?</li>
-  <li>Use eve's fallback chain: if the tail does not fit under 50%, keep only its text, then only the summary. Test with one giant tool result.</li>
+  <li><strong>Plot the wall.</strong> Log input tokens per step for a 40-step task. Plot per-step and cumulative tokens, and mark where your compactor fires.</li>
+  <li><strong>Cheap rungs first.</strong> Before summarising, clear tool results older than 10 turns (keep the calls). How many sessions never reach the summary?</li>
+  <li><strong>Lint the summary.</strong> Make the summariser cite turn handles. Check every cited file path and command against the saved turns; count unsupported claims over 20 compactions.</li>
+  <li><strong>The footer.</strong> Run the same long task with and without a footer that says where the raw log is and how to grep it. Does the agent re-run commands it already ran?</li>
+  <li><strong>Background start.</strong> Start a summary at 65% in the background and apply it at the next turn boundary. Measure the wait saved and check the summary for staleness.</li>
 </ol>
 
-<h2 id="quiz">7. Check yourself</h2>
+<h2 id="quiz">9. Check yourself</h2>
 <div class="widget quiz" data-quiz="qz5"></div>
 <script type="application/json" id="qz5">[
-{"q":"fx's default auto-compaction threshold is:","o":["50%","80%","90%","95%"],"a":1,"e":"settings.zig: default_percent = 80, allowed range 10 to 80."},
-{"q":"After compacting, eve requires the request to fit under:","o":["90% of the window","50% of the window","20,000 tokens","The threshold"],"a":1,"e":"So the next compaction is far away. If the kept tail does not fit, eve keeps only its text, then only the summary."},
-{"q":"What does fx's lint.zig do?","o":["Formats code","Checks every summary note against the saved turns and marks what it cannot confirm","Counts tokens","Removes duplicates"],"a":1,"e":"Verification keeps an invented fact in a summary from steering the rest of the session."},
-{"q":"How does Pi Durable avoid making the user wait for compaction?","o":["It never compacts","Background compaction runs while the conversation keeps working; only the blocking threshold or overflow makes the run wait","It uses a bigger model","It compacts on another machine"],"a":1,"e":"Spec section 8.7 defines background, blocking and overflow starts."},
-{"q":"Why does the kept tail never start with a tool result?","o":["Tool results are unimportant","Providers reject a tool result whose call is missing","It saves tokens","Tool results are already in the summary"],"a":1,"e":"Cut only at a clean boundary: a user or assistant message."}
+{"q":"Why is summarisation the last resort?","o":["It is slow","A summary is a sample that can drop or invent details, while cheaper reductions are deterministic","Providers charge extra","It breaks tools"],"a":1,"e":"Bound, offload, isolate and clear old results first."},
+{"q":"What is Claude Code's context collapse stage, according to the paper?","o":["Deleting the transcript","A non-destructive projection applied when the context is read, not written","A smaller model","Dropping the system prompt"],"a":1,"e":"It changes what the model sees without rewriting what is stored."},
+{"q":"Why is a fixed token reserve sometimes better than a percentage trigger?","o":["It is simpler","The summary call itself needs room, and that need does not shrink with a small window","Providers require it","It compacts less"],"a":1,"e":"Kimi Code uses whichever comes first: 85% or a 50,000-token reserve."},
+{"q":"What does fx do that no other harness here does?","o":["Compacts at 90%","Lints the summary's notes against the saved turns","Uses a smaller model","Never compacts"],"a":1,"e":"Handles make it possible: a note citing a turn can be checked against it."},
+{"q":"What makes Kimi Code's compaction effectively lossless?","o":["It keeps everything in the window","A footer tells the model the raw history is in an append-only log and how to grep it","It never summarises","It uses a bigger window"],"a":1,"e":"The summary becomes a cache in front of a complete record."},
+{"q":"When does Codex's experimental async mode start a speculative compaction?","o":["At 50%","At 65% of the window","At 90%","On overflow only"],"a":1,"e":"So the summary is ready when the limit arrives instead of blocking."},
+{"q":"Why does Qwen Code count CJK characters as 1.5 tokens?","o":["To compact more often","Chinese text tokenises differently, and an English-tuned estimate would undercount it","For billing","For display"],"a":1,"e":"An undercount means compaction fires too late."},
+{"q":"What does eve do if instructions, tools and memory alone do not fit the window?","o":["Truncates the system prompt","Calls the provider anyway","Does not call the provider; the turn fails with a compaction error","Switches model"],"a":2,"e":"A clean failure is better than a request that cannot succeed."}
 ]</script>
 
-<h2 id="refs">8. References</h2>
+<h2 id="refs">10. References</h2>
 <ul>
-  <li>eve: <code>packages/eve/src/harness/compaction/</code>; <code>docs/concepts/default-harness.md</code>.</li>
-  <li>fx: <code>src/core/compactor/compactor.zig</code>, <code>settings.zig</code>, <code>lint.zig</code>.</li>
-  <li>Pi: <code>packages/coding-agent/src/core/compaction/compaction.ts</code>; <code>packages/durable/docs/spec.md</code> section 8.7.</li>
-  <li>nanocode: <code>crates/backends/claude/prompts/compact.md</code>, <code>crates/backends/codex/client/prompts/compact.md</code>.</li>
-  <li><a href="https://anthropic.com/engineering/effective-harnesses-for-long-running-agents">Effective harnesses for long-running agents</a>, Anthropic, Nov 2025.</li>
-  <li><a href="https://manus.im/blog/Context-Engineering-for-AI-Agents-Lessons-from-Building-Manus">Context Engineering for AI Agents: Lessons from Building Manus</a>, Jul 2025.</li>
+  <li>Pi: <a href="https://github.com/earendil-works/pi">github.com/earendil-works/pi</a> (fb248c7), including the durable runtime specification. eve: <a href="https://github.com/vercel/eve">github.com/vercel/eve</a> (5c52fbf). fx: <a href="https://github.com/vercel-labs/fx">github.com/vercel-labs/fx</a> (cbe7daf). nanocode: <a href="https://github.com/gakonst/nanocode">github.com/gakonst/nanocode</a> (015cbfa).</li>
+  <li>Codex CLI: <a href="https://github.com/openai/codex">github.com/openai/codex</a> (50aeac2). Claude Code: Dive into Claude Code, arXiv 2604.14228; <a href="https://code.claude.com/docs/en/memory">memory documentation</a>.</li>
+  <li>Kimi Code: <a href="https://github.com/MoonshotAI/kimi-code">github.com/MoonshotAI/kimi-code</a> (111aae2) and the earlier <a href="https://github.com/MoonshotAI/kimi-cli">kimi-cli</a> (9ab1286). Qwen Code: <a href="https://github.com/QwenLM/qwen-code">github.com/QwenLM/qwen-code</a> (c56424fc). Trae Agent: <a href="https://github.com/bytedance/trae-agent">github.com/bytedance/trae-agent</a> (e839e55).</li>
+  <li>Context Engineering for AI Agents: Lessons from Building Manus, Jul 2025. Anthropic, Effective harnesses for long-running agents, Nov 2025.</li>
 </ul>
 
 <div class="navfoot"></div>
