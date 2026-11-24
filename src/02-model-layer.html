@@ -1,130 +1,849 @@
 <div class="kicker">Stage 1 · Foundations · Chapter 2</div>
 <h1>The model and provider layer</h1>
-<p class="lede">The model is a remote service you pay per token (fact 4) over a network that fails (fact 6), and every vendor trained its model on a different text format. Every harness therefore talks to models through a layer that hides wire formats, streams tokens, retries failures, counts cost and protects the prompt cache. Harnesses split on one question here: one neutral format for every model, or each model in the harness it was trained with? This chapter reads Pi's unified API, nanocode's per-vendor drivers, eve's retry and recovery code and fx's gateway, then builds a two-provider layer.</p>
+<p class="lede">The loop in Chapter 1 called the model as if it were a function. It is not. It is a remote service on shared hardware, paid per token (fact 4), reached over a network that fails (fact 6), and every vendor trained its model on a different message format. Between the loop and the model sits a layer that translates formats, streams tokens, decides which failures to retry and how, keeps the prompt cache warm, carries reasoning state from one call to the next, counts money and holds credentials. This chapter takes those jobs one at a time, shows how nine harnesses designed each one and why, and ends with a two-provider layer you build yourself.</p>
 <div class="meta">
   <span class="chip">Level: intermediate</span>
   <span class="chip">Time: about 20 hours with the build</span>
   <span class="chip">Needs: Chapter 1, API keys for two providers</span>
-  <span class="chip">Code read at: Pi fb248c7, eve 5c52fbf, fx cbe7daf, nanocode 015cbfa</span>
+  <span class="chip">Harnesses read: Pi, eve, fx, nanocode, Codex, Claude Code, Kimi Code, Qwen Code, Trae Agent</span>
 </div>
 
 <div class="box skip">
   <span class="lbl">Before you start: skip check</span>
   <ol>
-    <li>Where do tool results go in the Anthropic Messages format, compared with OpenAI chat completions?</li>
-    <li>Why can adding a timestamp to the system prompt double your bill?</li>
-    <li>What is a hedged request?</li>
+    <li>A provider answers 429. Name two situations where retrying is the wrong response.</li>
+    <li>Why does switching models mid-conversation make the next request slow and expensive even though the text sent is identical?</li>
+    <li>Why does Pi drop the previous model's thinking blocks when the conversation moves to a different model?</li>
+    <li>What is a hedged request, and what does it cost?</li>
   </ol>
   <details><summary>Answers</summary><ol>
-    <li>Anthropic puts <code>tool_result</code> blocks inside a <em>user</em> message; OpenAI chat uses separate <code>role: "tool"</code> messages.</li>
-    <li>Prompt caching matches an exact prefix. A changing timestamp at the top makes every request a cache miss, and uncached input often costs about 10x cached input.</li>
-    <li>If the first byte is slow, send a second identical request and use whichever answers first. It trades extra cost for lower tail latency.</li>
+    <li>When the 429 means a quota or plan limit that resets in hours, not seconds (Pi lists several such messages, including a ChatGPT subscription limit and a Zhipu plan code); and when the harness would rather switch models, which Qwen Code does after its retries run out. Claude Code takes the opposite view and never switches models on a rate limit.</li>
+    <li>Each model has its own cache. The provider must recompute the whole prefix for the new model, so every token is billed at the uncached rate once.</li>
+    <li>Signatures and encrypted reasoning are only valid for the model that produced them, and readable thinking sent to another model as plain text would look like part of the reply.</li>
+    <li>If the first byte has not arrived by a deadline, send a duplicate request and keep whichever answers first. It buys lower tail latency with extra tokens; nanocode caps it at 10% of requests.</li>
   </ol></details>
 </div>
 
-<h2 id="why">1. What this layer does</h2>
-<p>The loop from Chapter 1 called one SDK directly. Work out what a model call physically is and the extra jobs appear on their own.</p>
-<ul>
-  <li><strong>Translation.</strong> Underneath, every API turns your messages into one long token sequence with special markers for roles and tool calls. Each vendor chose different markers and trained its model on them, so the JSON on the wire differs too: OpenAI chat completions, OpenAI Responses, Anthropic Messages, Google and Bedrock all disagree. The harness needs one internal shape and a translator per vendor.</li>
-  <li><strong>Streaming.</strong> The model emits one token at a time, so a long reply takes seconds to tens of seconds. Waiting for the end wastes the user's time and hides progress. Tool-call arguments also arrive token by token and must be joined before they are valid JSON.</li>
-  <li><strong>Retries.</strong> The model runs on shared GPUs behind a network (fact 6). Rate limits (429), overloads (529) and dropped connections are not bugs; they are the normal state of a shared resource. Retrying them is safe because a model call has no side effects of its own. Errors that mean "your request is wrong" will fail the same way again, so retrying those only wastes time.</li>
-  <li><strong>Accounting.</strong> Because the whole conversation is resent each step (fact 2) and paid for each time (fact 4), cost grows roughly with the square of the session length. You cannot manage what you do not count: input, cached input and output tokens, and dollars, per call and per session.</li>
-  <li><strong>Caching discipline.</strong> The provider can skip recomputing a prefix it has already processed, which is why cached input is so much cheaper. "Same prefix" means byte for byte, so any change near the top (a timestamp, a reordered tool list) throws the saving away. Build requests so each one shares the longest possible exact prefix with the last.</li>
-  <li><strong>Model choice.</strong> Different models trade price, speed and skill. Since the model holds no state (fact 2), you can switch it at any step boundary; the next model just reads the same history. That makes routing cheap work to cheap models possible.</li>
-</ul>
+
+<h2 id="call">1. What a model call physically is</h2>
+<p>Follow one request from the harness to the model and back. The harness serialises the history into the provider's JSON and sends it. A gateway or load balancer picks a server. That server turns the JSON into one long token sequence and runs it through the model once to build its internal state for every token (the <em>prefill</em>), unless it already holds that state for a matching prefix from an earlier request (a <em>cache hit</em>). Then it generates output one token at a time and streams each token back. At the end it reports how many tokens of each kind it processed, which is what you pay for.</p>
+
 <figure>
-<div class="svgwrap"><svg viewBox="0 0 760 250" width="760" style="max-width:100%;height:auto" role="img" aria-label="Provider layer: the harness speaks one internal format, adapters translate to each wire format">
-  <defs><marker id="c1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
-  <rect x="24" y="90" width="150" height="70" rx="8" style="fill:var(--kv-s);stroke:var(--kv);stroke-width:1.6"/>
-  <text x="99" y="120" text-anchor="middle" style="fill:var(--ink);font-size:13px;font-weight:600">Harness</text>
-  <text x="99" y="138" text-anchor="middle" style="fill:var(--ink2);font-size:11px">one message format</text>
-  <rect x="230" y="40" width="190" height="170" rx="10" style="fill:var(--panel);stroke:var(--line)"/>
-  <text x="325" y="62" text-anchor="middle" style="fill:var(--ink);font-size:13px;font-weight:600">Provider layer</text>
-  <text x="246" y="88" style="fill:var(--ink2);font-size:11px">translate messages</text>
-  <text x="246" y="108" style="fill:var(--ink2);font-size:11px">join streamed tool args</text>
-  <text x="246" y="128" style="fill:var(--ink2);font-size:11px">retry transient errors</text>
-  <text x="246" y="148" style="fill:var(--ink2);font-size:11px">count tokens and cost</text>
-  <text x="246" y="168" style="fill:var(--ink2);font-size:11px">keep prefixes stable</text>
-  <text x="246" y="188" style="fill:var(--ink2);font-size:11px">hedge slow requests</text>
-  <g style="fill:none;stroke:var(--ink2);stroke-width:1.3">
-    <path d="M176 125H228" marker-start="url(#c1)" marker-end="url(#c1)"/>
-    <path d="M422 70H498" marker-end="url(#c1)"/><path d="M422 110H498" marker-end="url(#c1)"/><path d="M422 150H498" marker-end="url(#c1)"/><path d="M422 190H498" marker-end="url(#c1)"/>
-  </g>
-  <rect x="500" y="52" width="236" height="34" rx="6" style="fill:var(--pre-s);stroke:var(--pre)"/><text x="512" y="74" style="fill:var(--ink);font-size:12px">OpenAI chat completions</text>
-  <rect x="500" y="92" width="236" height="34" rx="6" style="fill:var(--pre-s);stroke:var(--pre)"/><text x="512" y="114" style="fill:var(--ink);font-size:12px">OpenAI Responses</text>
-  <rect x="500" y="132" width="236" height="34" rx="6" style="fill:var(--pre-s);stroke:var(--pre)"/><text x="512" y="154" style="fill:var(--ink);font-size:12px">Anthropic Messages</text>
-  <rect x="500" y="172" width="236" height="34" rx="6" style="fill:var(--pre-s);stroke:var(--pre)"/><text x="512" y="194" style="fill:var(--ink);font-size:12px">Google, Bedrock, others</text>
+<div class="svgwrap"><svg viewBox="0 0 760 230" width="760" style="max-width:100%;height:auto" role="img" aria-label="Timeline of one model call">
+  <defs><marker id="m1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <text x="10" y="18" text-anchor="start" style="fill:var(--ink);font-size:11px;font-weight:600">One request, left to right in time</text>
+  <rect x="10" y="30" width="70" height="48" rx="5" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="45.0" y="50.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">serialise,</text>
+  <text x="45.0" y="64.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">send</text>
+  <rect x="84" y="30" width="70" height="48" rx="5" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="119.0" y="50.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">queue,</text>
+  <text x="119.0" y="64.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">route</text>
+  <rect x="158" y="30" width="60" height="48" rx="5" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="188.0" y="50.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">cached</text>
+  <text x="188.0" y="64.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">prefix</text>
+  <rect x="222" y="30" width="120" height="48" rx="5" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="282.0" y="50.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">prefill the</text>
+  <text x="282.0" y="64.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">new tokens</text>
+  <rect x="346" y="30" width="270" height="48" rx="5" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="481.0" y="57.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">generate and stream, one token at a time</text>
+  <rect x="620" y="30" width="130" height="48" rx="5" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="685.0" y="50.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">usage, stop</text>
+  <text x="685.0" y="64.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">reason</text>
+  <path d="M10 96H750" style="fill:none;stroke:var(--line);stroke-width:1"/>
+  <path d="M10 90V102" style="fill:none;stroke:var(--ink2);stroke-width:1.5"/>
+  <text x="13" y="116" text-anchor="start" style="fill:var(--ink2);font-size:10px">send</text>
+  <path d="M346 90V102" style="fill:none;stroke:var(--ink2);stroke-width:1.5"/>
+  <text x="349" y="116" text-anchor="start" style="fill:var(--ink2);font-size:10px">first token</text>
+  <path d="M616 90V102" style="fill:none;stroke:var(--ink2);stroke-width:1.5"/>
+  <text x="619" y="116" text-anchor="start" style="fill:var(--ink2);font-size:10px">last token</text>
+  <text x="222" y="140" text-anchor="start" style="fill:var(--kv);font-size:10px">time to first token: queue + prefill. Caching shortens it; a hedge races it.</text>
+  <text x="346" y="158" text-anchor="start" style="fill:var(--kv);font-size:10px">output time: grows with reply length; streaming shows it as it happens</text>
+  <text x="10" y="186" text-anchor="start" style="fill:var(--ink2);font-size:10px">Failures can happen at every point: no connection, a queue rejection (429, 503, 529), a stall mid-stream,</text>
+  <text x="10" y="202" text-anchor="start" style="fill:var(--ink2);font-size:10px">a reply cut off by the output limit, a content filter, or a prompt too long for the window.</text>
 </svg></div>
-<figcaption>The harness speaks one format. The provider layer owns everything that differs between vendors.</figcaption>
+<figcaption>Figure 1. Where the time and the failures are. Each design decision in this chapter attacks one segment of this line.</figcaption>
 </figure>
 
-<h2 id="formats">2. The wire formats differ in ways that matter</h2>
+<p>Three numbers dominate, and each produces a design pressure. <strong>Input tokens</strong> are paid on every call, and because the loop resends the whole history, they dominate cost; caching is the main lever, and a cached token is billed at a fraction of the full rate. <strong>Time to first token</strong> is queueing plus prefill; it is what the person feels as "thinking" and what a hedged request attacks. <strong>Failures</strong> are routine, not exceptional: a shared service under load rejects requests, connections drop, long streams stall. The layer exists to turn these three facts into a dependable function for the loop.</p>
+
+<h2 id="jobs">2. The jobs of the layer</h2>
+<p>Derive the jobs from the call itself. Each job below exists because of one property of the call, and each later section takes one job and shows the designs.</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 300" width="760" style="max-width:100%;height:auto" role="img" aria-label="The model layer between the loop and the providers">
+  <defs><marker id="m2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="10" width="740" height="40" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="380.0" y="34.0" text-anchor="middle" style="fill:var(--ink);font-size:11px;font-weight:600">The loop (Chapter 1): history in, one assistant message out</text>
+  <rect x="10" y="66" width="176" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="98.0" y="87.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Translate</text>
+  <text x="98.0" y="101.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">formats differ</text>
+  <rect x="196" y="66" width="176" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="284.0" y="87.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Stream</text>
+  <text x="284.0" y="101.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">tokens arrive one by one</text>
+  <rect x="382" y="66" width="176" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="470.0" y="87.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Classify failures</text>
+  <text x="470.0" y="101.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">some retry, some never</text>
+  <rect x="568" y="66" width="176" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="656.0" y="87.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Recover</text>
+  <text x="656.0" y="101.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">change the request</text>
+  <rect x="10" y="128" width="176" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="98.0" y="149.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Cache</text>
+  <text x="98.0" y="163.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">prefix reuse is cheap</text>
+  <rect x="196" y="128" width="176" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="284.0" y="149.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Reasoning state</text>
+  <text x="284.0" y="163.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">valid for one model</text>
+  <rect x="382" y="128" width="176" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="470.0" y="149.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Account</text>
+  <text x="470.0" y="163.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">tokens are money</text>
+  <rect x="568" y="128" width="176" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="656.0" y="149.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Credentials</text>
+  <text x="656.0" y="163.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">keys, subscriptions</text>
+  <rect x="10" y="196" width="740" height="30" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="380.0" y="214.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Transports: HTTPS + SSE, WebSocket, cloud SDKs, local servers</text>
+  <rect x="10" y="242" width="100" height="40" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="60.0" y="265.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">OpenAI</text>
+  <rect x="116" y="242" width="100" height="40" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="166.0" y="265.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Anthropic</text>
+  <rect x="222" y="242" width="100" height="40" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="272.0" y="265.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Google</text>
+  <rect x="328" y="242" width="100" height="40" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="378.0" y="265.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Bedrock / Vertex</text>
+  <rect x="434" y="242" width="100" height="40" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="484.0" y="265.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Gateways</text>
+  <rect x="540" y="242" width="100" height="40" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="590.0" y="265.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Chinese labs</text>
+  <rect x="646" y="242" width="100" height="40" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="696.0" y="265.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Local (Ollama)</text>
+  <path d="M380 52V62" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m2)"/>
+  <path d="M380 186V194" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m2)"/>
+  <path d="M380 228V240" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m2)"/>
+</svg></div>
+<figcaption>Figure 2. Eight jobs. A research harness can skip most of them; a production harness that runs for hours on several providers needs all eight.</figcaption>
+</figure>
+
+<p>The rest of the chapter is eight decisions, one per job. Translation and streaming come first because every other job depends on how messages are represented.</p>
+
+<h2 id="decisions">3. The decisions, one at a time</h2>
+<h3 id="d-shape">Decision 1. One neutral format, one wire format, or one harness per vendor?</h3>
+<p>Every vendor's API is a different encoding of the same few ideas: a system prompt, messages, tool definitions, tool calls, tool results, reasoning. The differences are not cosmetic, because each model was trained on its own vendor's encoding. A field becomes specific tokens in the sequence the model reads, and a model fed an unfamiliar arrangement does a little worse.</p>
 <div class="tbl"><table>
-  <tr><th>Concept</th><th>OpenAI chat completions</th><th>Anthropic Messages</th></tr>
-  <tr><td>System prompt</td><td>A message with <code>role: "system"</code></td><td>A separate <code>system</code> field</td></tr>
-  <tr><td>Tool call</td><td><code>tool_calls</code> on the assistant message, arguments as a JSON <em>string</em></td><td><code>tool_use</code> content block, input as a JSON <em>object</em></td></tr>
-  <tr><td>Tool result</td><td>Its own message, <code>role: "tool"</code></td><td><code>tool_result</code> block inside a <em>user</em> message</td></tr>
-  <tr><td>Caching</td><td>Automatic on exact prefixes; report in <code>prompt_tokens_details.cached_tokens</code></td><td>Explicit <code>cache_control</code> breakpoints; report in <code>cache_read_input_tokens</code></td></tr>
-  <tr><td>Reasoning</td><td>Hidden or summarized, per model</td><td>Thinking blocks, which may carry a signature that must be sent back unchanged</td></tr>
+  <tr><th>Concept</th><th>OpenAI chat completions</th><th>OpenAI Responses</th><th>Anthropic Messages</th></tr>
+  <tr><td>System prompt</td><td>A message with role <code>system</code></td><td>An <code>instructions</code> field plus developer messages</td><td>A separate <code>system</code> field</td></tr>
+  <tr><td>Tool call</td><td><code>tool_calls</code> on the assistant message; arguments as a JSON string</td><td>A <code>function_call</code> output item</td><td>A <code>tool_use</code> content block; input as a JSON object</td></tr>
+  <tr><td>Tool result</td><td>Its own message, role <code>tool</code></td><td>A <code>function_call_output</code> input item</td><td>A <code>tool_result</code> block inside a <em>user</em> message</td></tr>
+  <tr><td>Reasoning</td><td>Hidden or summarised, per model</td><td>Reasoning items, which can be returned encrypted and sent back</td><td>Thinking blocks with a signature that must be sent back unchanged</td></tr>
+  <tr><td>Caching</td><td>Automatic on exact prefixes</td><td>Automatic, with an optional cache key</td><td>Explicit <code>cache_control</code> breakpoints</td></tr>
 </table></div>
-<p>These are not cosmetic, because the model was trained on its own format. Each field becomes specific tokens in the sequence the model reads, and a model fed an unfamiliar arrangement behaves a little worse. Switching a conversation from one provider to another mid-session means converting thinking blocks, tool-call IDs and caching markers. Pi does this best-effort: Anthropic thinking becomes tagged text when the conversation moves to OpenAI.</p>
+<p>Three answers appear in the code.</p>
 
-<h2 id="tour">3. Code tour</h2>
-<h3>Pi: one API over everything</h3>
-<p><code>packages/ai/src</code> is a full multi-provider library. <code>types.ts</code> lists the wire APIs it speaks (<code>KnownApi</code>): <code>openai-completions</code>, <code>openai-responses</code>, <code>azure-openai-responses</code>, <code>openai-codex-responses</code>, <code>anthropic-messages</code>, <code>bedrock-converse-stream</code>, <code>google-generative-ai</code>, <code>google-vertex</code>, <code>mistral-conversations</code> and its own <code>pi-messages</code>. <code>providers/</code> holds about 49 providers (each a <code>.ts</code> plus a <code>.models.ts</code>, including DeepSeek and several Chinese hosts), and <code>models.generated.ts</code> is a generated catalog with context sizes and prices. Transports include SSE and WebSocket. <code>cache-warming.ts</code> pre-warms the provider cache.</p>
-<p>The design bet: model choice is a user right, so the harness must speak everything. The cost: provider-specific features that do not fit the common shape are harder to use well.</p>
-<h3>nanocode: each vendor in its own harness</h3>
-<p>nanocode goes the other way. <code>crates/backends/</code> has one tree per vendor (<code>codex</code>, <code>claude</code>, <code>antigravity</code> for Gemini). Each has a <code>client</code> crate for the wire protocol and authentication, and a driver crate that owns prompts, tools, compaction and the durability format. The Codex client pins prompts per model in <code>crates/backends/codex/client/prompts/</code> (<code>sol.md</code>, <code>luna.md</code>, <code>astra.md</code>, even <code>glm.md</code>) with an <code>upstream.json</code> recording where they came from. A layering script forbids one backend from depending on another.</p>
-<p>The bet: models are post-trained inside their vendor's harness, so the best result comes from giving each model its native prompts and tools. The cost: three drivers to maintain, and new vendors take real work.</p>
-<p>nanocode also hedges. <code>crates/core/hedge</code> defines <code>HedgePolicy::DEFAULT</code>: track first-byte latency over the last 100 requests, and if a request is slower than the 90th percentile (never less than 1.5 seconds), fire a second request; hedges are capped at 10% of traffic.</p>
-<h3>eve: retries and recovery as first-class code</h3>
-<p><code>packages/eve/src/harness/model-call/</code> separates <code>request.ts</code>, <code>response.ts</code>, <code>retry.ts</code>, <code>recovery.ts</code>, <code>errors.ts</code>, <code>credential.ts</code> and <code>usage.ts</code>. <code>retry.ts</code> allows 3 attempts per model call (2 for gateway stream timeouts). Models are named through Vercel AI Gateway ids such as <code>anthropic/claude-opus-5.5</code>, so switching is one line. <code>harness/prompt-cache.ts</code> handles cache markers and <code>harness/model-profile.ts</code> holds per-model behaviour.</p>
-<h3>fx: one provider at a time, classified errors</h3>
-<p>fx talks to one provider per session through <code>src/gateway/client.zig</code>: Vercel AI Gateway by default, a ChatGPT or Grok subscription, or any OpenAI-compatible endpoint. Its retry code classifies errors carefully: <code>isRetryableGatewayError</code> treats closed and reset connections as retryable, and a comment notes that some errors "carry delivery ambiguity": the request may have reached the model even though the reply was lost.</p>
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 250" width="760" style="max-width:100%;height:auto" role="img" aria-label="Three shapes for the model layer">
+  <defs><marker id="m3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <text x="10" y="18" text-anchor="start" style="fill:var(--ink);font-size:12px;font-weight:600">A. Neutral format + adapters</text>
+  <text x="10" y="33" text-anchor="start" style="fill:var(--ink2);font-size:10px">Pi, Kimi Code, Qwen Code,</text>
+  <text x="10" y="45" text-anchor="start" style="fill:var(--ink2);font-size:10px">eve (AI SDK), Trae Agent</text>
+  <rect x="10" y="50" width="238" height="184" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <rect x="24" y="58" width="210" height="40" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="129.0" y="81.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">one internal message type</text>
+  <rect x="24" y="116" width="210" height="40" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="129.0" y="139.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">adapter per API</text>
+  <path d="M129 100V113" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m3)"/>
+  <rect x="24" y="174" width="210" height="40" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="129.0" y="197.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">OpenAI · Anthropic · Google · ...</text>
+  <path d="M129 158V171" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m3)"/>
+  <text x="260" y="18" text-anchor="start" style="fill:var(--ink);font-size:12px;font-weight:600">B. One wire format</text>
+  <text x="260" y="33" text-anchor="start" style="fill:var(--ink2);font-size:10px">Codex (Responses only),</text>
+  <text x="260" y="45" text-anchor="start" style="fill:var(--ink2);font-size:10px">Claude Code (Anthropic models)</text>
+  <rect x="260" y="50" width="238" height="184" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <rect x="274" y="58" width="210" height="40" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="379.0" y="81.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">native messages</text>
+  <rect x="274" y="116" width="210" height="40" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="379.0" y="139.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">one API, tuned hard</text>
+  <path d="M379 100V113" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m3)"/>
+  <rect x="274" y="174" width="210" height="40" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="379.0" y="197.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">one vendor family</text>
+  <path d="M379 158V171" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m3)"/>
+  <text x="510" y="18" text-anchor="start" style="fill:var(--ink);font-size:12px;font-weight:600">C. One harness per vendor</text>
+  <text x="510" y="33" text-anchor="start" style="fill:var(--ink2);font-size:10px">nanocode</text>
+  <rect x="510" y="50" width="238" height="184" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <rect x="524" y="58" width="210" height="40" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="629.0" y="81.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Claude driver</text>
+  <rect x="524" y="116" width="210" height="40" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="629.0" y="139.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Codex driver</text>
+  <rect x="524" y="174" width="210" height="40" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="629.0" y="197.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Antigravity (Gemini) driver</text>
+</svg></div>
+<figcaption>Figure 3. Three shapes. A maximises choice of model; B maximises fidelity to one model family; C keeps each vendor's native harness and shares only the runtime around it.</figcaption>
+</figure>
 
-<h3>Codex: one wire format, tuned hard</h3>
-<p>Codex has dropped the format question. <code>codex-rs/model-provider-info/src/lib.rs</code> defines a single <code>WireApi::Responses</code>, and configuring the old chat format fails with "<code>wire_api = "chat"</code> is no longer supported". Any provider must speak OpenAI's Responses API. In exchange, the transport is tuned: a WebSocket connection with a 15-second connect timeout, 5 stream retries and 4 request retries by default, a 300-second idle timeout on a stream, and a <code>prompt_cache_key</code> sent with every request so the provider can route repeated prefixes to the same cache. Base prompts are pinned per model in <code>codex-rs/core/</code>: <code>gpt_5_codex_prompt.md</code> is about 1,100 words while <code>gpt_5_1_prompt.md</code> is about 3,900. The models post-trained inside Codex need a third of the instructions, which is fact 2 seen from the other side: behaviour that is trained in does not have to be resent.</p>
-<h3>Claude Code: one vendor, layered recovery</h3>
-<p>Claude Code talks to one vendor's models, so its model layer is about recovery rather than translation. The paper lists the paths: escalating the maximum output tokens up to three times when a reply is cut off, one reactive compaction per turn when the prompt is too long, a fallback from streaming to non-streaming, and a fallback model.</p>
-<h3>Kimi Code: the model call as a compiler</h3>
-<p>Kimi Code's <code>packages/core/src/llm/</code> is a standalone library that owns exactly one request, and its design guide (<code>agent-core-v2/docs/en/llm.md</code>) is worth reading in full. Every protocol (OpenAI chat, OpenAI Responses, Anthropic, Google) is defined with <code>defineProtocol</code> and encoded by a fixed pipeline: cache key, thinking, response format, max output tokens, sampling, tools, messages, merge turns, annotate, finalize, flatten. A provider is a <em>patch</em> on a protocol (<code>protocol.with(patch)</code>); Kimi itself is one such patch. Two rules stand out. "No silent fallback": an unsupported feature fails loudly instead of quietly changing behaviour. And the settle stage validates every completed tool call against its schema; invalid arguments trigger a retry with a temporary reminder, and the bad call is never executed.</p>
-<h3>Qwen Code: many models, many quirks</h3>
-<p>Qwen Code has to run Qwen, DeepSeek, Kimi, Gemini, Anthropic and OpenAI models, and <code>packages/core/src/core/</code> shows what that costs: separate content generators for Anthropic, Gemini, OpenAI chat and OpenAI Responses; reasoning adapters per family (<code>deepseek-reasoning.ts</code>, <code>kimi-reasoning.ts</code>, <code>gemini-reasoning.ts</code>, <code>anthropic-reasoning.ts</code>); and <code>xml-tool-call-fallback.ts</code>, which recovers tool calls a model wrote as text (<code>&lt;invoke name="..."&gt;</code> or <code>&lt;function=...&gt;</code>) instead of in the structured field. That last file exists because of fact 5: a model's output follows its training, not your schema.</p>
-<h3>Trae Agent: one client per vendor</h3>
-<p>Trae Agent's <code>trae_agent/utils/llm_clients/</code> has one small client per vendor (OpenAI, Anthropic, Azure, Doubao, Google, Ollama, OpenRouter) on a shared base with <code>retry_utils.py</code>. It is the simplest approach that works and is enough for research runs.</p>
-
-<h2 id="decisions">4. Design decisions compared</h2>
-<div class="tbl"><table>
-  <tr><th>Decision</th><th>Pi</th><th>nanocode</th><th>eve</th><th>fx</th></tr>
-  <tr><td>Abstraction</td><td>One neutral API, ~10 wire formats</td><td>One driver per vendor, native prompts</td><td>AI SDK plus AI Gateway ids</td><td>One gateway client, OpenAI-compatible</td></tr>
-  <tr><td>Model switching mid-session</td><td>Yes, with context conversion</td><td>Per session (harness, model, thinking, tier)</td><td>Yes, via config or redeploy</td><td>One provider at a time</td></tr>
-  <tr><td>Retries</td><td>In provider code</td><td>Per client, plus hedging</td><td>3 attempts, recovery path</td><td>Error classification</td></tr>
-  <tr><td>Prompts</td><td>Pi's own, short</td><td>Pinned upstream prompts per model</td><td>Authored instructions</td><td>fx's own, about 1,000 words</td></tr>
-  <tr><td>Pro</td><td>Maximum choice</td><td>Best native quality</td><td>Simplest ops on Vercel</td><td>Small, predictable</td></tr>
-  <tr><td>Con</td><td>Lowest common denominator</td><td>Maintenance per vendor</td><td>Tied to the AI SDK shape</td><td>Less flexible</td></tr>
-</table></div>
-<p>The same layer in the five reference harnesses:</p>
-<div class="tbl"><table>
-  <tr><th>Decision</th><th>Codex</th><th>Claude Code</th><th>Kimi Code</th><th>Qwen Code</th><th>Trae Agent</th></tr>
-<tr><td>Format strategy</td><td>Responses API only</td><td>One vendor</td><td>One internal message type, protocols as pipelines, providers as patches</td><td>Generator per API, adapters per reasoning format</td><td>One client per vendor</td></tr>
-<tr><td>Retries</td><td>5 stream, 4 request, 300 s idle timeout</td><td>Output-token escalation, reactive compaction, fallback model</td><td>Policy-driven attempts; invalid tool arguments retried without executing</td><td>Stream transport retry</td><td>Shared retry helper</td></tr>
-<tr><td>Caching</td><td><code>prompt_cache_key</code> per request</td><td>Prompt caching on the vendor API</td><td>Cache key is the first pipeline stage</td><td>Per provider</td><td>Not managed</td></tr>
-<tr><td>Unusual idea</td><td>Per-model pinned prompts</td><td>Recovery ladder</td><td>No silent fallback</td><td>XML tool-call fallback</td><td>Minimal by design</td></tr>
-</table></div>
-<div class="box expert">
-  <span class="lbl">Harness-model coupling</span>
-  <p>LangChain notes that Claude Code and Codex models are post-trained with their harnesses in the loop, so changing a tool's logic, such as the <code>apply_patch</code> format, can hurt. VS Code's Copilot harness gives Claude models a string-replace edit tool and GPT models <code>apply_patch</code> for this reason. Keep this in mind when you compare models in your own harness: a weak score may be a format mismatch, not a weak model.</p>
-</div>
-
-<h2 id="research">5. Research and how Chinese teams approach it</h2>
 <ul>
-  <li><strong>Cache economics.</strong> Manus calls KV-cache hit rate its most important production metric: cached Claude Sonnet input cost $0.30 per million tokens against $3.00 uncached, a 10x difference, with a typical task near 100 input tokens per output token (<a href="https://manus.im/blog/Context-Engineering-for-AI-Agents-Lessons-from-Building-Manus">Manus</a>).</li>
-  <li><strong>Same model, different harness.</strong> 2026 papers measure how much scores move when only the harness changes, for example <a href="https://arxiv.org/abs/2608.26218">arXiv 2608.26218</a>.</li>
-  <li><strong>Chinese models through foreign harnesses.</strong> Qwen, Kimi, GLM and DeepSeek ship Anthropic-compatible endpoints, so the most common Chinese setup in 2026 is a Western harness (Claude Code, OpenCode) with a Chinese model behind it; a newsletter put it as "the harness standard is American; the price war is Chinese" (<a href="https://invenew.beehiiv.com/p/chinese-coding-agents-are-now-a-stack-design-question">Invenew</a>).</li>
-  <li><strong>Labs evaluate with named scaffolds.</strong> Alibaba's Qwen3-Coder-Next report gives SWE-bench results "with SWE-Agent" and Terminal-Bench results "with Terminus-2", which is an admission that the scaffold is part of the score (<a href="https://arxiv.org/pdf/2603.00729">Qwen</a>).</li>
+  <li><strong>A. A neutral format with adapters.</strong> Pi keeps its own message type and converts at the last moment; it lists dozens of providers, including separate China endpoints for several labs. Kimi Code compiles its neutral messages into each protocol through a fixed sequence of encoding stages and treats each provider as a patch on a protocol. Qwen Code has a content generator per API and a separate adapter for each reasoning format (DeepSeek, Kimi, Gemini, Anthropic). eve delegates the whole job to the AI SDK and, by default, to Vercel's AI Gateway. Trae Agent has one small client per vendor. Buys: any model, switching mid-session, one place to fix a bug. Costs: the lowest common denominator leaks; every vendor feature needs an escape hatch; the adapters are where most bugs live.</li>
+  <li><strong>B. One wire format.</strong> Codex supports only OpenAI's Responses API; configuring the old chat format fails with an explicit error. Claude Code speaks to Anthropic's models, through Anthropic's API or the cloud platforms that host them. Buys: every vendor feature used fully, a harness tuned with the model it was trained alongside. Costs: one vendor family.</li>
+  <li><strong>C. One harness per vendor.</strong> nanocode runs the Codex and Claude harnesses with their own prompts and tools, and a third driver reproduces Google's Antigravity CLI engine for Gemini. Only the runtime (durability, subagents, Code Mode) is shared. The bet: a model performs best in the harness it was post-trained with, so reproduce that harness instead of normalising it away. Costs: three drivers to maintain, and conversations do not move freely between them.</li>
+</ul>
+<div class="box expert"><span class="lbl">Moving a conversation between models</span><p>Shape A promises you can switch models mid-session. Pi's rules show what that really takes: user messages and tool results pass through unchanged; assistant messages from the same model keep their thinking; assistant messages from a different model lose their thinking blocks, because signatures and encrypted reasoning only work with the model that produced them, and readable thinking sent as plain text makes the new model treat it as part of the reply. Tool calls and text are kept. Switching is possible, but the new model never sees how the old one reasoned.</p></div>
+
+<h3 id="d-stream">Decision 2. What does the layer hand the loop while the reply is still arriving?</h3>
+<p>The model produces one token at a time, so a long reply takes tens of seconds. Streaming lets the person read along and lets the harness start work early (Chapter 1: Codex and Claude Code start tools during the stream). It also creates two awkward facts: tool-call arguments arrive as fragments of JSON that are invalid until complete, and a stream can fail halfway with useful content already received.</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 190" width="760" style="max-width:100%;height:auto" role="img" aria-label="Events a streaming model layer emits">
+  <defs><marker id="m4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="20" width="136" height="36" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="78.0" y="41.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">start</text>
+  <rect x="158" y="20" width="136" height="36" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="226.0" y="41.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">text deltas</text>
+  <path d="M148 38.0H155" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m4)"/>
+  <rect x="306" y="20" width="136" height="36" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="374.0" y="41.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">thinking deltas</text>
+  <path d="M296 38.0H303" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m4)"/>
+  <rect x="454" y="20" width="136" height="36" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="522.0" y="41.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">tool-call deltas</text>
+  <path d="M444 38.0H451" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m4)"/>
+  <rect x="602" y="20" width="136" height="36" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="670.0" y="34.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">done: usage,</text>
+  <text x="670.0" y="48.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">stop reason</text>
+  <path d="M592 38.0H599" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m4)"/>
+  <rect x="160" y="86" width="290" height="36" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="305.0" y="100.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">partial arguments: best-effort parse,</text>
+  <text x="305.0" y="114.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">never trusted until complete</text>
+  <path d="M442 58L430 84" style="fill:none;stroke:var(--ink2);stroke-width:1.3;stroke-dasharray:4 3" marker-end="url(#m4)"/>
+  <rect x="470" y="86" width="280" height="36" rx="7" style="fill:var(--bad-s);stroke:var(--bad)"/>
+  <text x="610.0" y="100.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">or: error / aborted, with the partial</text>
+  <text x="610.0" y="114.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">message and the usage so far</text>
+  <path d="M680 58V84" style="fill:none;stroke:var(--ink2);stroke-width:1.3;stroke-dasharray:4 3" marker-end="url(#m4)"/>
+  <text x="10" y="150" text-anchor="start" style="fill:var(--ink2);font-size:10px">Pi's rule: once a stream has started, failures are events, not exceptions. The final message always exists,</text>
+  <text x="10" y="166" text-anchor="start" style="fill:var(--ink2);font-size:10px">carries a stop reason (stop, length, toolUse, error, aborted) and keeps whatever content arrived.</text>
+</svg></div>
+<figcaption>Figure 4. A normalised event stream. Every adapter's job is to turn its provider's stream into these events.</figcaption>
+</figure>
+
+<p>The decisions inside streaming are small but each one prevents a class of bug.</p>
+<ul>
+  <li><strong>Failures as data.</strong> Pi never throws once a stream is returned; an error or abort ends the stream with a final message that holds the partial content and the usage so far. The loop then decides what to do with a message, instead of reconstructing one from an exception.</li>
+  <li><strong>Partial arguments for display only.</strong> Pi parses partial tool-call JSON best-effort so a UI can show progress, and documents that fields may be missing or truncated. The arguments become real only when the call completes, and Chapter 1 showed Pi refusing to run any call from a reply cut off by the output limit.</li>
+  <li><strong>Validation at settlement.</strong> Kimi Code validates each newly completed tool call against its schema when the stream settles; invalid arguments trigger a retry with a temporary reminder and are never executed. Existing history is left as it was.</li>
+  <li><strong>Not every provider streams tools.</strong> Pi notes that its Google adapter delivers a tool call's arguments in one event. Trae Agent does not stream at all: one blocking call per step, which is simpler and fine for benchmarks.</li>
+  <li><strong>Text that should have been a tool call.</strong> Some models occasionally write a tool call as XML text instead of using the structured field. Qwen Code recovers those (<code>&lt;invoke name=...&gt;</code> and <code>&lt;function=...&gt;</code> forms), decodes XML entities so an edit's search text still matches the file, and bounds the scan to 64 KiB because a pathological input made the parser slow.</li>
 </ul>
 
-<h2 id="build">6. Build: a two-provider layer</h2>
+<h3 id="d-classify">Decision 3. Which failures are retried, and which never are?</h3>
+<p>A retry is only correct when the same request could succeed a moment later. That depends on why it failed, and the status code alone does not tell you. Every careful harness ends up with a classifier that sorts failures into a few buckets, each with a different response.</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 260" width="760" style="max-width:100%;height:auto" role="img" aria-label="Sorting a failed model call">
+  <defs><marker id="m5" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="290" y="10" width="180" height="40" rx="7" style="fill:var(--bad-s);stroke:var(--bad)"/>
+  <text x="380.0" y="34.0" text-anchor="middle" style="fill:var(--ink);font-size:11px">Model call failed</text>
+  <rect x="10" y="86" width="176" height="70" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="98.0" y="110.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Transient</text>
+  <text x="98.0" y="124.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">overload, dropped stream,</text>
+  <text x="98.0" y="138.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">server error, throttle</text>
+  <rect x="10" y="172" width="176" height="30" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="98.0" y="190.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">retry the same request</text>
+  <path d="M380 52L98 82" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m5)"/>
+  <path d="M98 158V170" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m5)"/>
+  <rect x="198" y="86" width="176" height="70" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="286.0" y="110.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Recoverable</text>
+  <text x="286.0" y="124.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">cut off, too long, empty,</text>
+  <text x="286.0" y="138.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">unsupported tool</text>
+  <rect x="198" y="172" width="176" height="30" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="286.0" y="190.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">change the request, retry</text>
+  <path d="M380 52L286 82" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m5)"/>
+  <path d="M286 158V170" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m5)"/>
+  <rect x="386" y="86" width="176" height="70" rx="7" style="fill:var(--panel2);stroke:var(--line)"/>
+  <text x="474.0" y="110.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Needs a person</text>
+  <text x="474.0" y="124.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">expired login, billing,</text>
+  <text x="474.0" y="138.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">plan quota, filter block</text>
+  <rect x="386" y="172" width="176" height="30" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="474.0" y="190.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">stop and ask</text>
+  <path d="M380 52L474 82" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m5)"/>
+  <path d="M474 158V170" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m5)"/>
+  <rect x="574" y="86" width="176" height="70" rx="7" style="fill:var(--bad-s);stroke:var(--bad)"/>
+  <text x="662.0" y="110.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Terminal</text>
+  <text x="662.0" y="124.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">invalid request,</text>
+  <text x="662.0" y="138.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">cancelled by user</text>
+  <rect x="574" y="172" width="176" height="30" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="662.0" y="190.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">fail now</text>
+  <path d="M380 52L662 82" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m5)"/>
+  <path d="M662 158V170" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m5)"/>
+  <text x="10" y="228" text-anchor="start" style="fill:var(--ink2);font-size:10px">The hard cases are the boundaries: a 429 can be a 10-second throttle or a quota that resets tomorrow;</text>
+  <text x="10" y="244" text-anchor="start" style="fill:var(--ink2);font-size:10px">a 402 can be a temporary payment hold or a closed account. Harnesses read the error body, not just the code.</text>
+</svg></div>
+<figcaption>Figure 5. Four buckets. The status code is a hint; the body decides.</figcaption>
+</figure>
+
+<div class="tbl"><table>
+  <tr><th>Harness</th><th>How it classifies</th><th>The distinctive rule</th></tr>
+  <tr><td>eve</td><td>Three outcomes: retry, recoverable, terminal. Credential errors and cancellations are terminal; empty replies are recoverable; known transient error types retry.</td><td>Retry policies compose: each policy votes, the most restrictive vote wins, and the longest delay wins. Adding a policy can only make retrying stricter.</td></tr>
+  <tr><td>Pi</td><td>Pattern lists over the error text: retryable (overloaded, rate limit, 429 and 5xx including Cloudflare's 520, 524, 525) and explicitly non-retryable provider limits.</td><td>A 429 that means a subscription or plan limit is <em>not</em> retried: the list includes ChatGPT subscription limits, OpenAI's <code>insufficient_quota</code>, and Zhipu's plan-limit code, each of which resets in hours.</td></tr>
+  <tr><td>fx</td><td>Kinds of failure: offline, dropped, server, rate limited, context exceeded, sign-in needed, content filter.</td><td>Nothing gives up on its own: every failure waits, for time or for the user. Only success or the user's cancel ends a request (checked with a formal model).</td></tr>
+  <tr><td>Kimi Code</td><td>Error kinds with a retryable flag; syntax errors, aborts and context overflow are deterministic and never retried.</td><td>An "infinite retry" mode still refuses deterministic failures, because repeating them cannot help.</td></tr>
+  <tr><td>Qwen Code</td><td>A retry classifier over status, provider codes and transport errors; a separate check for model fallback.</td><td>Fallback is eligible only for 429, 503 and 529, and never for transport errors or failures it diagnoses as fail-fast.</td></tr>
+  <tr><td>Claude Code</td><td>Per Anthropic's docs: overloaded, unavailable or other non-retryable server errors can trigger a fallback model.</td><td>Authentication, billing, rate-limit, request-size and transport errors never trigger a model switch.</td></tr>
+  <tr><td>Trae Agent</td><td>None: any exception is retried.</td><td>Simple and wasteful; acceptable for unattended benchmark runs.</td></tr>
+</table></div>
+<p>Notice the disagreement between Qwen Code and Claude Code over rate limits. Qwen Code treats a 429 that survives its retries as a reason to try the next model in the chain. Claude Code's documentation says a rate limit never triggers a switch. Both are defensible: a rate limit is often per model, so another model may well answer; but switching models silently changes the agent's behaviour and, as section D7 shows, throws away the prompt cache.</p>
+
+<h3 id="d-schedule">Decision 4. How long to wait, and how many times?</h3>
+<p>Once a failure is retryable, the schedule decides two things: how quickly you recover from a blip, and how much you add to the load on a service that is already struggling. Exponential backoff answers both: short first waits, doubling, with a cap. Random jitter spreads out many clients that failed at the same moment so they do not all return together.</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 290" width="760" style="max-width:100%;height:auto" role="img" aria-label="Retry waits by attempt for five harnesses">
+  <defs><marker id="m6" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <text x="10" y="18" text-anchor="start" style="fill:var(--ink);font-size:11px;font-weight:600">Wait before each retry (seconds, before jitter)</text>
+  <path d="M60 256H700" style="fill:none;stroke:var(--ink2);stroke-width:1"/>
+  <path d="M60 256V60" style="fill:none;stroke:var(--ink2);stroke-width:1"/>
+  <path d="M60 256.0H700" style="fill:none;stroke:var(--line);stroke-width:1;stroke-dasharray:4 3"/>
+  <text x="52" y="260.0" text-anchor="end" style="fill:var(--ink2);font-size:10px">0</text>
+  <path d="M60 194.75H700" style="fill:none;stroke:var(--line);stroke-width:1;stroke-dasharray:4 3"/>
+  <text x="52" y="198.75" text-anchor="end" style="fill:var(--ink2);font-size:10px">10</text>
+  <path d="M60 133.5H700" style="fill:none;stroke:var(--line);stroke-width:1;stroke-dasharray:4 3"/>
+  <text x="52" y="137.5" text-anchor="end" style="fill:var(--ink2);font-size:10px">20</text>
+  <path d="M60 72.25H700" style="fill:none;stroke:var(--line);stroke-width:1;stroke-dasharray:4 3"/>
+  <text x="52" y="76.25" text-anchor="end" style="fill:var(--ink2);font-size:10px">30</text>
+  <text x="105.71428571428572" y="272" text-anchor="middle" style="fill:var(--ink2);font-size:10px">retry 1</text>
+  <text x="197.14285714285714" y="272" text-anchor="middle" style="fill:var(--ink2);font-size:10px">retry 2</text>
+  <text x="288.57142857142856" y="272" text-anchor="middle" style="fill:var(--ink2);font-size:10px">retry 3</text>
+  <text x="380.0" y="272" text-anchor="middle" style="fill:var(--ink2);font-size:10px">retry 4</text>
+  <text x="471.42857142857144" y="272" text-anchor="middle" style="fill:var(--ink2);font-size:10px">retry 5</text>
+  <text x="562.8571428571429" y="272" text-anchor="middle" style="fill:var(--ink2);font-size:10px">retry 6</text>
+  <text x="654.2857142857143" y="272" text-anchor="middle" style="fill:var(--ink2);font-size:10px">retry 7</text>
+  <rect x="66.0" y="249.9" width="13.2" height="6.1" style="fill:var(--kv)"/>
+  <rect x="157.4" y="243.8" width="13.2" height="12.2" style="fill:var(--kv)"/>
+  <rect x="248.9" y="231.5" width="13.2" height="24.5" style="fill:var(--kv)"/>
+  <rect x="340.3" y="207.0" width="13.2" height="49.0" style="fill:var(--kv)"/>
+  <rect x="431.7" y="158.0" width="13.2" height="98.0" style="fill:var(--kv)"/>
+  <rect x="523.1" y="72.2" width="13.2" height="183.8" style="fill:var(--kv)"/>
+  <rect x="614.6" y="72.2" width="13.2" height="183.8" style="fill:var(--kv)"/>
+  <rect x="60" y="28" width="10" height="10" style="fill:var(--kv)"/>
+  <text x="74" y="37" text-anchor="start" style="fill:var(--ink2);font-size:10px">fx</text>
+  <rect x="81.2" y="252.9" width="13.2" height="3.1" style="fill:var(--pre)"/>
+  <rect x="172.7" y="249.9" width="13.2" height="6.1" style="fill:var(--pre)"/>
+  <rect x="264.1" y="243.8" width="13.2" height="12.2" style="fill:var(--pre)"/>
+  <rect x="355.5" y="231.5" width="13.2" height="24.5" style="fill:var(--pre)"/>
+  <rect x="447.0" y="207.0" width="13.2" height="49.0" style="fill:var(--pre)"/>
+  <rect x="538.4" y="158.0" width="13.2" height="98.0" style="fill:var(--pre)"/>
+  <rect x="629.8" y="60.0" width="13.2" height="196.0" style="fill:var(--pre)"/>
+  <rect x="188" y="28" width="10" height="10" style="fill:var(--pre)"/>
+  <text x="202" y="37" text-anchor="start" style="fill:var(--ink2);font-size:10px">Kimi Code</text>
+  <rect x="96.5" y="246.8" width="13.2" height="9.2" style="fill:var(--dec)"/>
+  <rect x="187.9" y="237.6" width="13.2" height="18.4" style="fill:var(--dec)"/>
+  <rect x="279.3" y="219.2" width="13.2" height="36.8" style="fill:var(--dec)"/>
+  <rect x="370.8" y="182.5" width="13.2" height="73.5" style="fill:var(--dec)"/>
+  <rect x="462.2" y="109.0" width="13.2" height="147.0" style="fill:var(--dec)"/>
+  <rect x="553.6" y="72.2" width="13.2" height="183.8" style="fill:var(--dec)"/>
+  <rect x="316" y="28" width="10" height="10" style="fill:var(--dec)"/>
+  <text x="330" y="37" text-anchor="start" style="fill:var(--ink2);font-size:10px">Qwen Code</text>
+  <rect x="111.7" y="243.8" width="13.2" height="12.2" style="fill:var(--bad)"/>
+  <rect x="203.1" y="231.5" width="13.2" height="24.5" style="fill:var(--bad)"/>
+  <rect x="294.6" y="207.0" width="13.2" height="49.0" style="fill:var(--bad)"/>
+  <rect x="444" y="28" width="10" height="10" style="fill:var(--bad)"/>
+  <text x="458" y="37" text-anchor="start" style="fill:var(--ink2);font-size:10px">Pi (session)</text>
+  <rect x="127.0" y="252.9" width="13.2" height="3.1" style="fill:var(--good)"/>
+  <rect x="218.4" y="249.9" width="13.2" height="6.1" style="fill:var(--good)"/>
+  <rect x="572" y="28" width="10" height="10" style="fill:var(--good)"/>
+  <text x="586" y="37" text-anchor="start" style="fill:var(--ink2);font-size:10px">eve</text>
+</svg></div>
+<figcaption>Figure 6. Retry schedules side by side, before jitter. fx's table repeats its last value forever; Kimi Code stops after 10 attempts by default; Qwen Code after 7; Pi after 3; eve after 3 attempts in total. Codex retries a stream 5 times and a request 4 times with exponential backoff; Trae Agent sleeps a random 3 to 30 seconds.</figcaption>
+</figure>
+
+<div class="tbl"><table>
+  <tr><th>Harness</th><th>Attempts</th><th>Waits</th><th>Jitter and hints</th><th>Time limits</th></tr>
+  <tr><td>fx</td><td>Unlimited; after 3 same-kind failures, try another way</td><td>1, 2, 4, 8, 16, 30 s, then 30 s; offline 1, 2, 5 s</td><td>Waits keep 80 to 100% of the table value; honours Retry-After</td><td>Separate bounds to connect, for the first response, and for silence mid-stream</td></tr>
+  <tr><td>Kimi Code</td><td>10 per step (or unlimited)</td><td>0.5 s doubling, cap 32 s</td><td>Up to +25%; honours Retry-After</td><td>Headers timeout in its fetch layer</td></tr>
+  <tr><td>Qwen Code</td><td>7</td><td>1.5 s doubling, cap 30 s</td><td>Exponential, capped</td><td>A workflow stall watchdog sized against this ladder</td></tr>
+  <tr><td>eve</td><td>3 (gateway stream timeouts: 2)</td><td>0.5 s doubling</td><td>+0 to 250 ms</td><td>Gateway stream timeout counted separately</td></tr>
+  <tr><td>Pi</td><td>3, from the session around the loop</td><td>2 s doubling, cap 60 s</td><td>Failed attempt kept in raw history, hidden from the model</td><td>Per provider</td></tr>
+  <tr><td>Codex</td><td>5 stream, 4 request</td><td>Exponential</td><td>Reads Retry-After on file uploads</td><td>300 s idle stream; 15 s WebSocket connect</td></tr>
+  <tr><td>Trae Agent</td><td>Configured (10 in the example)</td><td>Random 3 to 30 s</td><td>Fully random</td><td>None in the client</td></tr>
+</table></div>
+<p>Two designs stand out. fx's recovery is a pure decision module: it is told what happened and the time, and answers with a plan (wait, resend, show a status, ask the user). It reads no clock, does no I/O and keeps no global state, so the same events always produce the same plan, which is what makes it possible to check with a model checker. And fx separates three deadlines that most harnesses merge into one timeout: time to connect, time to the first byte (a model may legitimately think for a minute before answering), and silence once the stream has started. A single overall timeout either kills long healthy replies or waits forever on a dead stream.</p>
+
+<h3 id="d-recover">Decision 5. Which failures are fixed by changing the request?</h3>
+<p>Some failures will repeat forever if you resend the same bytes, but go away if you change the request. These are the most valuable to handle, because they otherwise end the turn.</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 290" width="760" style="max-width:100%;height:auto" role="img" aria-label="Recoveries that change the request">
+  <defs><marker id="m7" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="10" width="230" height="38" rx="7" style="fill:var(--bad-s);stroke:var(--bad)"/>
+  <text x="125.0" y="32.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Reply cut off by the output limit</text>
+  <path d="M242 29H262" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m7)"/>
+  <rect x="266" y="10" width="484" height="38" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="276" y="25.6" text-anchor="start" style="fill:var(--ink);font-size:10px">Claude Code raises the limit (up to 3 times per turn);</text>
+  <text x="276" y="39.6" text-anchor="start" style="fill:var(--ink);font-size:10px">Pi fails the truncated calls so the model reissues them</text>
+  <rect x="10" y="56" width="230" height="38" rx="7" style="fill:var(--bad-s);stroke:var(--bad)"/>
+  <text x="125.0" y="78.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Prompt too long for the window</text>
+  <path d="M242 75H262" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m7)"/>
+  <rect x="266" y="56" width="484" height="38" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="276" y="71.6" text-anchor="start" style="fill:var(--ink);font-size:10px">Claude Code compacts and retries (once per turn);</text>
+  <text x="276" y="85.6" text-anchor="start" style="fill:var(--ink);font-size:10px">nanocode retries with a smaller request</text>
+  <rect x="10" y="102" width="230" height="38" rx="7" style="fill:var(--bad-s);stroke:var(--bad)"/>
+  <text x="125.0" y="124.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Empty reply</text>
+  <path d="M242 121H262" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m7)"/>
+  <rect x="266" y="102" width="484" height="38" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="276" y="117.6" text-anchor="start" style="fill:var(--ink);font-size:10px">eve reissues once with a note that the previous</text>
+  <text x="276" y="131.6" text-anchor="start" style="fill:var(--ink);font-size:10px">reply was empty and was not delivered</text>
+  <rect x="10" y="148" width="230" height="38" rx="7" style="fill:var(--bad-s);stroke:var(--bad)"/>
+  <text x="125.0" y="170.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Provider tool not supported</text>
+  <path d="M242 167H262" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m7)"/>
+  <rect x="266" y="148" width="484" height="38" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="276" y="163.6" text-anchor="start" style="fill:var(--ink);font-size:10px">eve removes the tool, adds a note saying it</text>
+  <text x="276" y="177.6" text-anchor="start" style="fill:var(--ink);font-size:10px">was removed, and retries once</text>
+  <rect x="10" y="194" width="230" height="38" rx="7" style="fill:var(--bad-s);stroke:var(--bad)"/>
+  <text x="125.0" y="216.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Thinking or summary rejected</text>
+  <path d="M242 213H262" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m7)"/>
+  <rect x="266" y="194" width="484" height="38" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="276" y="209.6" text-anchor="start" style="fill:var(--ink);font-size:10px">nanocode retries with unsigned thinking stripped,</text>
+  <text x="276" y="223.6" text-anchor="start" style="fill:var(--ink);font-size:10px">or with a plainer summary</text>
+  <rect x="10" y="240" width="230" height="38" rx="7" style="fill:var(--bad-s);stroke:var(--bad)"/>
+  <text x="125.0" y="262.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Content filter blocked the reply</text>
+  <path d="M242 259H262" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m7)"/>
+  <rect x="266" y="240" width="484" height="38" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="276" y="255.6" text-anchor="start" style="fill:var(--ink);font-size:10px">fx resends up to 3 times in a row,</text>
+  <text x="276" y="269.6" text-anchor="start" style="fill:var(--ink);font-size:10px">then needs the user</text>
+</svg></div>
+<figcaption>Figure 7. Six recoveries. Each has a bound, because a recovery that can repeat forever is just a slower failure.</figcaption>
+</figure>
+
+<p>Kimi Code turns recovery into a mechanism instead of a list. A recovery is a <em>proposal</em> to rewrite the request, offered when a failure matches; the proposals applied so far are recorded, so the same recovery is not proposed twice for one request, and a recovery can be remembered and reused for later requests in the same agent. If a provider once rejected a feature, the next request is built without it from the start instead of failing first. Its design notes add the rule that keeps this honest: <em>no silent fallback</em>. Unsupported features, thinking settings, media and empty responses fail explicitly instead of quietly changing behaviour; a recovery is a recorded decision, not a hidden one.</p>
+
+<h3 id="d-fallback">Decision 6. When does a different model, or a second request, answer instead?</h3>
+<p>Two techniques use more than one request for one answer. They solve different problems and should not be confused.</p>
+<p><strong>Model fallback</strong> answers "this model is unavailable". Claude Code lets you configure a chain of fallback models; per its documentation, the chain is used when the primary is overloaded, unavailable or returns another non-retryable server error, is capped at three models, and the switch lasts for the current turn only. Qwen Code moves to the next model in its chain once retries are exhausted on a 429, 503 or 529. fx, after three consecutive failures of the same kind, tries another way, such as dropping its fast route. Kimi Code takes the opposite position by principle: no silent fallback.</p>
+<p><strong>Hedging</strong> answers "this request is slow". nanocode keeps, per model, the time to first byte of its last 100 requests. When a request has produced nothing by the 90th percentile of those times (or 1.5 seconds before there is enough data), it sends an identical second request and keeps whichever produces a byte first. Hedges are capped at 10% of requests, and the extra input tokens they cost are recorded.</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 200" width="760" style="max-width:100%;height:auto" role="img" aria-label="Hedged request timeline">
+  <defs><marker id="m8" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <text x="10" y="18" text-anchor="start" style="fill:var(--ink);font-size:11px;font-weight:600">nanocode's hedge, one request</text>
+  <rect x="10" y="34" width="300" height="26" rx="4" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="160.0" y="50.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">primary: waiting for the first byte...</text>
+  <rect x="310" y="34" width="440" height="26" rx="4" style="fill:var(--panel);stroke:var(--line);stroke-dasharray:4 3"/>
+  <text x="530.0" y="50.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">primary: answers late, cancelled</text>
+  <path d="M240 28V120" style="fill:none;stroke:var(--kv);stroke-width:2"/>
+  <text x="246" y="118" text-anchor="start" style="fill:var(--kv);font-size:10px">deadline = p90 of the last 100 first-byte times (min 1.5 s)</text>
+  <rect x="240" y="74" width="170" height="26" rx="4" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="325.0" y="90.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">hedge: duplicate request</text>
+  <rect x="410" y="74" width="200" height="26" rx="4" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="510.0" y="90.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">first byte: hedge wins</text>
+  <text x="10" y="150" text-anchor="start" style="fill:var(--ink2);font-size:10px">Cap: at most 10% of requests may be hedged. Each hedge's input tokens are counted as its own cost.</text>
+  <text x="10" y="168" text-anchor="start" style="fill:var(--ink2);font-size:10px">Outcomes recorded per request: not needed, capped, throttled, not yet estimable, or dispatched with the winner.</text>
+</svg></div>
+<figcaption>Figure 8. A hedge trades a bounded amount of extra spend for a shorter tail. It only makes sense where the slow part is the wait for the first byte.</figcaption>
+</figure>
+
+<p>The trade-offs mirror each other. Fallback changes <em>who</em> answers, so it changes behaviour and costs a full cache miss on the new model; it is worth it when the alternative is no answer. Hedging keeps the same model and the same request, so behaviour is unchanged and the cache is shared; it costs duplicated input on the hedged fraction and only helps the tail. A harness that silently does either makes its own evaluations harder to interpret, which is why every harness that does them records when they happened.</p>
+
+<h3 id="d-cache">Decision 7. How do you keep the prompt cache hot?</h3>
+<p>Caching is the single largest cost lever, and it follows from how prefill works: a server that already holds the internal state for a prefix can skip recomputing it. The match is exact from the first token, so a change anywhere recomputes everything after it. Anthropic's Claude Code documentation describes the same rule from the user's side: the API caches by matching the start of each request against content it recently processed, and a change anywhere in the prefix recomputes everything after it (<a href="https://code.claude.com/docs/en/prompt-caching">How Claude Code uses prompt caching</a>).</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 230" width="760" style="max-width:100%;height:auto" role="img" aria-label="Prefix cache: request n+1 reuses request n">
+  <defs><marker id="m9" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <text x="10" y="18" text-anchor="start" style="fill:var(--ink);font-size:11px;font-weight:600">Request n</text>
+  <rect x="10" y="26" width="160" height="30" rx="4" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="90.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">system + tools</text>
+  <rect x="170" y="26" width="120" height="30" rx="4" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="230.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">project rules</text>
+  <rect x="290" y="26" width="300" height="30" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="440.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">conversation so far</text>
+  <text x="10" y="80" text-anchor="start" style="fill:var(--ink);font-size:11px;font-weight:600">Request n+1</text>
+  <rect x="10" y="88" width="160" height="30" rx="4" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="90.0" y="106.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">system + tools</text>
+  <rect x="170" y="88" width="120" height="30" rx="4" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="230.0" y="106.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">project rules</text>
+  <rect x="290" y="88" width="300" height="30" rx="4" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="440.0" y="106.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">conversation so far</text>
+  <rect x="590" y="88" width="160" height="30" rx="4" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="670.0" y="106.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">new step</text>
+  <text x="10" y="140" text-anchor="start" style="fill:var(--ink);font-size:11px;font-weight:600">Request n+1 after a model switch, a tool change or a timestamp at the top</text>
+  <rect x="10" y="148" width="580" height="30" rx="4" style="fill:var(--bad-s);stroke:var(--bad)"/>
+  <text x="300.0" y="166.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">everything recomputed at the full input price</text>
+  <rect x="590" y="148" width="160" height="30" rx="4" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="670.0" y="166.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">new step</text>
+  <text x="10" y="204" text-anchor="start" style="fill:var(--ink2);font-size:10px">Green = read from cache at the cached rate. Order content from least to most volatile, and append changes instead of editing.</text>
+</svg></div>
+<figcaption>Figure 9. The rule every harness designs around. Chapter 4 covers what goes in each layer; this chapter covers how the layer marks, keys and warms the cache.</figcaption>
+</figure>
+
+<p>Four mechanisms appear in the harnesses.</p>
+<ul>
+  <li><strong>Markers.</strong> Anthropic-style caching needs explicit breakpoints. fx places two stable markers in each provider's syntax and models the provider's own automatic breakpoints and its limit of four markers. Qwen Code marks the last stable content item for DashScope and sends DashScope's cache-control header. Claude Code's documentation adds a lesson from gateways: if a gateway rejects the marker on its system context block, Claude Code moves the marker to the last conversation message for the rest of the session; if a gateway silently strips markers, the whole history bills as uncached on every turn.</li>
+  <li><strong>Keys and affinity.</strong> Automatic caches route by a key. Codex sends a <code>prompt_cache_key</code> with every request. eve sets the OpenAI cache key to a hash of the session ID (unique per subagent), sends a Gateway session ID so the gateway prefers the provider that served the last request, and on Anthropic models through the gateway anchors caching at the first message and sends the shared base of the system prompt as its own message, so different sessions with the same agent share that part of the cache.</li>
+  <li><strong>Lifetime.</strong> Anthropic offers a 5-minute and a 1-hour lifetime. eve's documentation does the arithmetic: a 1-hour write costs 2x the base input price against 1.25x for 5 minutes, so it pays off only when the prefix is read again after the 5-minute entry would have expired. Claude Code requests the 1-hour lifetime for the main conversation only on a subscription within plan usage, and 5 minutes otherwise.</li>
+  <li><strong>Warming.</strong> A cache entry that will expire before the next real request can be refreshed by resending the prompt with a one-token reply. fx does this for Claude models, stopping at a cap, at the next real request, on a session change or at shutdown. Pi decides with an explicit economic model, shown below. nanocode warms a prefix once and shares that warm-up across agents with the same prefix.</li>
+</ul>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 210" width="760" style="max-width:100%;height:auto" role="img" aria-label="Pi's cache-warming decision">
+  <defs><marker id="m10" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="20" width="220" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="120.0" y="41.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">chance a real request</text>
+  <text x="120.0" y="55.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">comes before expiry</text>
+  <rect x="250" y="20" width="160" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="330.0" y="41.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">× extra cost of</text>
+  <text x="330.0" y="55.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">a cache miss</text>
+  <rect x="430" y="20" width="150" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="505.0" y="41.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">− cost of the refresh</text>
+  <text x="505.0" y="55.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">(cached read + 1 token)</text>
+  <rect x="600" y="20" width="150" height="50" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="675.0" y="41.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">= expected</text>
+  <text x="675.0" y="55.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">savings</text>
+  <rect x="600" y="100" width="150" height="50" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="675.0" y="128.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">warm if ≥ $0.05</text>
+  <path d="M675 72V98" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m10)"/>
+  <text x="10" y="110" text-anchor="start" style="fill:var(--ink2);font-size:10px">Idle chance: 15% (measured from Pi's own usage;</text>
+  <text x="10" y="126" text-anchor="start" style="fill:var(--ink2);font-size:10px">per-session estimates were not better).</text>
+  <text x="10" y="150" text-anchor="start" style="fill:var(--ink2);font-size:10px">Refresh at 90% of the lifetime, keeping at least 10 s of margin.</text>
+  <text x="10" y="166" text-anchor="start" style="fill:var(--ink2);font-size:10px">Stop warming 60 min after the last real request while streaming, 30 min when idle.</text>
+  <text x="10" y="182" text-anchor="start" style="fill:var(--ink2);font-size:10px">Not replayable when the provider keys the cache on the thinking budget (budget-based thinking).</text>
+</svg></div>
+<figcaption>Figure 10. Warming is a bet, so Pi prices it. Most harnesses either never warm or always warm; Pi warms only when the expected saving clears a threshold.</figcaption>
+</figure>
+
+<p>The list of things that break a cache is longer than most people expect. Anthropic's Claude Code documentation lists switching models, changing effort level on most models, turning on fast mode (its header is part of the cache key), connecting or removing tools when they are loaded up front, compacting, accumulating many images and upgrading the harness. It also explains why its tool search keeps the cache intact: with tools deferred, the tool list from the first request stays fixed and new tools arrive as messages instead.</p>
+
+<h3 id="d-reasoning">Decision 8. How is reasoning carried from one call to the next?</h3>
+<p>Reasoning models think before they answer, and that thinking is part of the model's state for the rest of the turn. Since the model keeps nothing between calls (fact 2), the harness must send the reasoning back, and providers protect it differently: Anthropic attaches a signature to each thinking block that must be returned unchanged; OpenAI's Responses API can return reasoning encrypted, to be sent back as an opaque blob.</p>
+<ul>
+  <li><strong>Codex</strong> keeps requests stateless (it does not ask the server to remember earlier responses), so it asks for encrypted reasoning in every response and sends it back. OpenAI's write-up explains why: statelessness supports zero-data-retention customers, and the encrypted reasoning can still be decrypted server-side for them (<a href="https://openai.com/index/unrolling-the-codex-agent-loop">OpenAI</a>).</li>
+  <li><strong>Pi</strong> keeps thinking blocks for the same model and drops them when the model changes (section D1).</li>
+  <li><strong>Qwen Code</strong> needs a reasoning adapter per model family, because DeepSeek, Kimi, Gemini and Anthropic each return reasoning in a different field and expect it back differently.</li>
+  <li><strong>Effort</strong> is a request setting with cache consequences. Pi offers one scale (minimal to max) and silently ignores it for models without reasoning. eve maps one setting to each provider's native option. Claude Code's documentation lists per-model effort levels and defaults, falls back to the highest supported level at or below the one requested, and notes that changing effort mid-session invalidates the cache on most models but not on its newest ones.</li>
+</ul>
+
+<h3 id="d-account">Decision 9. How is money counted?</h3>
+<p>Providers report four token counts that matter (new input, cached input read, cached input written, output), each at a different price. A harness that only counts "input" and "output" cannot tell whether its caching works, which is the most common cost bug.</p>
+<div class="tbl"><table>
+  <tr><th>Harness</th><th>What it records</th><th>Notable choice</th></tr>
+  <tr><td>Pi</td><td>Input, output, cache read, cache write, and cost per message</td><td>Marks whether the cost is the provider's billed figure or an estimate from catalog prices</td></tr>
+  <tr><td>eve</td><td>Session totals and a window since the last approved continuation</td><td>The budget check before each model call uses new input (input minus cache reads), so cached history does not exhaust the budget</td></tr>
+  <tr><td>nanocode</td><td>Tokens, dollars and remote execution time per step</td><td>Cost attribution is a pure fold over the log, rolled up by agent, turn, task and commit; hedge input is counted separately</td></tr>
+  <tr><td>Claude Code</td><td>Cache read and creation tokens per response; a per-session cache hit ratio</td><td>Its usage view names the likely cause of the last cache miss, such as changed tool definitions</td></tr>
+  <tr><td>Trae Agent</td><td>Input and output tokens per call</td><td>Enough for a benchmark; no cache accounting</td></tr>
+</table></div>
+
+<h3 id="d-creds">Decision 10. Whose credential pays, and what happens when it expires?</h3>
+<p>Two kinds of credential exist: API keys, which are long-lived and billed per token, and subscription logins (Claude Pro and Max, ChatGPT, GitHub Copilot and others), which use OAuth tokens that expire and must be refreshed. Pi supports both, with an OAuth flow per subscription provider and a pluggable credential store. fx supports AI Gateway, ChatGPT and Grok subscriptions and any OpenAI-compatible endpoint, and models one subtle problem formally: several fx processes sharing one saved login must not each redeem the same refresh token, because providers that rotate refresh tokens accept each one once. eve can run each person's turns on that person's own credential: on a 401 it drops the token, resolves the credential again and retries once; after a second 401 it opens a sign-in or fails the turn with a reason. Claude Code runs on Anthropic's API, subscriptions, or Claude models hosted on AWS, Google Cloud and Microsoft Foundry, and can route through a gateway by changing its base URL.</p>
+<p>The design point is that a credential failure is neither a retry nor a crash. It belongs in the "needs a person" bucket of figure 5, and the layer should say exactly what the person must do.</p>
+
+<h2 id="harnesses">4. The nine model layers, harness by harness</h2>
+
+<h3 id="h-pi">Pi: a library of providers with explicit economics</h3>
+<p>Pi's model layer is a standalone library: a model catalog, an API implementation per wire format, a provider factory per vendor, OAuth for subscriptions, and a credential store. Every call produces the same stream of events and a final message that always exists, with a stop reason and cost. What stands out is how much of its judgement is written down as data: retryable and non-retryable error patterns with comments naming the incident behind each, cache-warming economics with measured constants, and explicit rules for moving a conversation between models.</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 84" width="760" style="max-width:100%;height:auto" role="img" aria-label="Pi request path">
+  <defs><marker id="m11" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="20" width="136" height="46" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="78.0" y="39.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">neutral context</text>
+  <text x="78.0" y="53.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">+ tools</text>
+  <rect x="158" y="20" width="136" height="46" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="226.0" y="39.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">provider factory</text>
+  <text x="226.0" y="53.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">+ credentials</text>
+  <path d="M148 43.0H155" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m11)"/>
+  <rect x="306" y="20" width="136" height="46" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="374.0" y="39.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">API adapter</text>
+  <text x="374.0" y="53.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">(wire format)</text>
+  <path d="M296 43.0H303" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m11)"/>
+  <rect x="454" y="20" width="136" height="46" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="522.0" y="46.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">model</text>
+  <path d="M444 43.0H451" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m11)"/>
+  <rect x="602" y="20" width="136" height="46" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="670.0" y="39.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">events + final</text>
+  <text x="670.0" y="53.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">message, cost</text>
+  <path d="M592 43.0H599" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m11)"/>
+</svg></div>
+<figcaption>Figure 11. Pi. The adapter is chosen by the model's API, not its vendor, so one adapter serves every OpenAI-compatible provider.</figcaption>
+</figure>
+
+<h3 id="h-eve">eve: the AI SDK and a gateway, with policies on top</h3>
+<p>eve does not translate formats itself: it calls models through the AI SDK, routed by default through Vercel's AI Gateway, and accepts any AI SDK model instance for direct access. Its own work is policy: composable retry votes, the recoveries for empty replies and unsupported provider tools, cache keys and anchors, per-person credentials with sign-in flows, and a usage budget checked before every call. A model can be chosen dynamically per call, for example by a small decision model reading the prompt.</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 84" width="760" style="max-width:100%;height:auto" role="img" aria-label="eve request path">
+  <defs><marker id="m12" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="20" width="136" height="46" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="78.0" y="39.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">choose model</text>
+  <text x="78.0" y="53.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">(static or per call)</text>
+  <rect x="158" y="20" width="136" height="46" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="226.0" y="39.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">resolve</text>
+  <text x="226.0" y="53.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">credential</text>
+  <path d="M148 43.0H155" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m12)"/>
+  <rect x="306" y="20" width="136" height="46" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="374.0" y="39.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">AI SDK +</text>
+  <text x="374.0" y="53.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">AI Gateway</text>
+  <path d="M296 43.0H303" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m12)"/>
+  <rect x="454" y="20" width="136" height="46" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="522.0" y="46.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">model</text>
+  <path d="M444 43.0H451" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m12)"/>
+  <rect x="602" y="20" width="136" height="46" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="670.0" y="39.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">retry votes,</text>
+  <text x="670.0" y="53.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">recover once</text>
+  <path d="M592 43.0H599" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m12)"/>
+</svg></div>
+<figcaption>Figure 12. eve. Translation is delegated; retries, recovery, caching keys and credentials are eve's.</figcaption>
+</figure>
+
+<h3 id="h-fx">fx: a transport built around deadlines and recovery</h3>
+<p>fx talks to AI Gateway, ChatGPT and Grok subscriptions, and any OpenAI-compatible Chat Completions endpoint. Its distinctive parts are the three-deadline transport (connect, first response, stall), a recovery module that is pure logic with a formal model, cache markers placed within each provider's limits, cache warming for Claude, and shared subscription logins across processes.</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 84" width="760" style="max-width:100%;height:auto" role="img" aria-label="fx request path">
+  <defs><marker id="m13" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="20" width="136" height="46" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="78.0" y="39.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">stable prompt,</text>
+  <text x="78.0" y="53.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">cache markers</text>
+  <rect x="158" y="20" width="136" height="46" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="226.0" y="39.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">deadlines: connect,</text>
+  <text x="226.0" y="53.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">first byte, stall</text>
+  <path d="M148 43.0H155" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m13)"/>
+  <rect x="306" y="20" width="136" height="46" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="374.0" y="39.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">gateway or</text>
+  <text x="374.0" y="53.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">subscription</text>
+  <path d="M296 43.0H303" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m13)"/>
+  <rect x="454" y="20" width="136" height="46" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="522.0" y="46.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">model</text>
+  <path d="M444 43.0H451" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m13)"/>
+  <rect x="602" y="20" width="136" height="46" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="670.0" y="39.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">recovery plan:</text>
+  <text x="670.0" y="53.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">wait, resend, ask</text>
+  <path d="M592 43.0H599" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m13)"/>
+</svg></div>
+<figcaption>Figure 13. fx. Failures go to a recovery module that answers with a plan; fx carries it out.</figcaption>
+</figure>
+
+<h3 id="h-nano">nanocode: three native drivers and a hedge</h3>
+<p>nanocode keeps one driver per vendor family (Claude, Codex, and an Antigravity driver for Gemini), each reproducing that vendor's prompts, tools and request shape. Shared pieces sit underneath: hedged requests, cache warm-up keyed by prefix fingerprint and shared across agents, cost folding, and several ways to pay (subscriptions, API keys, or machine payments).</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 84" width="760" style="max-width:100%;height:auto" role="img" aria-label="nanocode request path">
+  <defs><marker id="m14" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="20" width="136" height="46" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="78.0" y="39.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">native driver</text>
+  <text x="78.0" y="53.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">(per vendor)</text>
+  <rect x="158" y="20" width="136" height="46" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="226.0" y="39.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">warm-up by</text>
+  <text x="226.0" y="53.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">prefix fingerprint</text>
+  <path d="M148 43.0H155" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m14)"/>
+  <rect x="306" y="20" width="136" height="46" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="374.0" y="39.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">hedge if slow</text>
+  <text x="374.0" y="53.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">(p90, ≤10%)</text>
+  <path d="M296 43.0H303" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m14)"/>
+  <rect x="454" y="20" width="136" height="46" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="522.0" y="46.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">model</text>
+  <path d="M444 43.0H451" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m14)"/>
+  <rect x="602" y="20" width="136" height="46" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="670.0" y="46.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">cost fold</text>
+  <path d="M592 43.0H599" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m14)"/>
+</svg></div>
+<figcaption>Figure 14. nanocode. The vendor shape is kept; latency and cost machinery is shared.</figcaption>
+</figure>
+
+<h3 id="h-codex">Codex: one API, stateless, tuned</h3>
+<p>Codex speaks only the Responses API, over HTTPS or WebSocket, to OpenAI, Amazon Bedrock, Google Cloud or a local server such as Ollama or LM Studio. Every request carries the full history (no server-side conversation state), a cache key, and the encrypted reasoning returned by the previous response. Retries for the stream and the request live inside the client with fixed defaults, and a stream that sends nothing for five minutes is treated as dead.</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 84" width="760" style="max-width:100%;height:auto" role="img" aria-label="Codex request path">
+  <defs><marker id="m15" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="20" width="136" height="46" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="78.0" y="39.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">full history</text>
+  <text x="78.0" y="53.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">(stateless)</text>
+  <rect x="158" y="20" width="136" height="46" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="226.0" y="39.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">cache key +</text>
+  <text x="226.0" y="53.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">encrypted reasoning</text>
+  <path d="M148 43.0H155" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m15)"/>
+  <rect x="306" y="20" width="136" height="46" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="374.0" y="39.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Responses API</text>
+  <text x="374.0" y="53.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">(HTTPS or WS)</text>
+  <path d="M296 43.0H303" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m15)"/>
+  <rect x="454" y="20" width="136" height="46" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="522.0" y="46.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">model</text>
+  <path d="M444 43.0H451" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m15)"/>
+  <rect x="602" y="20" width="136" height="46" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="670.0" y="39.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">retries: 5 stream,</text>
+  <text x="670.0" y="53.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">4 request</text>
+  <path d="M592 43.0H599" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m15)"/>
+</svg></div>
+<figcaption>Figure 15. Codex. Statelessness keeps zero-data-retention possible; the cache key and encrypted reasoning recover what statelessness would lose.</figcaption>
+</figure>
+
+<h3 id="h-cc">Claude Code: one model family, managed caching and fallback</h3>
+<p>Claude Code's documentation describes the parts of its model layer that a user can see: model aliases and defaults per account type, per-model effort levels, a fallback chain for availability errors capped at three models and limited to the current turn, content-based fallback when a safety classifier flags a request, and a detailed account of caching: layers ordered from stable to volatile, which actions invalidate the cache, lifetimes per request type, and gateway behaviour. The source-level study adds the recovery ladder inside the loop (output escalation, one reactive compaction, streaming and model fallback).</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 84" width="760" style="max-width:100%;height:auto" role="img" aria-label="Claude Code request path">
+  <defs><marker id="m16" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="20" width="136" height="46" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="78.0" y="39.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">layered prompt</text>
+  <text x="78.0" y="53.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">(stable first)</text>
+  <rect x="158" y="20" width="136" height="46" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="226.0" y="39.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">effort, lifetime</text>
+  <text x="226.0" y="53.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">per request</text>
+  <path d="M148 43.0H155" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m16)"/>
+  <rect x="306" y="20" width="136" height="46" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="374.0" y="39.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Anthropic API or</text>
+  <text x="374.0" y="53.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">cloud platform</text>
+  <path d="M296 43.0H303" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m16)"/>
+  <rect x="454" y="20" width="136" height="46" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="522.0" y="46.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">model</text>
+  <path d="M444 43.0H451" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m16)"/>
+  <rect x="602" y="20" width="136" height="46" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="670.0" y="39.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">ladder, then</text>
+  <text x="670.0" y="53.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">fallback chain</text>
+  <path d="M592 43.0H599" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m16)"/>
+</svg></div>
+<figcaption>Figure 16. Claude Code. One model family lets the layer use every caching and effort feature fully.</figcaption>
+</figure>
+
+<h3 id="h-kimi">Kimi Code: a single-request library with explicit rules</h3>
+<p>Kimi Code's model library owns exactly one request. Its design guide lists principles and, unusually, rejected designs that must not be reintroduced. Messages are compiled to each protocol through ordered stages; providers are patches on a protocol; a request either succeeds, fails with a typed error, or aborts; recoveries are recorded proposals that can be reused; nothing falls back silently. Retries default to 10 attempts with capped exponential backoff and jitter, honouring Retry-After.</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 84" width="760" style="max-width:100%;height:auto" role="img" aria-label="Kimi Code request path">
+  <defs><marker id="m17" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="20" width="136" height="46" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="78.0" y="39.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">neutral messages</text>
+  <text x="78.0" y="53.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">+ attributes</text>
+  <rect x="158" y="20" width="136" height="46" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="226.0" y="39.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">ordered</text>
+  <text x="226.0" y="53.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">encode stages</text>
+  <path d="M148 43.0H155" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m17)"/>
+  <rect x="306" y="20" width="136" height="46" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="374.0" y="39.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">protocol +</text>
+  <text x="374.0" y="53.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">provider patch</text>
+  <path d="M296 43.0H303" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m17)"/>
+  <rect x="454" y="20" width="136" height="46" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="522.0" y="46.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">model</text>
+  <path d="M444 43.0H451" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m17)"/>
+  <rect x="602" y="20" width="136" height="46" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="670.0" y="39.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">settle: validate</text>
+  <text x="670.0" y="53.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">tool arguments</text>
+  <path d="M592 43.0H599" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m17)"/>
+</svg></div>
+<figcaption>Figure 17. Kimi Code. The pipeline order is fixed, so a provider can change one stage without touching the rest.</figcaption>
+</figure>
+
+<h3 id="h-qwen">Qwen Code: breadth across Chinese and Western models</h3>
+<p>Qwen Code has generators for Anthropic, Gemini, OpenAI chat and OpenAI Responses, OpenAI-compatible provider classes for DashScope, DeepSeek, MiniMax, ModelScope, Z.ai and Xiaomi MiMo alongside OpenRouter, Fireworks and others, reasoning adapters per family, XML tool-call recovery, a 7-attempt retry ladder and a fallback chain on 429, 503 and 529. Its provider guide states a rule worth copying: create a new provider class only for request-level differences; a provider that differs only in headers is configuration.</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 84" width="760" style="max-width:100%;height:auto" role="img" aria-label="Qwen Code request path">
+  <defs><marker id="m18" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="20" width="136" height="46" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="78.0" y="39.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">provider preset</text>
+  <text x="78.0" y="53.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">or class</text>
+  <rect x="158" y="20" width="136" height="46" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="226.0" y="39.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">reasoning adapter</text>
+  <text x="226.0" y="53.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">per family</text>
+  <path d="M148 43.0H155" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m18)"/>
+  <rect x="306" y="20" width="136" height="46" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="374.0" y="46.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">generator per API</text>
+  <path d="M296 43.0H303" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m18)"/>
+  <rect x="454" y="20" width="136" height="46" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="522.0" y="46.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">model</text>
+  <path d="M444 43.0H451" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m18)"/>
+  <rect x="602" y="20" width="136" height="46" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="670.0" y="39.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">XML recovery,</text>
+  <text x="670.0" y="53.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">retry, fallback</text>
+  <path d="M592 43.0H599" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m18)"/>
+</svg></div>
+<figcaption>Figure 18. Qwen Code. Supporting many model families moves complexity into adapters and recovery.</figcaption>
+</figure>
+
+<h3 id="h-trae">Trae Agent: the minimum</h3>
+<p>Trae Agent has a client per vendor (OpenAI, Anthropic, Azure, Doubao, Google, Ollama, OpenRouter) with one blocking call per step, input and output token counts, and a retry wrapper that sleeps a random 3 to 30 seconds after any exception. It is the right amount of model layer for a research harness and a useful baseline for what the others add.</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 84" width="760" style="max-width:100%;height:auto" role="img" aria-label="Trae Agent request path">
+  <defs><marker id="m19" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="20" width="136" height="46" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="78.0" y="46.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">messages</text>
+  <rect x="158" y="20" width="136" height="46" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="226.0" y="46.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">vendor client</text>
+  <path d="M148 43.0H155" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m19)"/>
+  <rect x="306" y="20" width="136" height="46" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="374.0" y="39.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">model</text>
+  <text x="374.0" y="53.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">(blocking)</text>
+  <path d="M296 43.0H303" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m19)"/>
+  <rect x="454" y="20" width="136" height="46" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="522.0" y="39.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">any error:</text>
+  <text x="522.0" y="53.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">sleep 3 to 30 s</text>
+  <path d="M444 43.0H451" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m19)"/>
+  <rect x="602" y="20" width="136" height="46" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="670.0" y="39.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">input, output</text>
+  <text x="670.0" y="53.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">tokens</text>
+  <path d="M592 43.0H599" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m19)"/>
+</svg></div>
+<figcaption>Figure 19. Trae Agent. No streaming, no caching marks, no classification.</figcaption>
+</figure>
+
+<h2 id="compare">5. All nine in one table</h2>
+<div class="tbl"><table>
+  <tr><th>Harness</th><th>Shape</th><th>Streaming</th><th>Failure classes</th><th>Retries</th><th>Recovery / fallback</th><th>Caching</th><th>Credentials</th></tr>
+  <tr><td>Pi</td><td>Neutral + adapters, many providers</td><td>Events; errors as final message</td><td>Text patterns; quota 429s not retried</td><td>3 from session, 2 s doubling</td><td>Truncated calls failed; thinking dropped on model change</td><td>Priced warming</td><td>API keys + OAuth subscriptions</td></tr>
+  <tr><td>eve</td><td>AI SDK + AI Gateway</td><td>AI SDK stream</td><td>Retry / recoverable / terminal</td><td>3, 0.5 s doubling + jitter</td><td>Empty reply, unsupported tool: once</td><td>Session cache keys, shared base prompt, 1 h option</td><td>Per-person credentials, sign-in on 401</td></tr>
+  <tr><td>fx</td><td>Gateway, subscriptions, OpenAI-compatible</td><td>Three deadlines</td><td>Failure kinds; never gives up</td><td>1 to 30 s table, 80 to 100% jitter</td><td>Content filter ×3; another route after 3</td><td>Two markers in a four-marker limit; Claude warming</td><td>Shared logins, rotation-safe refresh</td></tr>
+  <tr><td>nanocode</td><td>Native driver per vendor</td><td>Per driver</td><td>Per driver</td><td>Per driver</td><td>Changed-request retries; hedging</td><td>Warm-up by prefix fingerprint</td><td>Subscriptions, keys, machine payments</td></tr>
+  <tr><td>Codex</td><td>Responses API only</td><td>HTTPS or WebSocket</td><td>Client retry rules</td><td>5 stream, 4 request</td><td>In the loop (Chapter 1)</td><td>Cache key per request</td><td>ChatGPT or API key; cloud providers</td></tr>
+  <tr><td>Claude Code</td><td>One model family, several hosts</td><td>Streaming with fallback</td><td>Fallback-eligible vs never</td><td>Not described in detail</td><td>Ladder; fallback chain ≤3, per turn</td><td>Layered; lifetimes per request type</td><td>API, subscription, cloud, gateway</td></tr>
+  <tr><td>Kimi Code</td><td>Neutral, compiled pipeline</td><td>Events; validate at settle</td><td>Typed errors; deterministic never retried</td><td>10, 0.5 s doubling, cap 32 s</td><td>Recorded, reusable proposals; no silent fallback</td><td>Cache key as first stage</td><td>Endpoint credentials</td></tr>
+  <tr><td>Qwen Code</td><td>Generator per API, many providers</td><td>Stream + XML recovery</td><td>Classifier + fallback check</td><td>7, 1.5 s doubling, cap 30 s</td><td>Fallback on 429/503/529</td><td>DashScope markers and header</td><td>Per provider</td></tr>
+  <tr><td>Trae Agent</td><td>Client per vendor</td><td>None</td><td>None</td><td>Random 3 to 30 s</td><td>None</td><td>None found</td><td>API keys</td></tr>
+</table></div>
+
+<h2 id="choose">6. Choosing a model layer for what you want to build</h2>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 300" width="760" style="max-width:100%;height:auto" role="img" aria-label="Choosing a model layer">
+  <defs><marker id="m20" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="14" width="240" height="48" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="130.0" y="34.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Will you use more than</text>
+  <text x="130.0" y="48.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">one model family?</text>
+  <rect x="290" y="14" width="220" height="48" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="400.0" y="34.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">B. One wire format,</text>
+  <text x="400.0" y="48.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">use every vendor feature</text>
+  <path d="M252 38H286" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m20)"/>
+  <text x="258" y="32" text-anchor="start" style="fill:var(--ink2);font-size:10px">no</text>
+  <rect x="10" y="96" width="240" height="48" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="130.0" y="116.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Do you need each model's</text>
+  <text x="130.0" y="130.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">native behaviour exactly?</text>
+  <path d="M130 64V92" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m20)"/>
+  <text x="136" y="82" text-anchor="start" style="fill:var(--ink2);font-size:10px">yes</text>
+  <rect x="290" y="96" width="220" height="48" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="400.0" y="116.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">C. Native driver per vendor</text>
+  <text x="400.0" y="130.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">(nanocode)</text>
+  <path d="M252 120H286" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m20)"/>
+  <text x="258" y="114" text-anchor="start" style="fill:var(--ink2);font-size:10px">yes</text>
+  <rect x="540" y="96" width="210" height="48" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="645.0" y="116.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">A. Neutral format + adapters</text>
+  <text x="645.0" y="130.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">(Pi, Kimi Code)</text>
+  <path d="M130 146V164H645V148" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m20)"/>
+  <text x="380" y="160" text-anchor="start" style="fill:var(--ink2);font-size:10px">no</text>
+  <text x="10" y="194" text-anchor="start" style="fill:var(--ink);font-size:11px;font-weight:600">Then, whatever the shape:</text>
+  <rect x="10" y="204" width="364" height="38" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="192.0" y="226.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Classify: transient, recoverable, person, terminal</text>
+  <rect x="384" y="204" width="364" height="38" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="566.0" y="226.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Separate deadlines: connect, first byte, stall</text>
+  <rect x="10" y="250" width="364" height="38" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="192.0" y="272.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Count cache reads and writes; alert when the hit rate falls</text>
+  <rect x="384" y="250" width="364" height="38" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="566.0" y="272.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Make every recovery and fallback bounded and recorded</text>
+</svg></div>
+<figcaption>Figure 20. A decision path. The shape is expensive to change; the four policies below it are cheap to add and pay off immediately.</figcaption>
+</figure>
+
+<p>For this book's harness: shape A with two adapters (OpenAI-compatible and Anthropic), because it lets you compare models on your own tasks, which is the point of a learning harness. Add the four policies as you go: the build below starts with classification, retries and cache accounting; the exercises add deadlines, a recovery and a hedge.</p>
+
+<h2 id="research">7. Research and how Chinese teams approach it</h2>
+<ul>
+  <li><strong>Hedged requests</strong> come from distributed systems: Dean and Barroso's "The Tail at Scale" (2013) showed that sending a backup request after a short delay cuts tail latency for a small increase in load. nanocode applies exactly that to the first byte of a model response.</li>
+  <li><strong>Context and cost engineering.</strong> Manus's write-up on context engineering made the cache hit rate the headline metric for production agents; Claude Code's documentation and Anthropic's own post on lessons from building Claude Code say the same thing from the other side.</li>
+  <li><strong>Chinese practice.</strong> Chinese labs ship OpenAI-compatible and often Anthropic-compatible endpoints, which is why every neutral-format harness here supports them with little code: Pi lists separate China endpoints for MiniMax, Moonshot, Z.ai, Qwen and Xiaomi MiMo, and Kimi's coding subscription uses an Anthropic-compatible API. The differences that remain are in reasoning formats and limits: Qwen Code carries reasoning adapters for DeepSeek and Kimi, DashScope needs its own cache-control header, and Pi's retry rules include a Zhipu plan-limit code that looks like a throttle but resets in hours. Qwen Code's compactor also counts CJK characters as 1.5 tokens in its estimates, because character-based estimates undercount Chinese text.</li>
+</ul>
+
+<h2 id="build">8. Build: a two-provider layer</h2>
 <p>We add a <code>models.py</code> with our own message format, two adapters (OpenAI-compatible and Anthropic), streaming, retries, token counts and cost. We still use the official SDKs for transport: writing raw SSE parsers teaches little and breaks often.</p>
 <pre>pip install openai anthropic</pre>
 <pre>&quot;&quot;&quot;One interface over two wire formats: OpenAI-compatible chat and Anthropic Messages.&quot;&quot;&quot;
@@ -283,30 +1002,40 @@ def make(spec: str):
   <li>Put the current time into the system prompt and rerun one task. Watch the cached share fall. Remove it.</li>
 </ol>
 
-<h2 id="exercises">7. Exercises</h2>
+
+<h2 id="exercises">9. Exercises</h2>
 <ol>
-  <li>Add a hedge: if no first token arrives within the 90th percentile of your last 50 calls (minimum 1.5 s), start a second request and keep the first to answer. Cap hedges at 10% of calls, as nanocode does.</li>
-  <li>Switch provider mid-session: run three steps on one model, convert the history, and continue on the other. What did you lose?</li>
-  <li>Read one prompt in <code>nanocode/crates/backends/codex/client/prompts/</code> and list three instructions you would not have thought to write.</li>
+  <li><strong>Classify.</strong> Write a function that sorts an exception into transient, recoverable, needs-a-person or terminal. Feed it a 429 with a quota message, a 429 with a rate-limit message, a 529, a 400 and a 401, and check each lands where figure 5 says.</li>
+  <li><strong>Three deadlines.</strong> Replace your single timeout with separate limits for connecting, the first byte and silence mid-stream. Simulate a model that thinks for 40 seconds before answering and one that stops sending halfway. Which does each design catch?</li>
+  <li><strong>A hedge.</strong> If no first token arrives within the 90th percentile of your last 50 calls (minimum 1.5 s), start a second identical request and keep the first to answer. Cap hedges at 10% of calls and count the extra input tokens. Measure the tail before and after.</li>
+  <li><strong>Cache forensics.</strong> Print the cached share of input per step. Put the current time into the system prompt and watch it fall; move it to the end of the last message and watch it recover.</li>
+  <li><strong>Switch models.</strong> Run three steps on one model, then continue on the other. Drop the first model's thinking blocks as Pi does. What does the second model still know, and what has it lost?</li>
 </ol>
 
-<h2 id="quiz">8. Check yourself</h2>
+<h2 id="quiz">10. Check yourself</h2>
 <div class="widget quiz" data-quiz="qz2"></div>
 <script type="application/json" id="qz2">[
-{"q":"Why does nanocode keep one driver per vendor instead of one neutral API?","o":["Rust requires it","Models are post-trained inside their vendor's harness, so native prompts and tools work best","Neutral APIs are slower","To support WASM"],"a":1,"e":"Native prompts and tool formats match what the model saw in training. The cost is maintaining several drivers."},
-{"q":"In a streamed OpenAI-compatible response, tool-call arguments:","o":["Arrive complete in the first chunk","Arrive as string fragments that must be joined by index","Are never streamed","Arrive as parsed objects"],"a":1,"e":"Join fragments per tool-call index, then parse the JSON once the stream ends."},
-{"q":"Which errors should a harness retry?","o":["All errors","Transient ones such as 429, 503, 529 and dropped connections","Only 400","None; let the model handle it"],"a":1,"e":"Retry transient failures with backoff. A 400 means the request is wrong; retrying it wastes money."},
-{"q":"What does nanocode's default hedge policy do?","o":["Retries every request twice","Sends a second request when the first byte is slower than the recent 90th percentile (minimum 1.5 s), capped at 10% of requests","Switches provider on error","Caches responses"],"a":1,"e":"Hedging cuts tail latency at a bounded extra cost."},
-{"q":"Why does a timestamp at the top of the system prompt raise cost?","o":["It adds many tokens","It changes the prefix every call, so prompt caching never hits","Providers charge for dates","It slows streaming"],"a":1,"e":"Caching needs an exact prefix match; anything that changes early in the prompt invalidates everything after it."}
+{"q":"Why does Pi refuse to retry some 429 responses?","o":["429 is never retryable","Some 429s mean a subscription or plan quota that resets in hours, so retrying in seconds only wastes calls","Retries are handled by the provider","Pi has no retries"],"a":1,"e":"Pi lists quota messages, including ChatGPT subscription limits, insufficient_quota and a Zhipu plan code, as non-retryable."},
+{"q":"How do eve's retry policies combine?","o":["The first policy decides","Each policy votes; the most restrictive vote wins and the longest delay wins","They are averaged","The last policy decides"],"a":1,"e":"Adding a policy can only make retrying stricter or slower, never looser."},
+{"q":"Why does fx use three separate deadlines instead of one timeout?","o":["To save memory","A model can think for a long time before its first byte, so one timeout either kills healthy replies or waits forever on a dead stream","Providers require it","To support WebSocket"],"a":1,"e":"Connect, first response and mid-stream silence fail for different reasons and need different bounds."},
+{"q":"What is the difference between model fallback and hedging?","o":["None","Fallback changes which model answers when one is unavailable; hedging sends a duplicate to the same model when the first byte is slow","Hedging changes the model","Fallback is cheaper"],"a":1,"e":"Fallback changes behaviour and costs a cache miss; hedging keeps behaviour and costs duplicated input."},
+{"q":"When does Claude Code's fallback chain switch models, per its documentation?","o":["On any error","On overload, unavailability or other non-retryable server errors, never on authentication, billing, rate-limit, request-size or transport errors","Only on rate limits","Never"],"a":1,"e":"The chain is capped at three models and the switch lasts for the current turn."},
+{"q":"Why does Pi drop thinking blocks when a conversation moves to another model?","o":["They are too long","Signatures and encrypted reasoning only work with the model that produced them, and plain-text thinking would look like part of the reply","Providers forbid storing them","To save cost"],"a":1,"e":"Text and tool calls are kept; reasoning is not portable."},
+{"q":"According to eve's documentation, when does a 1-hour Anthropic cache pay off?","o":["Always","Only when the prefix is read again after the 5-minute entry would have expired, since a 1-hour write costs 2x the base input price against 1.25x","Never","Only for small prompts"],"a":1,"e":"The longer lifetime costs more to write, so it only helps when there are long gaps."},
+{"q":"What principle does Kimi Code's model library state about unsupported features?","o":["Fall back silently to something similar","No silent fallback: fail explicitly rather than quietly change behaviour","Retry forever","Ask the model"],"a":1,"e":"Recoveries exist, but each is a recorded decision, not a hidden one."}
 ]</script>
 
-<h2 id="refs">9. References</h2>
+<h2 id="refs">11. References</h2>
 <ul>
-  <li>Pi: <code>packages/ai/src/types.ts</code>, <code>providers/</code>, <code>models.generated.ts</code> (<a href="https://github.com/earendil-works/pi">earendil-works/pi</a>).</li>
-  <li>nanocode: <code>crates/backends/</code>, <code>crates/core/hedge/src/lib.rs</code>, <code>crates/README.md</code> (<a href="https://github.com/gakonst/nanocode">gakonst/nanocode</a>).</li>
-  <li>eve: <code>packages/eve/src/harness/model-call/retry.ts</code>, <code>prompt-cache.ts</code> (<a href="https://github.com/vercel/eve">vercel/eve</a>).</li>
-  <li>fx: <code>src/gateway/client.zig</code> (<a href="https://github.com/vercel-labs/fx">vercel-labs/fx</a>).</li>
+  <li>Pi model library, Earendil Works: <a href="https://github.com/earendil-works/pi">github.com/earendil-works/pi</a> (read at fb248c7).</li>
+  <li>eve, Vercel: <a href="https://github.com/vercel/eve">github.com/vercel/eve</a> (read at 5c52fbf), including its agent configuration documentation on models, caching and credentials.</li>
+  <li>fx, Vercel Labs: <a href="https://github.com/vercel-labs/fx">github.com/vercel-labs/fx</a> (read at cbe7daf), including its recovery and provider TLA+ models.</li>
+  <li>nanocode: <a href="https://github.com/gakonst/nanocode">github.com/gakonst/nanocode</a> (read at 015cbfa).</li>
+  <li>Codex CLI, OpenAI: <a href="https://github.com/openai/codex">github.com/openai/codex</a> (read at 50aeac2); <a href="https://openai.com/index/unrolling-the-codex-agent-loop">Unrolling the Codex agent loop</a>, OpenAI, Jan 2026.</li>
+  <li>Claude Code: <a href="https://code.claude.com/docs/en/model-config">Model configuration</a> and <a href="https://code.claude.com/docs/en/prompt-caching">How Claude Code uses prompt caching</a>, Anthropic documentation, checked 24 Nov 2026; <a href="https://arxiv.org/abs/2604.14228">Dive into Claude Code</a>, 2026.</li>
+  <li>Kimi Code CLI, Moonshot AI: <a href="https://github.com/MoonshotAI/kimi-code">github.com/MoonshotAI/kimi-code</a> (read at 111aae2), including its model library design guide.</li>
+  <li>Qwen Code, Alibaba Qwen team: <a href="https://github.com/QwenLM/qwen-code">github.com/QwenLM/qwen-code</a> (read at c56424fc).</li>
+  <li>Trae Agent, ByteDance: <a href="https://github.com/bytedance/trae-agent">github.com/bytedance/trae-agent</a> (read at e839e55).</li>
   <li><a href="https://manus.im/blog/Context-Engineering-for-AI-Agents-Lessons-from-Building-Manus">Context Engineering for AI Agents: Lessons from Building Manus</a>, Jul 2025.</li>
-  <li><a href="https://code.visualstudio.com/blogs/2026/05/15/agent-harnesses-github-copilot-vscode">The Coding Harness Behind GitHub Copilot in VS Code</a>, May 2026.</li>
-  <li><a href="https://www.mariozechner.at/posts/2025-11-30-pi-coding-agent/">Building Pi</a> (cross-provider context handoff), Mario Zechner, Nov 2025.</li>
+  <li>Dean and Barroso, The Tail at Scale, Communications of the ACM, 2013.</li>
 </ul>
