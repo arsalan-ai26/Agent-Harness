@@ -15,103 +15,631 @@
 <main><article>
 <div class="kicker">Stage 2 · Context · Chapter 4</div>
 <h1>Instructions and context assembly</h1>
-<p class="lede">The model knows nothing about your project, your rules or today's date unless it is in the request (fact 2), and every request is paid for again (fact 4). So before the model acts, the harness decides what it sees: a system prompt, project instructions, environment facts and the names of available skills. This chapter compares how fx, Pi, eve and nanocode assemble that context, and shows the one rule all of them respect: never change the prefix mid-session. You build a context assembler that keeps the prefix stable and appends every change at the end.</p>
+<p class="lede">The model keeps nothing between calls (fact 2), so every request must carry everything the model should know: who it is, what tools it has, the project's rules, where it is running, and what has happened so far. Every token of that is paid for on every step unless it is an identical prefix (fact 4), and quality drops as the input grows (fact 3). Context assembly is the job of deciding what goes into the request, in what order, under which role, and how changes get in without breaking the cache. This chapter derives the layout, walks through eight design decisions, shows how nine harnesses assemble their requests, and keeps the cache-stable assembler you build.</p>
 <div class="meta">
   <span class="chip">Level: intermediate</span>
-  <span class="chip">Time: about 20 hours with the build</span>
-  <span class="chip">Needs: Stage 1</span>
-  <span class="chip">Code read at: Pi fb248c7, eve 5c52fbf, fx cbe7daf, nanocode 015cbfa</span>
+  <span class="chip">Time: about 12 hours with the build</span>
+  <span class="chip">Needs: Chapters 1 to 3</span>
+  <span class="chip">Harnesses read: Pi, eve, fx, nanocode, Codex, Claude Code, Kimi Code, Qwen Code, Trae Agent</span>
 </div>
 
 <div class="box skip">
   <span class="lbl">Before you start: skip check</span>
   <ol>
-    <li>The agent changes git branch mid-session. Where should the harness tell the model?</li>
-    <li>A repo has AGENTS.md at the root and another in <code>packages/api/</code>. When should the second one load?</li>
-    <li>What is the "zero tolerance" rule for AGENTS.md?</li>
+    <li>The user edits AGENTS.md halfway through a session. Why does Codex append the new text with a notice instead of replacing the old text where it sits?</li>
+    <li>Claude Code delivers CLAUDE.md as a user message after the system prompt, not inside the system prompt. Name one benefit and one cost.</li>
+    <li>A model answered "no task received" even though the task was in its input. What had the harness done wrong, and how did Qwen Code fix it?</li>
+    <li>Why do fx and Kimi Code wait until the agent touches a folder before telling it about that folder's rules?</li>
   </ol>
   <details><summary>Answers</summary><ol>
-    <li>Append a small update block to the end of the latest message (user message or tool result). Rewriting the system prompt would break the prompt cache.</li>
-    <li>Either at start if the session begins inside that folder, or the first time a tool touches that folder (fx attaches it to that tool result).</li>
-    <li>Every line must trace back to a real agent failure; if you cannot name the failure, delete the line.</li>
+    <li>Replacing text early in the request changes the prefix, so the provider recomputes everything after it on the next step. Appending keeps the cached prefix valid; the notice ("these instructions replace all previously provided AGENTS.md instructions") tells the model which version wins.</li>
+    <li>Benefit: it can be appended and reloaded without touching the system prompt, and it cannot pose as the harness's own rules. Cost: user-role text carries less authority than system text, so it guides rather than binds; the documentation points to hooks for anything that must be enforced.</li>
+    <li>It placed reminders, hook output and memory after the user's own text, so the real task sat in the middle of a long message. Qwen Code moves injected context ahead of the user's text so the instruction is the last thing the model reads.</li>
+    <li>Loading every folder's rules at the start costs tokens on every step for rules that may never apply. Delivering them when the agent first reaches the folder costs tokens only when they matter, and puts them at the end of the context, where they are noticed.</li>
   </ol></details>
 </div>
 
-<h2 id="layers">1. The layers of context</h2>
-<p>Derive the layout instead of memorizing it. Two facts pull in opposite directions. Fact 2 says the model must be told everything it needs on every call, so the request is large and mostly repeated. Fact 4 says repeated input is cheap only if it is an identical prefix: the provider caches the computation for the first N tokens and can reuse it only if those N tokens match exactly. A change at token 500 forces recomputing everything after token 500.</p>
-<p>The resolution is to sort content by how often it changes. What never changes in a session (core instructions, tool schemas) goes first. What changes once per session (project rules, environment facts) goes next. What changes every step goes last. Then each step adds new tokens only at the end and pays full price only for those. There is a second reason the tail is the right place for news: models attend most reliably to the start and the end of their input, so a fresh update at the end is both cheap and noticed.</p>
-<p>So a request is a stack. The top changes rarely, the bottom changes every step. Put things in the right layer and caching works for free. The rule "never edit the prefix mid-session; append the change instead" is not a style choice; it falls straight out of how the cache works.</p>
+
+<h2 id="what">1. What the model is actually told</h2>
+<p>Start from what a request is. It is one long sequence of tokens sent to the provider. The provider does not know which part is "the system prompt" and which is "history" except by role markers. The model reads all of it every time. Three forces shape how a harness lays it out:</p>
+
 <figure>
-<div class="svgwrap"><svg viewBox="0 0 760 300" width="760" style="max-width:100%;height:auto" role="img" aria-label="Context layers from stable prefix to changing tail">
-  <rect x="24" y="16" width="520" height="40" rx="6" style="fill:var(--kv-s);stroke:var(--kv)"/><text x="36" y="41" style="fill:var(--ink);font-size:12px">1. Base system prompt: who the agent is, how it works</text>
-  <rect x="24" y="62" width="520" height="40" rx="6" style="fill:var(--kv-s);stroke:var(--kv)"/><text x="36" y="87" style="fill:var(--ink);font-size:12px">2. Tool definitions (and skill names and descriptions)</text>
-  <rect x="24" y="108" width="520" height="40" rx="6" style="fill:var(--kv-s);stroke:var(--kv)"/><text x="36" y="133" style="fill:var(--ink);font-size:12px">3. Project instructions: AGENTS.md, global, then root to cwd</text>
-  <rect x="24" y="154" width="520" height="40" rx="6" style="fill:var(--kv-s);stroke:var(--kv)"/><text x="36" y="179" style="fill:var(--ink);font-size:12px">4. Environment at session start: cwd, OS, shell, git branch</text>
-  <rect x="24" y="200" width="520" height="40" rx="6" style="fill:var(--panel2);stroke:var(--line)"/><text x="36" y="225" style="fill:var(--ink);font-size:12px">5. Conversation: messages, tool calls, tool results (append only)</text>
-  <rect x="24" y="246" width="520" height="40" rx="6" style="fill:var(--dec-s);stroke:var(--dec)"/><text x="36" y="271" style="fill:var(--ink);font-size:12px">6. Tail: context updates, folder rules, reminders</text>
-  <path d="M570 20V280" style="stroke:var(--ink2);stroke-width:1.4" marker-end="url(#d1)"/>
-  <defs><marker id="d1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
-  <text x="584" y="40" style="fill:var(--kv);font-size:12px;font-weight:600">cached prefix</text>
-  <text x="584" y="58" style="fill:var(--ink2);font-size:11px">never edited</text>
-  <text x="584" y="58" style="fill:var(--ink2);font-size:11px"></text>
-  <text x="584" y="230" style="fill:var(--ink2);font-size:11px">grows each step</text>
-  <text x="584" y="270" style="fill:var(--dec);font-size:12px;font-weight:600">changes go here</text>
+<div class="svgwrap"><svg viewBox="0 0 760 196" width="760" style="max-width:100%;height:auto" role="img" aria-label="Three forces on the request">
+  <defs><marker id="m1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <text x="10" y="18" text-anchor="start" style="fill:var(--ink);font-size:12px;font-weight:600">Completeness</text>
+  <text x="10" y="34" text-anchor="start" style="fill:var(--ink2);font-size:10px">fact 2</text>
+  <rect x="10" y="44" width="238" height="96" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="129.0" y="81.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">the model knows only what</text>
+  <text x="129.0" y="95.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">is in this request: rules,</text>
+  <text x="129.0" y="109.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">tools, place, history</text>
+  <rect x="10" y="152" width="238" height="34" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="129.0" y="172.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">pushes the request to grow</text>
+  <text x="260" y="18" text-anchor="start" style="fill:var(--ink);font-size:12px;font-weight:600">Cost and cache</text>
+  <text x="260" y="34" text-anchor="start" style="fill:var(--ink2);font-size:10px">fact 4</text>
+  <rect x="260" y="44" width="238" height="96" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="379.0" y="81.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">only an identical prefix is</text>
+  <text x="379.0" y="95.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">cheap; one changed token</text>
+  <text x="379.0" y="109.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">re-prices everything after it</text>
+  <rect x="260" y="152" width="238" height="34" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="379.0" y="172.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">pushes stable content first</text>
+  <text x="510" y="18" text-anchor="start" style="fill:var(--ink);font-size:12px;font-weight:600">Attention</text>
+  <text x="510" y="34" text-anchor="start" style="fill:var(--ink2);font-size:10px">fact 3</text>
+  <rect x="510" y="44" width="238" height="96" rx="7" style="fill:var(--bad-s);stroke:var(--bad)"/>
+  <text x="629.0" y="81.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">quality drops with length;</text>
+  <text x="629.0" y="95.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">start and end are read</text>
+  <text x="629.0" y="109.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">most reliably</text>
+  <rect x="510" y="152" width="238" height="34" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="629.0" y="172.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">pushes news to the end</text>
 </svg></div>
-<figcaption>Layers 1 to 4 form the cached prefix, built once per session. Changes are appended at the tail, where the model also pays the most attention.</figcaption>
+<figcaption>Figure 1. Completeness wants more in the request; cost wants it stable; attention wants it short, with what matters at the edges.</figcaption>
 </figure>
 
-<h2 id="tour">2. Code tour</h2>
-<h3>fx: an operating manual plus appended updates</h3>
-<p><code>src/builtins/system_prompt.md</code> is about 1,000 words in sections: identity and context, workspace behaviour, source routing, interaction, safety. It tells the model to inspect before answering, to load named skills completely, to tell the user what failed before retrying, and to send one short update before the first tool call.</p>
-<p>Two mechanisms keep it cache-stable. First, when cwd, git state or permission mode change, fx appends an <code>&lt;fx-context-update&gt;</code> block to the end of the message where it noticed the change; the prompt says its values replace the runtime context, and fx escapes the tag in tool output so a file cannot forge one. Second, <code>src/builtins/context.zig</code> notes that folder rules are not added to the session-start instructions when a later tool call reaches a new folder; they ride on that step's last tool result instead. A later turn that reaches the folder again gets a short reminder line, because "without it some models stop applying them after the turn they arrived in." fx also has per-model prompt overlays (<code>modelPromptOverlay</code>).</p>
-<h3>Pi: short prompt, ancestor files</h3>
-<p><code>packages/coding-agent/src/core/system-prompt.ts</code> builds a short prompt from tool snippets and guidelines; users can replace it entirely. <code>resource-loader.ts</code> looks in each directory for <code>AGENTS.override.md</code>, <code>AGENTS.md</code>, <code>AGENTS.MD</code>, <code>CLAUDE.md</code>, <code>CLAUDE.MD</code> and takes the first match, so Pi reads Claude Code projects unchanged. It also handles git worktrees: a nested worktree's own AGENTS.md shadows the main repo's copy so the same rules are not loaded twice.</p>
-<h3>nanocode: deduplicated, size-capped sources</h3>
-<p><code>crates/core/home/src/instructions.rs</code> loads <code>AGENTS.override.md</code> before <code>AGENTS.md</code> at each scope, caps each file at <code>MAX_INSTRUCTION_FILE_BYTES</code>, and skips a file whose content is identical to one already loaded with the diagnostic "included once". The pinned vendor prompts (Chapter 2) stay byte-identical across rounds and reloads; <code>docs/memory-invariant.md</code> lists prefix stability as an invariant.</p>
-<h3>eve: markdown plus code-computed instructions</h3>
-<p>eve's <code>agent/instructions.md</code> is the always-on prompt. Dynamic instructions (<code>defineDynamic</code>) are TypeScript functions that return text per session and can be memoized, for example to load a replaced session's transcript. After a redeploy, system-role instructions update on the next turn, while a changed user-role instruction joins the history again and an unchanged one is not re-added. That is cache-aware by design.</p>
+<p>Sort the content by how often it changes and the layout falls out. What never changes in a session goes first, what changes once per session next, what changes every step last. Changes arrive at the end, which is both the cheapest place (only new tokens are paid in full) and the place the model attends to most.</p>
 
-<h3>Codex: AGENTS.md with a byte budget</h3>
-<p><code>codex-rs/core/src/agents_md.rs</code> walks from the project root to the working directory and loads <code>AGENTS.override.md</code> if present, else <code>AGENTS.md</code>, plus any names in <code>project_doc_fallback_filenames</code>. Files are joined with a <code>--- project-doc ---</code> separator and cut at <code>project_doc_max_bytes</code>, 32 KiB by default; if the budget runs out, the model is told to trim its project instructions. Nothing is loaded for an untrusted project. Environment facts (working directory, shell, sandbox, date) are not baked into the prefix. They are recorded as context items, and <code>record_step_world_state_if_changed()</code> appends a new one only when something actually changed, exactly the append-at-the-tail rule this chapter derives from the cache.</p>
-<h3>Claude Code: four levels, delivered as user context</h3>
-<p>The paper describes a four-level <code>CLAUDE.md</code> hierarchy: managed (<code>/etc/</code>), user (<code>~/.claude/</code>), project (<code>CLAUDE.md</code> and <code>.claude/rules/</code>) and local (<code>CLAUDE.local.md</code>, git-ignored), assembled with other sources in a fixed order of nine. One detail matters for first principles: CLAUDE.md enters as <em>user</em> context, not as part of the system prompt. Instructions there guide the model, but the paper stresses that permission checks and sandboxes, not instructions, are what enforce limits (fact 5: a rule the model reads is a suggestion).</p>
-<h3>Kimi Code: a reminder when the agent walks into a new folder</h3>
-<p>Kimi Code loads <code>AGENTS.md</code> or <code>agents.md</code> from the working directory and <code>.kimi-code/AGENTS.md</code> from its home (<code>agent/profile/context.ts</code>). The interesting part is <code>agent/agentsMdReminder/</code>: <code>bashTargets.ts</code> works out which directories a shell command touches, and when the agent enters a directory with an AGENTS.md it has not seen, a reminder pointing to that file is appended to the context. It is the same answer as fx's folder rules: the agent cannot know about a rule in a folder it has not looked at, so the harness tells it at the moment it matters, at the tail.</p>
-<h3>Qwen Code: QWEN.md and an explicit context order</h3>
-<p>Qwen Code inherited Gemini CLI's hierarchical context files, named <code>QWEN.md</code> by default and configurable (for example to <code>AGENTS.md</code>), discovered from the home directory and the project tree in <code>memory/memoryDiscovery.ts</code>. <code>core/prompt-context-order.ts</code> fixes the order in which system prompt, context files, environment and reminders are placed, and has its own tests, because changing that order silently breaks caching.</p>
-<h3>Trae Agent: one prompt, the task and the path</h3>
-<p>Trae Agent has a single system prompt in <code>trae_agent/prompt/agent_prompt.py</code> and adds the task and project path to the first user message. No project rule files are loaded. For a research harness that is a feature: every run sees the same instructions.</p>
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 270" width="760" style="max-width:100%;height:auto" role="img" aria-label="The request as a stack">
+  <defs><marker id="m2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <text x="10" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">start of request</text>
+  <rect x="10" y="26" width="430" height="30" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="225.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Base instructions: identity, working style, safety</text>
+  <text x="454" y="45" text-anchor="start" style="fill:var(--ink2);font-size:10px">set per harness and model</text>
+  <rect x="10" y="62" width="430" height="30" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="225.0" y="80.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Tool definitions (and skill names)</text>
+  <text x="454" y="81" text-anchor="start" style="fill:var(--ink2);font-size:10px">fixed for the session (Ch. 3)</text>
+  <rect x="10" y="98" width="430" height="30" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="225.0" y="116.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Project instructions: AGENTS.md, CLAUDE.md, QWEN.md</text>
+  <text x="454" y="117" text-anchor="start" style="fill:var(--ink2);font-size:10px">once per session</text>
+  <rect x="10" y="134" width="430" height="30" rx="7" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="225.0" y="152.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Environment: working directory, OS, shell, date</text>
+  <text x="454" y="153" text-anchor="start" style="fill:var(--ink2);font-size:10px">once, then only diffs</text>
+  <rect x="10" y="170" width="430" height="30" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="225.0" y="188.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Conversation: messages, calls, results</text>
+  <text x="454" y="189" text-anchor="start" style="fill:var(--ink2);font-size:10px">grows every step</text>
+  <rect x="10" y="206" width="430" height="30" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="225.0" y="224.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Tail: updates, reminders, folder rules, the user's text</text>
+  <text x="454" y="225" text-anchor="start" style="fill:var(--ink2);font-size:10px">new every step</text>
+  <text x="10" y="262" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">end of request</text>
+</svg></div>
+<figcaption>Figure 2. Rows 1 to 4 form the cached prefix. Everything after the first change is paid at full price, so changes are appended at the tail, never written into the rows above.</figcaption>
+</figure>
 
-<h2 id="decisions">3. Design decisions compared</h2>
+<h2 id="decisions">2. The decisions, one at a time</h2>
+<h3 id="d-base">Decision 1. How long is the base prompt?</h3>
+<p>The base prompt is the harness's own voice: who the agent is, how it should work, what it must never do. Its length is a bet about the model. A model trained inside this harness already knows how to behave and needs few words; a general model, or a model the harness did not train, needs the rules spelled out.</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 200" width="760" style="max-width:100%;height:auto" role="img" aria-label="Codex base prompt length by model">
+  <defs><marker id="m3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <text x="10" y="31" text-anchor="start" style="fill:var(--ink);font-size:10px">gpt-5 codex</text>
+  <rect x="150" y="14" width="140.66" height="24" rx="3" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="220.32999999999998" y="29.6" text-anchor="middle" style="fill:var(--ink);font-size:10px"></text>
+  <text x="296.65999999999997" y="31" text-anchor="start" style="fill:var(--ink2);font-size:10px">1,082 words</text>
+  <text x="10" y="63" text-anchor="start" style="fill:var(--ink);font-size:10px">gpt-5.1 codex max</text>
+  <rect x="150" y="46" width="157.95000000000002" height="24" rx="3" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="228.97500000000002" y="61.6" text-anchor="middle" style="fill:var(--ink);font-size:10px"></text>
+  <text x="313.95000000000005" y="63" text-anchor="start" style="fill:var(--ink2);font-size:10px">1,215 words</text>
+  <text x="10" y="95" text-anchor="start" style="fill:var(--ink);font-size:10px">gpt-5.2 codex</text>
+  <rect x="150" y="78" width="157.95000000000002" height="24" rx="3" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="228.97500000000002" y="93.6" text-anchor="middle" style="fill:var(--ink);font-size:10px"></text>
+  <text x="313.95000000000005" y="95" text-anchor="start" style="fill:var(--ink2);font-size:10px">1,215 words</text>
+  <text x="10" y="127" text-anchor="start" style="fill:var(--ink);font-size:10px">gpt-5.2</text>
+  <rect x="150" y="110" width="455.0" height="24" rx="3" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="377.5" y="125.6" text-anchor="middle" style="fill:var(--ink);font-size:10px"></text>
+  <text x="611.0" y="127" text-anchor="start" style="fill:var(--ink2);font-size:10px">3,500 words</text>
+  <text x="10" y="159" text-anchor="start" style="fill:var(--ink);font-size:10px">gpt-5.1</text>
+  <rect x="150" y="142" width="509.86" height="24" rx="3" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="404.93" y="157.6" text-anchor="middle" style="fill:var(--ink);font-size:10px"></text>
+  <text x="665.86" y="159" text-anchor="start" style="fill:var(--ink2);font-size:10px">3,922 words</text>
+  <text x="10" y="186" text-anchor="start" style="fill:var(--ink2);font-size:10px">Teal: models trained for Codex. Indigo: general models. Same harness, same tools, three times the words.</text>
+</svg></div>
+<figcaption>Figure 3. Codex ships one base prompt per model family. Models tuned for Codex get about 1,100 to 1,200 words; general GPT-5 models get 3,500 to 3,900.</figcaption>
+</figure>
+
+<p>The other harnesses spread across the same range. Pi's default preamble is one sentence ("You are a coding assistant running inside pi..."), followed by generated lists of the active tools and a few rules (be concise, show file paths), and the user can replace it entirely. fx's is an operating manual of about 1,000 words in sections (identity, workspace behaviour, where to look for answers, how to talk to the user, safety), with per-model overlays. nanocode pins each vendor's own prompt byte for byte, so a model sees exactly the text it was trained with (Chapter 2). Trae Agent has one fixed prompt for every run, which keeps experiments comparable.</p>
 <div class="tbl"><table>
-  <tr><th>Decision</th><th>fx</th><th>Pi</th><th>nanocode</th><th>eve</th></tr>
-  <tr><td>Base prompt</td><td>~1,000 words, sectioned</td><td>Short, replaceable</td><td>Pinned upstream vendor prompts</td><td>Authored <code>instructions.md</code></td></tr>
-  <tr><td>Project files</td><td>Instruction files, folder rules on first touch</td><td>AGENTS or CLAUDE files, root to cwd, worktree-aware</td><td>AGENTS.override then AGENTS, dedup, size cap</td><td>Directory is the contract</td></tr>
-  <tr><td>Mid-session changes</td><td>Appended <code>fx-context-update</code></td><td>No hidden injection</td><td>Prefix-stable rebuilds</td><td>Next turn, cache-aware</td></tr>
-  <tr><td>Per-model text</td><td>Prompt overlays</td><td>Same prompt</td><td>Different prompt per model</td><td>Model profiles</td></tr>
+  <tr><th></th><th>Short prompt (Pi)</th><th>Operating manual (fx, Codex general models)</th><th>Pinned vendor prompt (nanocode)</th></tr>
+  <tr><td>Pro</td><td>Cheap, transparent, easy to replace</td><td>Consistent behaviour across models; encodes lessons</td><td>Matches training, so models behave as intended</td></tr>
+  <tr><td>Con</td><td>Unfamiliar models drift; every lesson must live in project files</td><td>Thousands of tokens per request; rules the user cannot see</td><td>Must be updated when vendors change their prompts</td></tr>
 </table></div>
-<p>The same decisions in the five reference harnesses:</p>
-<div class="tbl"><table>
-  <tr><th>Decision</th><th>Codex</th><th>Claude Code</th><th>Kimi Code</th><th>Qwen Code</th><th>Trae Agent</th></tr>
-<tr><td>Project rules</td><td>AGENTS.override.md, AGENTS.md, fallbacks; 32 KiB cap</td><td>Four-level CLAUDE.md hierarchy</td><td>AGENTS.md plus home <code>.kimi-code/AGENTS.md</code></td><td>Hierarchical QWEN.md (configurable)</td><td>None</td></tr>
-<tr><td>Where they go</td><td>Developer and user context items</td><td>User context</td><td>Prefix, plus reminders at the tail</td><td>Ordered context sections</td><td>n/a</td></tr>
-<tr><td>Rules found later</td><td>Managed by <code>agents_md_manager.rs</code></td><td>Rules directory per project</td><td>Reminder when the agent enters a folder</td><td>Discovery on load</td><td>n/a</td></tr>
-<tr><td>Environment facts</td><td>World state appended only when changed</td><td>One of nine ordered sources</td><td>Environment binding events</td><td><code>environmentContext.ts</code></td><td>Project path in the task</td></tr>
-</table></div>
-<div class="grid2">
-  <div class="box ex"><span class="lbl">Short prompt (Pi)</span><p><strong>Pro:</strong> cheap, transparent, trusts RL-trained models. <strong>Con:</strong> weaker or unfamiliar models drift; every lesson must live in AGENTS.md.</p></div>
-  <div class="box ex"><span class="lbl">Operating manual (fx, Claude Code)</span><p><strong>Pro:</strong> consistent behaviour across models, encodes hard-won lessons. <strong>Con:</strong> thousands of tokens per request and rules the user cannot see.</p></div>
-</div>
 
-<h2 id="research">4. Research and the Chinese view</h2>
+<h3 id="d-files">Decision 2. Which project files, found how?</h3>
+<p>Project instructions are the user's voice: build commands, conventions, things the agent got wrong before. Every harness but Trae Agent reads them from markdown files in the repository. The questions are which names, which directories, and what happens when several apply.</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 270" width="760" style="max-width:100%;height:auto" role="img" aria-label="Directory walk for instruction files">
+  <defs><marker id="m4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="16" width="160" height="36" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="90.0" y="30.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">~ (home)</text>
+  <text x="90.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">user scope</text>
+  <rect x="10" y="66" width="160" height="36" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="90.0" y="80.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">/repo</text>
+  <text x="90.0" y="94.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">project root</text>
+  <path d="M90 52V64" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m4)"/>
+  <rect x="10" y="116" width="160" height="36" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="90.0" y="130.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">/repo/pkg</text>
+  <text x="90.0" y="144.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">parent of cwd</text>
+  <path d="M90 102V114" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m4)"/>
+  <rect x="10" y="166" width="160" height="36" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="90.0" y="180.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">/repo/pkg/api</text>
+  <text x="90.0" y="194.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">cwd</text>
+  <path d="M90 152V164" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m4)"/>
+  <text x="200" y="26" text-anchor="start" style="fill:var(--ink2);font-size:10px">Loaded at launch, broadest first, concatenated; later files sit closer to the end.</text>
+  <rect x="200" y="40" width="550" height="150" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="475.0" y="76.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Codex: AGENTS.override.md else AGENTS.md, root to cwd; 32 KiB</text>
+  <text x="475.0" y="90.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Claude Code: managed, user, project, local CLAUDE.md + rules</text>
+  <text x="475.0" y="104.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Pi: first of AGENTS.override, AGENTS, CLAUDE per directory</text>
+  <text x="475.0" y="118.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">nanocode: override first; per-file cap; duplicates once</text>
+  <text x="475.0" y="132.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Kimi Code: AGENTS.md in cwd and in its home folder</text>
+  <text x="475.0" y="146.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Qwen Code: QWEN.md from home and project (name configurable)</text>
+  <text x="475.0" y="160.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">eve: instructions.md + dynamic instructions; Trae: none</text>
+  <rect x="10" y="214" width="740" height="44" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="380.0" y="232.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Below cwd: Claude Code loads subdirectory CLAUDE.md files and path-scoped rules only when the agent reads files there;</text>
+  <text x="380.0" y="246.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">fx and Kimi Code announce a folder's rules when the agent first reaches it (decision 4).</text>
+</svg></div>
+<figcaption>Figure 4. The walk from broad to specific. Above the working directory everything loads at launch; below it, rules arrive on demand.</figcaption>
+</figure>
+
+<p>Three details show the design thinking. First, name compatibility: Pi accepts <code>CLAUDE.md</code> as a fallback, so it reads Claude Code projects unchanged; Claude Code reads only CLAUDE.md, and its documentation suggests a one-line <code>@AGENTS.md</code> import or a symlink to share one file. Second, duplication: nanocode skips a file whose content is identical to one already loaded, and Pi lets a nested git worktree's file shadow the main repository's, so the same rules are not paid for twice. Third, Claude Code's imports: a CLAUDE.md can pull in other files with <code>@path</code>, up to four hops deep, and the first external import triggers an approval dialog. Its documentation is explicit that imports load at launch and save no context; they are for organisation, not for loading less.</p>
+
+<h3 id="d-role">Decision 3. Which role do instructions travel in?</h3>
+<p>Providers give roles different weight: system (or developer) text is treated as the operator's rules, user text as the request. Where project instructions go changes both their authority and how they can be updated.</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 196" width="760" style="max-width:100%;height:auto" role="img" aria-label="Roles for project instructions">
+  <defs><marker id="m5" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <text x="10" y="18" text-anchor="start" style="fill:var(--ink);font-size:12px;font-weight:600">Inside the system prompt</text>
+  <text x="10" y="34" text-anchor="start" style="fill:var(--ink2);font-size:10px">Pi, eve (system-role instructions)</text>
+  <rect x="10" y="44" width="238" height="96" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="129.0" y="81.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">highest authority;</text>
+  <text x="129.0" y="95.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">one place to read;</text>
+  <text x="129.0" y="109.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">a change rewrites the start</text>
+  <rect x="10" y="152" width="238" height="34" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="129.0" y="172.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">cache breaks from token one</text>
+  <text x="260" y="18" text-anchor="start" style="fill:var(--ink);font-size:12px;font-weight:600">A user message after it</text>
+  <text x="260" y="34" text-anchor="start" style="fill:var(--ink2);font-size:10px">Claude Code, Codex (AGENTS.md)</text>
+  <rect x="260" y="44" width="238" height="96" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="379.0" y="81.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">can be appended or</text>
+  <text x="379.0" y="95.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">re-injected later;</text>
+  <text x="379.0" y="109.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">guides, does not bind</text>
+  <rect x="260" y="152" width="238" height="34" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="379.0" y="172.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">enforce with hooks, not text</text>
+  <text x="510" y="18" text-anchor="start" style="fill:var(--ink);font-size:12px;font-weight:600">Developer messages</text>
+  <text x="510" y="34" text-anchor="start" style="fill:var(--ink2);font-size:10px">Codex (base, permissions, mode)</text>
+  <rect x="510" y="44" width="238" height="96" rx="7" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="629.0" y="81.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">operator authority, but</text>
+  <text x="629.0" y="95.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">separate items that can be</text>
+  <text x="629.0" y="109.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">superseded by appending</text>
+  <rect x="510" y="152" width="238" height="34" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="629.0" y="172.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">needs a provider with the role</text>
+</svg></div>
+<figcaption>Figure 5. Authority against flexibility. Both Claude Code and Codex keep the user's files out of the system prompt.</figcaption>
+</figure>
+
+<p>Claude Code's documentation states the trade plainly: CLAUDE.md is delivered as a user message after the system prompt, it is context rather than enforced configuration, and anything that must always hold belongs in a hook that blocks the action. Codex sends its base instructions and its permission and collaboration-mode instructions as developer items, and AGENTS.md and the environment description as user items, each a separate, typed fragment. That typing is what makes decision 5 possible.</p>
+
+<h3 id="d-later">Decision 4. When do rules for a folder arrive?</h3>
+<p>A large repository may have instruction files in dozens of folders. Loading all of them at the start pays for rules that may never apply. Loading none of them means the agent edits <code>billing/</code> without knowing its rules. The middle path is to deliver a folder's rules when the agent first reaches it.</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 190" width="760" style="max-width:100%;height:auto" role="img" aria-label="Rules on first touch">
+  <defs><marker id="m6" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="20" width="134" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="77.0" y="41.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Session starts</text>
+  <text x="77.0" y="55.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">root rules only</text>
+  <rect x="161" y="20" width="134" height="50" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="228.0" y="41.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Agent reads</text>
+  <text x="228.0" y="55.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">billing/tax.py</text>
+  <path d="M146 45.0H158" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m6)"/>
+  <rect x="312" y="20" width="134" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="379.0" y="41.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Harness sees a new</text>
+  <text x="379.0" y="55.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">folder with rules</text>
+  <path d="M297 45.0H309" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m6)"/>
+  <rect x="463" y="20" width="134" height="50" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="530.0" y="41.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Rules appended to</text>
+  <text x="530.0" y="55.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">that step's result</text>
+  <path d="M448 45.0H460" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m6)"/>
+  <rect x="614" y="20" width="134" height="50" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="681.0" y="41.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Later visit:</text>
+  <text x="681.0" y="55.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">short reminder</text>
+  <path d="M599 45.0H611" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m6)"/>
+  <rect x="10" y="96" width="740" height="80" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="380.0" y="118.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Claude Code: subdirectory CLAUDE.md and rules with a paths pattern load when the agent reads matching files.</text>
+  <text x="380.0" y="132.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">fx: folder rules ride on the last tool result of the step that reached the folder; a later turn that reaches it again gets</text>
+  <text x="380.0" y="146.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">a reminder line, because without it some models stop applying the rules after the turn they arrived in.</text>
+  <text x="380.0" y="160.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Kimi Code: works out which directories a shell command touches and appends a reminder pointing at any unseen AGENTS.md.</text>
+</svg></div>
+<figcaption>Figure 6. Rules arrive at the tail, at the moment they apply. The prefix never changes.</figcaption>
+</figure>
+
+<p>The reminder line in fx is worth dwelling on. Its source notes the reason: models tend to apply a rule on the turn it arrives and forget it later, because it is now deep in the middle of a long context (fact 3). A one-line reminder at the end costs a few tokens and restores the rule's position.</p>
+
+<h3 id="d-change">Decision 5. How do changes get in mid-session?</h3>
+<p>The working directory changes, a file of rules is edited, the date rolls over, tools connect, the permission mode changes. The naive design rebuilds the request with the new values in place, which changes the prefix and re-prices the whole history. Every serious harness appends instead.</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 230" width="760" style="max-width:100%;height:auto" role="img" aria-label="Rebuild versus append">
+  <defs><marker id="m7" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <text x="10" y="18" text-anchor="start" style="fill:var(--ink);font-size:12px;font-weight:600">Rebuild in place</text>
+  <rect x="10" y="28" width="60" height="30" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="40.0" y="46.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">sys</text>
+  <rect x="72" y="28" width="70" height="30" rx="7" style="fill:var(--bad-s);stroke:var(--bad)"/>
+  <text x="107.0" y="46.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">cwd=B</text>
+  <rect x="144" y="28" width="220" height="30" rx="7" style="fill:var(--bad-s);stroke:var(--bad)"/>
+  <text x="254.0" y="46.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">history (re-priced)</text>
+  <text x="10" y="78" text-anchor="start" style="fill:var(--ink2);font-size:10px">One change near the start makes every later token a cache miss.</text>
+  <text x="400" y="18" text-anchor="start" style="fill:var(--ink);font-size:12px;font-weight:600">Append a diff</text>
+  <rect x="400" y="28" width="60" height="30" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="430.0" y="46.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">sys</text>
+  <rect x="462" y="28" width="70" height="30" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="497.0" y="46.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">cwd=A</text>
+  <rect x="534" y="28" width="130" height="30" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="599.0" y="46.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">history (cached)</text>
+  <rect x="666" y="28" width="84" height="30" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="708.0" y="46.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">cwd=B</text>
+  <text x="400" y="78" text-anchor="start" style="fill:var(--ink2);font-size:10px">Only the new tokens at the end are paid in full.</text>
+  <rect x="10" y="100" width="740" height="112" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="380.0" y="126.7" text-anchor="middle" style="fill:var(--ink);font-size:9px">Codex: each kind of context (environment, AGENTS.md, permissions, tools, plugins, context-window guidance) is a section that</text>
+  <text x="380.0" y="139.7" text-anchor="middle" style="fill:var(--ink);font-size:9px">compares its current state with the snapshot the model last saw and emits only the difference; a changed AGENTS.md arrives with</text>
+  <text x="380.0" y="152.7" text-anchor="middle" style="fill:var(--ink);font-size:9px">"These AGENTS.md instructions replace all previously provided AGENTS.md instructions", a removed one with a removal notice.</text>
+  <text x="380.0" y="165.7" text-anchor="middle" style="fill:var(--ink);font-size:9px">Pi: the system prompt is a set of named sections; a change is recorded as a section patch in a later system message, sent as such</text>
+  <text x="380.0" y="178.7" text-anchor="middle" style="fill:var(--ink);font-size:9px">where the provider accepts mid-conversation system messages, otherwise folded into the leading one.  fx: an appended context-update</text>
+  <text x="380.0" y="191.7" text-anchor="middle" style="fill:var(--ink);font-size:9px">block whose values replace the runtime context.  Kimi Code: a date-change reminder ("Rely on this reminder over any earlier date").</text>
+</svg></div>
+<figcaption>Figure 7. The append rule. The notice is what lets the model know which of two versions is current.</figcaption>
+</figure>
+
+<p>Codex's design generalises the rule. Each piece of world state the model can see is a typed section with a stable identity and a snapshot of what the model was last told. On every step the harness asks each section for the difference. If nothing changed, nothing is added. The snapshots are saved with the session, so a resumed session knows what the model already saw. Pi takes the same idea from the transcript side: the system prompt is replayed from the transcript, so a replay always reproduces exactly what the model was shown at each point (Chapter 6).</p>
+<p>There is one more defence. A tool result is untrusted text (Chapter 7), so a file could contain something that looks like a context update. fx escapes its update tag in tool output so a file cannot forge one.</p>
+
+<h3 id="d-remind">Decision 6. What does the harness say on its own?</h3>
+<p>Besides the user's files, a harness injects its own short messages: reminders, warnings, notices. They are how the harness talks to the model between the user's turns, and they are usually wrapped in a recognisable envelope (Kimi Code and Qwen Code use a system-reminder tag) so the model and the harness can tell them from the user's words.</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 236" width="760" style="max-width:100%;height:auto" role="img" aria-label="Kimi Code repeat breaker">
+  <defs><marker id="m8" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <text x="10" y="18" text-anchor="start" style="fill:var(--ink);font-size:11px;font-weight:600">Kimi Code: the same tool call repeated in a row</text>
+  <text x="10" y="44" text-anchor="start" style="fill:var(--ink);font-size:10px;font-weight:600">3 repeats</text>
+  <rect x="10" y="52" width="236" height="70" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="128.0" y="76.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Say in one sentence what new</text>
+  <text x="128.0" y="90.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">information the next call</text>
+  <text x="128.0" y="104.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">should produce, then act on it</text>
+  <path d="M248 87H260" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m8)"/>
+  <text x="262" y="44" text-anchor="start" style="fill:var(--ink);font-size:10px;font-weight:600">more repeats</text>
+  <rect x="262" y="52" width="236" height="70" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="380.0" y="76.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Choose one and say so: a cheap</text>
+  <text x="380.0" y="90.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">test that could disprove the</text>
+  <text x="380.0" y="104.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">approach, ask the user, or conclude</text>
+  <path d="M500 87H512" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m8)"/>
+  <text x="514" y="44" text-anchor="start" style="fill:var(--ink);font-size:10px;font-weight:600">still repeating</text>
+  <rect x="514" y="52" width="236" height="70" rx="7" style="fill:var(--bad-s);stroke:var(--bad)"/>
+  <text x="632.0" y="76.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Write the final response now,</text>
+  <text x="632.0" y="90.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">no more tool calls: blocker,</text>
+  <text x="632.0" y="104.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">attempts, what is needed</text>
+  <rect x="10" y="140" width="740" height="80" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="380.0" y="163.7" text-anchor="middle" style="fill:var(--ink);font-size:9px">Other injected messages: Kimi Code tells the model when the previous turn was interrupted ("any partial output shown above</text>
+  <text x="380.0" y="176.7" text-anchor="middle" style="fill:var(--ink);font-size:9px">is incomplete"), when the date changes, and when tools are added or removed. Codex has typed fragments for turn aborts, saved</text>
+  <text x="380.0" y="189.7" text-anchor="middle" style="fill:var(--ink);font-size:9px">approval rules, image resizing and the remaining context budget. Qwen Code moves all injected context ahead of the user's</text>
+  <text x="380.0" y="202.7" text-anchor="middle" style="fill:var(--ink);font-size:9px">text, because a model answered "no task received" when the real task was sandwiched between reminders.</text>
+</svg></div>
+<figcaption>Figure 8. Reminders escalate. Each step asks for less exploration and more commitment.</figcaption>
+</figure>
+
+<p>The Qwen Code case is a good lesson in fact 3. The user's message was assembled from independent sources: reminders before the prompt, then hook output and a memory catalog after it. On a long multi-part instruction the real task ended up in the middle, and the model reported that it had received no task. The fix moves the injected run ahead of the user's text in the copy sent to the provider, leaving the stored history unchanged, and every request that shares the cache must apply the same reordering or it re-pays the whole history.</p>
+
+<h3 id="d-budget">Decision 7. How big may instructions be, and what survives compaction?</h3>
+<p>Instructions are paid for on every step, and longer instructions are followed less reliably. Harnesses put a number on it.</p>
+<div class="tbl"><table>
+  <tr><th>Harness</th><th>Budget</th><th>What happens at the limit</th></tr>
+  <tr><td>Codex</td><td>32 KiB for project instructions by default</td><td>Text is cut, and the model is told to trim its project instructions</td></tr>
+  <tr><td>nanocode</td><td>A maximum size per instruction file</td><td>File capped; duplicate files skipped with an "included once" note</td></tr>
+  <tr><td>Claude Code</td><td>Target under 200 lines per CLAUDE.md; MEMORY.md loads its first 200 lines or 25 KB</td><td>CLAUDE.md loads in full regardless; longer files reduce adherence</td></tr>
+</table></div>
+<p>Claude Code adds two thrifty details: block-level HTML comments in CLAUDE.md are stripped before injection, so notes to human maintainers cost no tokens, and its auto-memory index loads at start while topic files are read only on demand. Compaction (Chapter 5) raises a second question: when the history is summarised, do the instructions survive? Claude Code re-reads the project-root CLAUDE.md from disk and re-injects it after compaction; nested files are not re-injected and reload the next time the agent reads a file in their folder. Instructions given only in conversation are lost, which is why the documentation tells users to move them into a file.</p>
+
+<h3 id="d-trust">Decision 8. Whose instructions are trusted?</h3>
+<p>A repository you just cloned can contain an AGENTS.md written by anyone. Loading it means a stranger writes part of your agent's prompt.</p>
 <ul>
-  <li><strong>Natural-Language Agent Harnesses</strong> (Tsinghua, Mar 2026) goes furthest: harness logic itself (contracts, roles, stages, failure taxonomy, state) is written as editable natural language and executed by a shared runtime (<a href="https://arxiv.org/html/2603.25723v1">arXiv 2603.25723</a>). AGENTS.md is the everyday version of this idea.</li>
-  <li><strong>Attention recitation.</strong> Manus rewrote a <code>todo.md</code> at the end of the context so the goal stays in the model's recent attention; fx's folder-rule reminder line is the same idea applied to rules.</li>
-  <li><strong>Zero-tolerance AGENTS.md.</strong> Chinese practitioners popularized the rule that every line must trace to a real failure (<a href="https://adg.csdn.net/6a5822cf10ee7a33f28df343.html">CSDN</a>). We adopt it: each line in our AGENTS.md gets a comment naming the failure that created it.</li>
-  <li><strong>OpenAI's practice.</strong> The Codex harness-engineering team kept AGENTS.md short and used it as a map into a structured docs folder, rather than one giant file.</li>
+  <li><strong>Codex</strong> loads no project instructions for a project the user has not trusted.</li>
+  <li><strong>Claude Code</strong> asks before following imports that point outside the project, and honours a custom memory location from project settings only after the workspace trust dialog. Managed CLAUDE.md from an organisation cannot be excluded by users.</li>
+  <li><strong>fx</strong> escapes its context-update tag in tool output, so file content cannot pose as the harness.</li>
+  <li><strong>All of them</strong> treat instructions as guidance. Permissions and sandboxes, not prompt text, are what stop a harmful action (Chapter 7).</li>
 </ul>
 
-<h2 id="build">5. Build: a cache-stable context assembler</h2>
+<h2 id="harnesses">3. How each harness assembles a request</h2>
+<p>Each diagram is the request from top (start) to bottom (end) as the harness builds it at the start of a session, with notes on what changes later.</p>
+
+<h3 id="h-pi">Pi: named sections, replayed from the transcript</h3>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 270" width="760" style="max-width:100%;height:auto" role="img" aria-label="Pi request">
+  <defs><marker id="m9" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <text x="10" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">start of request</text>
+  <rect x="10" y="26" width="430" height="30" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="225.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">preamble (one sentence, or the user's own prompt)</text>
+  <text x="454" y="45" text-anchor="start" style="fill:var(--ink2);font-size:10px">replaceable</text>
+  <rect x="10" y="62" width="430" height="30" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="225.0" y="80.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">tools, rules, docs pointers</text>
+  <text x="454" y="81" text-anchor="start" style="fill:var(--ink2);font-size:10px">generated from active tools</text>
+  <rect x="10" y="98" width="430" height="30" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="225.0" y="116.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">addendum (user's appended prompt)</text>
+  <text x="454" y="117" text-anchor="start" style="fill:var(--ink2);font-size:10px">optional</text>
+  <rect x="10" y="134" width="430" height="30" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="225.0" y="152.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">project_context: AGENTS.md / CLAUDE.md files</text>
+  <text x="454" y="153" text-anchor="start" style="fill:var(--ink2);font-size:10px">root to cwd</text>
+  <rect x="10" y="170" width="430" height="30" rx="7" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="225.0" y="188.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">skills, cwd</text>
+  <text x="454" y="189" text-anchor="start" style="fill:var(--ink2);font-size:10px">skill list only if a reader exists</text>
+  <rect x="10" y="206" width="430" height="30" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="225.0" y="224.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">messages; later system messages carry section patches</text>
+  <text x="454" y="225" text-anchor="start" style="fill:var(--ink2);font-size:10px">diffs only</text>
+  <text x="10" y="262" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">end of request</text>
+</svg></div>
+<figcaption>Figure 9. Pi wraps each section in its own tag. Tool changes are announced to the model as a system message before the next request.</figcaption>
+</figure>
+
+<h3 id="h-eve">eve: authored and computed instructions</h3>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 234" width="760" style="max-width:100%;height:auto" role="img" aria-label="eve request">
+  <defs><marker id="m10" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <text x="10" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">start of request</text>
+  <rect x="10" y="26" width="430" height="30" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="225.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">instructions.md: the agent's always-on prompt</text>
+  <text x="454" y="45" text-anchor="start" style="fill:var(--ink2);font-size:10px">authored in the agent directory</text>
+  <rect x="10" y="62" width="430" height="30" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="225.0" y="80.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">dynamic instructions: functions that return text</text>
+  <text x="454" y="81" text-anchor="start" style="fill:var(--ink2);font-size:10px">per session, memoizable</text>
+  <rect x="10" y="98" width="430" height="30" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="225.0" y="116.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">tools, including catalog tools</text>
+  <text x="454" y="117" text-anchor="start" style="fill:var(--ink2);font-size:10px">deferred tools stay out</text>
+  <rect x="10" y="134" width="430" height="30" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="225.0" y="152.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">history from the durable log</text>
+  <rect x="10" y="170" width="430" height="30" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="225.0" y="188.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">new message or channel event</text>
+  <text x="10" y="226" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">end of request</text>
+</svg></div>
+<figcaption>Figure 10. After a redeploy, system-role instructions update on the next turn; a changed user-role instruction joins the history again and an unchanged one is not re-added.</figcaption>
+</figure>
+
+<h3 id="h-fx">fx: an operating manual plus appended updates</h3>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 270" width="760" style="max-width:100%;height:auto" role="img" aria-label="fx request">
+  <defs><marker id="m11" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <text x="10" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">start of request</text>
+  <rect x="10" y="26" width="430" height="30" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="225.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">operating manual (about 1,000 words) + model overlay</text>
+  <text x="454" y="45" text-anchor="start" style="fill:var(--ink2);font-size:10px">sectioned</text>
+  <rect x="10" y="62" width="430" height="30" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="225.0" y="80.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">tools</text>
+  <rect x="10" y="98" width="430" height="30" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="225.0" y="116.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">instruction files at session start</text>
+  <rect x="10" y="134" width="430" height="30" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="225.0" y="152.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">history</text>
+  <rect x="10" y="170" width="430" height="30" rx="7" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="225.0" y="188.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">context-update blocks (cwd, git, permission mode)</text>
+  <text x="454" y="189" text-anchor="start" style="fill:var(--ink2);font-size:10px">replace earlier values</text>
+  <rect x="10" y="206" width="430" height="30" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="225.0" y="224.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">folder rules on first touch; reminder on revisit</text>
+  <text x="454" y="225" text-anchor="start" style="fill:var(--ink2);font-size:10px">on tool results</text>
+  <text x="10" y="262" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">end of request</text>
+</svg></div>
+<figcaption>Figure 11. fx never edits the start of the request. Everything that changes is appended.</figcaption>
+</figure>
+
+<h3 id="h-nano">nanocode: the vendor's prompt, unchanged</h3>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 198" width="760" style="max-width:100%;height:auto" role="img" aria-label="nanocode request">
+  <defs><marker id="m12" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <text x="10" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">start of request</text>
+  <rect x="10" y="26" width="430" height="30" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="225.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">pinned vendor system prompt for the chosen model</text>
+  <text x="454" y="45" text-anchor="start" style="fill:var(--ink2);font-size:10px">byte-identical</text>
+  <rect x="10" y="62" width="430" height="30" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="225.0" y="80.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">vendor tool set</text>
+  <text x="454" y="81" text-anchor="start" style="fill:var(--ink2);font-size:10px">or Code Mode</text>
+  <rect x="10" y="98" width="430" height="30" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="225.0" y="116.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">AGENTS.override.md / AGENTS.md per scope</text>
+  <text x="454" y="117" text-anchor="start" style="fill:var(--ink2);font-size:10px">capped, deduplicated</text>
+  <rect x="10" y="134" width="430" height="30" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="225.0" y="152.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">history</text>
+  <text x="454" y="153" text-anchor="start" style="fill:var(--ink2);font-size:10px">prefix stability is an invariant</text>
+  <text x="10" y="190" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">end of request</text>
+</svg></div>
+<figcaption>Figure 12. nanocode treats prefix stability as a written invariant: rounds and reloads must not change the start of the request.</figcaption>
+</figure>
+
+<h3 id="h-codex">Codex: typed fragments with diffs</h3>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 270" width="760" style="max-width:100%;height:auto" role="img" aria-label="Codex request">
+  <defs><marker id="m13" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <text x="10" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">start of request</text>
+  <rect x="10" y="26" width="430" height="30" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="225.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">base instructions for the model family</text>
+  <text x="454" y="45" text-anchor="start" style="fill:var(--ink2);font-size:10px">developer item</text>
+  <rect x="10" y="62" width="430" height="30" rx="7" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="225.0" y="80.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">permissions, collaboration mode, apps, plugins</text>
+  <text x="454" y="81" text-anchor="start" style="fill:var(--ink2);font-size:10px">developer items</text>
+  <rect x="10" y="98" width="430" height="30" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="225.0" y="116.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">AGENTS.md (root to cwd, 32 KiB)</text>
+  <text x="454" y="117" text-anchor="start" style="fill:var(--ink2);font-size:10px">user item</text>
+  <rect x="10" y="134" width="430" height="30" rx="7" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="225.0" y="152.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">environment: cwd, shell, workspace roots</text>
+  <text x="454" y="153" text-anchor="start" style="fill:var(--ink2);font-size:10px">user item</text>
+  <rect x="10" y="170" width="430" height="30" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="225.0" y="188.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">history</text>
+  <rect x="10" y="206" width="430" height="30" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="225.0" y="224.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">section diffs with replace or removal notices</text>
+  <text x="454" y="225" text-anchor="start" style="fill:var(--ink2);font-size:10px">only when changed</text>
+  <text x="10" y="262" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">end of request</text>
+</svg></div>
+<figcaption>Figure 13. Every model-visible piece of state is a section that knows what the model was last told.</figcaption>
+</figure>
+
+<h3 id="h-cc">Claude Code: system prompt, then the user's files as context</h3>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 270" width="760" style="max-width:100%;height:auto" role="img" aria-label="Claude Code request">
+  <defs><marker id="m14" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <text x="10" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">start of request</text>
+  <rect x="10" y="26" width="430" height="30" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="225.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">system prompt (+ --append-system-prompt if given)</text>
+  <rect x="10" y="62" width="430" height="30" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="225.0" y="80.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">tools (deferred ones listed by name)</text>
+  <text x="454" y="81" text-anchor="start" style="fill:var(--ink2);font-size:10px">fixed list for the session</text>
+  <rect x="10" y="98" width="430" height="30" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="225.0" y="116.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">CLAUDE.md: managed, user, project, local; rules</text>
+  <text x="454" y="117" text-anchor="start" style="fill:var(--ink2);font-size:10px">user message</text>
+  <rect x="10" y="134" width="430" height="30" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="225.0" y="152.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">MEMORY.md (first 200 lines or 25 KB)</text>
+  <text x="454" y="153" text-anchor="start" style="fill:var(--ink2);font-size:10px">auto memory index</text>
+  <rect x="10" y="170" width="430" height="30" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="225.0" y="188.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">history</text>
+  <rect x="10" y="206" width="430" height="30" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="225.0" y="224.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">nested CLAUDE.md and path rules on demand; reminders</text>
+  <text x="10" y="262" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">end of request</text>
+</svg></div>
+<figcaption>Figure 14. The paper lists the sources assembled in a fixed order; the documentation gives the user-facing rules shown here.</figcaption>
+</figure>
+
+<h3 id="h-kimi">Kimi Code: reminders as a feature system</h3>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 270" width="760" style="max-width:100%;height:auto" role="img" aria-label="Kimi Code request">
+  <defs><marker id="m15" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <text x="10" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">start of request</text>
+  <rect x="10" y="26" width="430" height="30" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="225.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">system prompt</text>
+  <rect x="10" y="62" width="430" height="30" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="225.0" y="80.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">tools (more loadable on request)</text>
+  <rect x="10" y="98" width="430" height="30" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="225.0" y="116.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">AGENTS.md (cwd) + home AGENTS.md</text>
+  <rect x="10" y="134" width="430" height="30" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="225.0" y="152.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">history</text>
+  <rect x="10" y="170" width="430" height="30" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="225.0" y="188.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">system reminders: new folder rules, date, interruption,</text>
+  <text x="454" y="189" text-anchor="start" style="fill:var(--ink2);font-size:10px">each a separate feature</text>
+  <rect x="10" y="206" width="430" height="30" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="225.0" y="224.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">tool changes, repeated calls</text>
+  <text x="10" y="262" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">end of request</text>
+</svg></div>
+<figcaption>Figure 15. Each kind of reminder is its own feature with its own trigger, all sharing one envelope.</figcaption>
+</figure>
+
+<h3 id="h-qwen">Qwen Code: an explicit order with tests</h3>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 270" width="760" style="max-width:100%;height:auto" role="img" aria-label="Qwen Code request">
+  <defs><marker id="m16" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <text x="10" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">start of request</text>
+  <rect x="10" y="26" width="430" height="30" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="225.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">system prompt</text>
+  <rect x="10" y="62" width="430" height="30" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="225.0" y="80.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">core tools; others behind tool search</text>
+  <rect x="10" y="98" width="430" height="30" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="225.0" y="116.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">QWEN.md hierarchy</text>
+  <text x="454" y="117" text-anchor="start" style="fill:var(--ink2);font-size:10px">name configurable</text>
+  <rect x="10" y="134" width="430" height="30" rx="7" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="225.0" y="152.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">environment context</text>
+  <rect x="10" y="170" width="430" height="30" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="225.0" y="188.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">history</text>
+  <rect x="10" y="206" width="430" height="30" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="225.0" y="224.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">injected context, then the user's text last</text>
+  <text x="454" y="225" text-anchor="start" style="fill:var(--ink2);font-size:10px">reordered on the wire only</text>
+  <text x="10" y="262" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">end of request</text>
+</svg></div>
+<figcaption>Figure 16. Qwen Code fixes the order in one place and tests it, because a silent reorder breaks caching.</figcaption>
+</figure>
+
+<h3 id="h-trae">Trae Agent: one prompt, one task</h3>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 198" width="760" style="max-width:100%;height:auto" role="img" aria-label="Trae Agent request">
+  <defs><marker id="m17" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <text x="10" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">start of request</text>
+  <rect x="10" y="26" width="430" height="30" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="225.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">fixed system prompt</text>
+  <text x="454" y="45" text-anchor="start" style="fill:var(--ink2);font-size:10px">same for every run</text>
+  <rect x="10" y="62" width="430" height="30" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="225.0" y="80.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">five tools</text>
+  <rect x="10" y="98" width="430" height="30" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="225.0" y="116.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">task text + project path (first user message)</text>
+  <text x="454" y="117" text-anchor="start" style="fill:var(--ink2);font-size:10px">no project files</text>
+  <rect x="10" y="134" width="430" height="30" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="225.0" y="152.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">history</text>
+  <text x="10" y="190" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">end of request</text>
+</svg></div>
+<figcaption>Figure 17. For a research harness, identical instructions on every run are the point.</figcaption>
+</figure>
+
+<h2 id="compare">4. All nine in one table</h2>
+<div class="tbl"><table>
+  <tr><th>Harness</th><th>Base prompt</th><th>Project files</th><th>Role of project files</th><th>Rules found later</th><th>Mid-session changes</th><th>Budget</th></tr>
+  <tr><td>Pi</td><td>One sentence + generated lists; replaceable</td><td>AGENTS.override, AGENTS, CLAUDE (first match)</td><td>System sections</td><td>Not loaded</td><td>Section patches in system messages</td><td>None stated</td></tr>
+  <tr><td>eve</td><td>Authored instructions.md</td><td>Agent directory</td><td>System and user</td><td>Dynamic instructions</td><td>Next turn, cache-aware</td><td>None stated</td></tr>
+  <tr><td>fx</td><td>About 1,000-word manual + overlays</td><td>Instruction files</td><td>Session start</td><td>On first touch + reminder</td><td>Appended update blocks</td><td>None stated</td></tr>
+  <tr><td>nanocode</td><td>Pinned vendor prompts</td><td>AGENTS.override, AGENTS</td><td>Vendor's layout</td><td>Not loaded</td><td>Prefix kept stable</td><td>Per-file cap, dedup</td></tr>
+  <tr><td>Codex</td><td>Per model: 1,100 to 3,900 words</td><td>AGENTS.override, AGENTS, fallbacks</td><td>User items</td><td>Section diff on cwd change</td><td>Typed section diffs</td><td>32 KiB</td></tr>
+  <tr><td>Claude Code</td><td>System prompt + optional append</td><td>Four-scope CLAUDE.md, rules, imports</td><td>User message</td><td>Subfolder files, path rules</td><td>Reminders; root file re-injected after compaction</td><td>Under 200 lines advised</td></tr>
+  <tr><td>Kimi Code</td><td>System prompt</td><td>AGENTS.md (cwd, home)</td><td>Prefix</td><td>Reminder on entering a folder</td><td>Typed system reminders</td><td>Not stated</td></tr>
+  <tr><td>Qwen Code</td><td>System prompt</td><td>QWEN.md hierarchy</td><td>Ordered context</td><td>Discovery on load</td><td>Reminders before user text</td><td>Not stated</td></tr>
+  <tr><td>Trae Agent</td><td>Fixed</td><td>None</td><td>n/a</td><td>n/a</td><td>None</td><td>n/a</td></tr>
+</table></div>
+
+<h2 id="choose">5. Choosing a layout</h2>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 274" width="760" style="max-width:100%;height:auto" role="img" aria-label="Choosing a context layout">
+  <defs><marker id="m18" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="10" width="280" height="52" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="150.0" y="32.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Are you using a model trained</text>
+  <text x="150.0" y="46.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">for another harness?</text>
+  <rect x="340" y="10" width="410" height="52" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="545.0" y="32.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Use or mirror that harness's prompt and tool</text>
+  <text x="545.0" y="46.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">names (nanocode's approach); keep your additions short</text>
+  <path d="M292 36H336" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m18)"/>
+  <text x="300" y="30" text-anchor="start" style="fill:var(--ink2);font-size:10px">yes</text>
+  <rect x="10" y="76" width="280" height="52" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="150.0" y="98.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Can anything change</text>
+  <text x="150.0" y="112.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">mid-session?</text>
+  <rect x="340" y="76" width="410" height="52" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="545.0" y="98.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Model each changing thing as a section with a</text>
+  <text x="545.0" y="112.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">snapshot; append diffs with a replace notice</text>
+  <path d="M292 102H336" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m18)"/>
+  <text x="300" y="96" text-anchor="start" style="fill:var(--ink2);font-size:10px">yes</text>
+  <rect x="10" y="142" width="280" height="52" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="150.0" y="164.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Large repo with rules</text>
+  <text x="150.0" y="178.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">in many folders?</text>
+  <rect x="340" y="142" width="410" height="52" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="545.0" y="164.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Load root rules at start; deliver folder rules</text>
+  <text x="545.0" y="178.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">on first touch, remind on revisit</text>
+  <path d="M292 168H336" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m18)"/>
+  <text x="300" y="162" text-anchor="start" style="fill:var(--ink2);font-size:10px">yes</text>
+  <rect x="10" y="208" width="280" height="52" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="150.0" y="230.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Does a rule have to hold</text>
+  <text x="150.0" y="244.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">every time?</text>
+  <rect x="340" y="208" width="410" height="52" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="545.0" y="230.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Do not rely on text: enforce it with a</text>
+  <text x="545.0" y="244.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">permission rule or hook (Chapters 7, 8)</text>
+  <path d="M292 234H336" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m18)"/>
+  <text x="300" y="228" text-anchor="start" style="fill:var(--ink2);font-size:10px">yes</text>
+</svg></div>
+<figcaption>Figure 18. Four questions. The answers combine: most production harnesses say yes to all four.</figcaption>
+</figure>
+
+<p>This book's assembler follows the stack in Figure 2: a fixed base prompt and tool list, AGENTS.md from root to working directory with a byte budget, environment facts at session start, and every change appended as a tagged update at the tail. The exercises add section snapshots, folder rules on first touch and a reminder envelope.</p>
+
+<h2 id="research">6. Research and the Chinese view</h2>
+<ul>
+  <li><strong>Natural-Language Agent Harnesses</strong> (Tsinghua, March 2026) takes the idea furthest: contracts, roles, stages and failure handling are written as editable natural language and executed by a shared runtime. AGENTS.md is the everyday version.</li>
+  <li><strong>Attention recitation.</strong> Manus described rewriting a todo list at the end of the context so the goal stays in recent attention. fx's folder-rule reminder and Kimi Code's escalating reminders are the same move.</li>
+  <li><strong>Short files as maps.</strong> OpenAI's Codex team described keeping AGENTS.md short and using it as an index into a structured docs folder rather than one long file, matching Claude Code's advice to stay under 200 lines and use path-scoped rules.</li>
+  <li><strong>Chinese practice.</strong> Kimi Code built reminders as a feature system with escalation for repeated tool calls; Qwen Code, inheriting Gemini CLI's hierarchical context files, added a tested context order after a production bug. Chinese practitioners popularised a zero-tolerance rule for AGENTS.md: every line must trace to a real failure. This book adopts it.</li>
+</ul>
+
+<h2 id="build">7. Build: a cache-stable context assembler</h2>
 <pre>&quot;&quot;&quot;Context assembly: a stable prefix, project instructions, and changes appended at the end, never in the prefix.&quot;&quot;&quot;
 import os, platform, subprocess
 from pathlib import Path
@@ -210,32 +738,36 @@ class ContextTracker:
   <li>Compare cache hit share with and without the tracker: in the "without" version, rebuild the system prompt every step.</li>
 </ol>
 
-<h2 id="exercises">6. Exercises</h2>
+
+<h2 id="exercises">8. Exercises</h2>
 <ol>
-  <li>Escape the update tag in tool output (as fx does) so a file containing <code>&lt;context-update&gt;</code> cannot forge one. Write a test.</li>
-  <li>Add a per-model overlay: a few lines appended to the base prompt only for one model family.</li>
-  <li>Read fx's <code>system_prompt.md</code> in full and list the three rules you would copy into your own base prompt, and why.</li>
+  <li><strong>Measure the cache.</strong> Run a 20-step task twice: once rebuilding the environment block in place when the working directory changes, once appending an update. Record cached and uncached input tokens per step for both.</li>
+  <li><strong>Section snapshots.</strong> Turn environment, project instructions and permission mode into sections that store the last value sent. Emit only diffs, with a replacement notice. Resume a saved session and check nothing is re-sent.</li>
+  <li><strong>Folder rules on first touch.</strong> Put an AGENTS.md in a subfolder with a rule the agent would otherwise break. Deliver it when a tool first touches that folder; add a reminder line on later visits. Compare compliance with and without the reminder.</li>
+  <li><strong>The sandwich bug.</strong> Append a long reminder after the user's text and test a multi-part instruction. Then move injected context ahead of the user's text. Does the model miss the task less often?</li>
+  <li><strong>Zero-tolerance AGENTS.md.</strong> Write your AGENTS.md so every line has a comment naming the failure that created it. Strip comments before sending, as Claude Code does.</li>
 </ol>
 
-<h2 id="quiz">7. Check yourself</h2>
+<h2 id="quiz">9. Check yourself</h2>
 <div class="widget quiz" data-quiz="qz4"></div>
 <script type="application/json" id="qz4">[
-{"q":"Where does fx put runtime changes such as a new cwd?","o":["It rewrites the system prompt","An fx-context-update block appended to the latest message","A new system message at the top","Nowhere; the model must ask"],"a":1,"e":"Appending keeps the cached prefix intact and puts the change where the model attends most."},
-{"q":"When fx first touches a folder with its own rules, where do those rules go?","o":["Into the session-start instructions","Onto that step's last tool result","Into a separate system message","They are ignored"],"a":1,"e":"Adding them to the start would change the prefix; attaching them to the tool result does not."},
-{"q":"Which files does Pi check in each directory, in order?","o":["Only AGENTS.md","AGENTS.override.md, AGENTS.md, AGENTS.MD, CLAUDE.md, CLAUDE.MD","README.md and AGENTS.md","CLAUDE.md only"],"a":1,"e":"First match wins, so Pi reads projects written for Claude Code without changes."},
-{"q":"Why does nanocode skip an instruction file identical to one already loaded?","o":["To save disk space","Loading the same rules twice wastes tokens and can over-weight them","Rust requires unique strings","For security"],"a":1,"e":"Duplicates appear with worktrees and copied files; including them once keeps context lean."},
-{"q":"A rule in AGENTS.md cannot be traced to any agent failure. The zero-tolerance rule says:","o":["Keep it as a precaution","Delete it","Move it to the system prompt","Make it bold"],"a":1,"e":"Rules without evidence cost tokens and attention without a measurable benefit."}
+{"q":"Why should content that changes every step go at the end of the request?","o":["Providers require it","Only an identical prefix is cheap, and the model attends most to the end","It is shorter there","Tools must come last"],"a":1,"e":"Facts 3 and 4 point the same way: changes at the tail are cheap and noticed."},
+{"q":"Codex's base prompt for models tuned for Codex is about 1,100 to 1,200 words; for general GPT-5 models about 3,500 to 3,900. Why?","o":["General models have larger windows","A model trained in the harness already knows how to behave and needs fewer instructions","Codex models cost more","It is accidental"],"a":1,"e":"Prompt length is a bet about what the model already knows."},
+{"q":"How does Claude Code deliver CLAUDE.md?","o":["Inside the system prompt","As a user message after the system prompt; it is context, not enforced configuration","As a tool result","Only on request"],"a":1,"e":"Its documentation recommends a hook for anything that must always hold."},
+{"q":"What does Codex add when AGENTS.md changes mid-session?","o":["Nothing until restart","It rewrites the original text in place","An appended fragment saying these instructions replace all previously provided AGENTS.md instructions","A new system prompt"],"a":2,"e":"Appending with a notice keeps the cached prefix valid and tells the model which version is current."},
+{"q":"Why does fx add a short reminder when the agent reaches a folder again?","o":["To save tokens","Some models stop applying folder rules after the turn they arrived in","To log the visit","To check permissions"],"a":1,"e":"The rule is now deep in the context; one line at the end restores it."},
+{"q":"What caused a model to answer 'no task received' in Qwen Code?","o":["An empty prompt","Injected reminders and hook output were placed after the user's text, burying the task in the middle","A tool error","A cache miss"],"a":1,"e":"Qwen Code now moves injected context ahead of the user's text on the wire."},
+{"q":"What does Kimi Code's third repeat-breaker reminder ask for?","o":["One more try","A falsification test","A final response with no more tool calls: blocker, attempts and what is needed","A new plan file"],"a":2,"e":"The reminders escalate from reflection, to a forced choice, to stopping."},
+{"q":"After compaction in Claude Code, which instruction files are re-injected?","o":["All of them","None","The project-root CLAUDE.md; nested files reload when the agent next reads a file in their folder","Only managed policy"],"a":2,"e":"Instructions given only in conversation are lost, so lasting rules belong in files."}
 ]</script>
 
-<h2 id="refs">8. References</h2>
+<h2 id="refs">10. References</h2>
 <ul>
-  <li>fx: <code>src/builtins/system_prompt.md</code>, <code>src/builtins/context.zig</code>.</li>
-  <li>Pi: <code>packages/coding-agent/src/core/system-prompt.ts</code>, <code>resource-loader.ts</code>.</li>
-  <li>nanocode: <code>crates/core/home/src/instructions.rs</code>, <code>docs/memory-invariant.md</code>.</li>
-  <li>eve: <code>docs/instructions.mdx</code>, <code>docs/concepts/execution-model-and-durability.mdx</code>.</li>
-  <li><a href="https://arxiv.org/html/2603.25723v1">Natural-Language Agent Harnesses</a>, Tsinghua University, 2026.</li>
-  <li><a href="https://openai.com/index/unrolling-the-codex-agent-loop">Unrolling the Codex agent loop</a> (prompt order and caching), OpenAI, Jan 2026.</li>
-  <li><a href="https://manus.im/blog/Context-Engineering-for-AI-Agents-Lessons-from-Building-Manus">Context Engineering for AI Agents: Lessons from Building Manus</a>, Jul 2025.</li>
+  <li>Pi: <a href="https://github.com/earendil-works/pi">github.com/earendil-works/pi</a> (fb248c7). eve: <a href="https://github.com/vercel/eve">github.com/vercel/eve</a> (5c52fbf). fx: <a href="https://github.com/vercel-labs/fx">github.com/vercel-labs/fx</a> (cbe7daf). nanocode: <a href="https://github.com/gakonst/nanocode">github.com/gakonst/nanocode</a> (015cbfa).</li>
+  <li>Codex CLI: <a href="https://github.com/openai/codex">github.com/openai/codex</a> (50aeac2).</li>
+  <li>Claude Code: <a href="https://code.claude.com/docs/en/memory">How Claude remembers your project</a>, Anthropic documentation, checked 24 Nov 2026; Dive into Claude Code, arXiv 2604.14228.</li>
+  <li>Kimi Code: <a href="https://github.com/MoonshotAI/kimi-code">github.com/MoonshotAI/kimi-code</a> (111aae2). Qwen Code: <a href="https://github.com/QwenLM/qwen-code">github.com/QwenLM/qwen-code</a> (c56424fc). Trae Agent: <a href="https://github.com/bytedance/trae-agent">github.com/bytedance/trae-agent</a> (e839e55).</li>
+  <li>Natural-Language Agent Harnesses, arXiv 2603.25723. Context Engineering for AI Agents: Lessons from Building Manus, Jul 2025. OpenAI, Unrolling the Codex agent loop, Jan 2026, and Harness engineering: leveraging Codex in an agent-first world, 2026.</li>
 </ul>
 
 <div class="navfoot"></div>
