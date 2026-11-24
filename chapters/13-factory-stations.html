@@ -15,101 +15,362 @@
 <main><article>
 <div class="kicker">Stage 5 · Software factory · Chapter 13</div>
 <h1>Software factory I: stations</h1>
-<p class="lede">One session with one context fills up (fact 3), and a model checking its own work shares its own blind spots (fact 5). A software factory follows from taking those facts seriously at scale: it is the harness scaled from one session to the whole delivery loop: an issue goes in, a reviewed draft pull request comes out, and people make the judgement calls. This chapter reads the real code of eve's Foreman template and compares it with Stripe's Minions, Ramp, Coinbase and StrongDM. You build a four-station factory that works on your own book repository.</p>
+<p class="lede">A software factory takes work from where it is filed (an issue, a ticket, a Slack thread) and returns a draft pull request, with no one at the keyboard. It is built from everything in Stages 1 to 4, plus structure: stations that each do one job in a fresh context, acceptance criteria written before code, a reviewer independent of the implementer, a bounded revision loop, safe delivery, and a small memory across runs. This chapter derives why stations beat one long session, walks through ten design decisions using Vercel's open-source Foreman as the worked example, compares what industry built, shows which factory parts each of the nine harnesses ships, and keeps the four-station factory you build.</p>
 <div class="meta">
   <span class="chip">Level: advanced</span>
-  <span class="chip">Time: about 20 hours with the build</span>
-  <span class="chip">Needs: Stages 1 to 4</span>
-  <span class="chip">Code read at: eve 5c52fbf (apps/templates/eve-software-factory-template)</span>
+  <span class="chip">Time: about 16 hours with the build</span>
+  <span class="chip">Needs: Chapters 1 to 12</span>
+  <span class="chip">Harnesses read: Pi, eve (Foreman), fx, nanocode, Codex, Claude Code, Kimi Code, Qwen Code, Trae Agent</span>
 </div>
 
 <div class="box skip">
   <span class="lbl">Before you start: skip check</span>
   <ol>
-    <li>Why does Foreman's Reviewer never see the Implementer's reasoning?</li>
-    <li>Why might a factory use different model vendors for different stations?</li>
-    <li>What is the difference between a light factory and a dark factory?</li>
+    <li>Why should the reviewer station not be the same session (or even the same vendor's model) as the implementer?</li>
+    <li>Why must acceptance criteria be written before the code?</li>
+    <li>CI fails on a factory pull request. Why does Foreman classify the failure before asking for a revision?</li>
+    <li>Why does Foreman run authenticated git in a separate sandbox from the one that runs the repository's code?</li>
   </ol>
   <details><summary>Answers</summary><ol>
-    <li>So it judges the real diff against the criteria instead of being persuaded by the author's explanation.</li>
-    <li>Cost (cheap models for triage and planning) and independence: a reviewer from another vendor is less likely to share the implementer's blind spots.</li>
-    <li>In a light factory humans review every pull request (Stripe). In a dark factory humans write specs and scenarios but review outcomes, not code (StrongDM).</li>
+    <li>A model reviewing its own work shares the blind spots that produced the mistake (fact 5). A different model that sees only the diff and the criteria makes independent errors, so together they catch more.</li>
+    <li>A check written after the code is shaped by the code. Criteria written first are a fixed target the reviewer can hold the work to.</li>
+    <li>Only code failures can be fixed by revising code. Missing logs, infrastructure, configuration and flaky tests need a person; revising for them burns money and can make things worse.</li>
+    <li>Repository code (tests, install scripts) is untrusted and can read anything in its sandbox. Keeping credentials in a separate disposable sandbox means the code that runs never sees them.</li>
   </ol></details>
 </div>
 
-<h2 id="what">1. What a factory adds to a harness</h2>
-<p>Why split one job into stations instead of giving one agent the whole issue? Derive it. A single session that triages, plans, codes and reviews accumulates everything in one window, so by the review it is reasoning through a crowded context (fact 3). Worse, it reviews its own work with the same weights, the same prompt and the same history that produced the mistake (fact 5); its errors are correlated with themselves. Splitting gives each station a fresh window holding only what that job needs, and lets the reviewer be a different model that sees only the diff and the criteria. Independence is the point: two samples with different blind spots catch more than one sample checked twice.</p>
-<p>The other parts follow too. Acceptance criteria must be written before the code, because a check written after it is shaped by it. The revision loop must be bounded, because a model that failed twice on the same feedback is unlikely to succeed on the tenth try, while the bill keeps growing (fact 4). Memory across runs must be small and curated, because it is loaded into every station's window.</p>
-<p>Everything in Stages 1 to 4 still applies inside each station. The factory adds structure around them: intake from where work is filed, triage, a plan with checkable acceptance criteria, isolated implementation, independent review, a bounded revision loop, safe delivery and memory across runs.</p>
+
+<h2 id="what">1. Why stations, from first principles</h2>
+<p>Why split one job into stations instead of giving one agent the whole issue? A single session that triages, plans, codes and reviews accumulates everything in one window, so by the review it reasons through a crowded context (fact 3). Worse, it reviews its own work with the same weights, prompt and history that produced the mistake; its errors are correlated with themselves (fact 5). Splitting gives each station a fresh window with only what its job needs, and lets the reviewer be a different model that sees only the diff and the criteria. Two samples with different blind spots catch more than one sample checked twice.</p>
+
 <figure>
-<div class="svgwrap"><svg viewBox="0 0 760 240" width="760" style="max-width:100%;height:auto" role="img" aria-label="Factory pipeline: intake, triage, analyst, implementer, reviewer, draft PR, with a revision loop and a shared factory brain">
-  <defs><marker id="i1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
-  <rect x="24" y="60" width="96" height="56" rx="8" style="fill:var(--panel2);stroke:var(--line)"/><text x="72" y="84" text-anchor="middle" style="fill:var(--ink);font-size:11px;font-weight:600">Intake</text><text x="72" y="102" text-anchor="middle" style="fill:var(--ink2);font-size:9px">label, @mention</text>
-  <rect x="144" y="60" width="96" height="56" rx="8" style="fill:var(--kv-s);stroke:var(--kv)"/><text x="192" y="84" text-anchor="middle" style="fill:var(--ink);font-size:11px;font-weight:600">Triage</text><text x="192" y="102" text-anchor="middle" style="fill:var(--ink2);font-size:9px">lane, duplicates</text>
-  <rect x="264" y="60" width="96" height="56" rx="8" style="fill:var(--kv-s);stroke:var(--kv)"/><text x="312" y="84" text-anchor="middle" style="fill:var(--ink);font-size:11px;font-weight:600">Analyst</text><text x="312" y="102" text-anchor="middle" style="fill:var(--ink2);font-size:9px">plan, criteria</text>
-  <rect x="384" y="60" width="110" height="56" rx="8" style="fill:var(--dec-s);stroke:var(--dec)"/><text x="439" y="84" text-anchor="middle" style="fill:var(--ink);font-size:11px;font-weight:600">Implementer</text><text x="439" y="102" text-anchor="middle" style="fill:var(--ink2);font-size:9px">own sandbox, checks</text>
-  <rect x="518" y="60" width="96" height="56" rx="8" style="fill:var(--pre-s);stroke:var(--pre)"/><text x="566" y="84" text-anchor="middle" style="fill:var(--ink);font-size:11px;font-weight:600">Reviewer</text><text x="566" y="102" text-anchor="middle" style="fill:var(--ink2);font-size:9px">diff only</text>
-  <rect x="638" y="60" width="98" height="56" rx="8" style="fill:var(--panel2);stroke:var(--good);stroke-width:2"/><text x="687" y="84" text-anchor="middle" style="fill:var(--ink);font-size:11px;font-weight:600">Draft PR</text><text x="687" y="102" text-anchor="middle" style="fill:var(--ink2);font-size:9px">human merges</text>
-  <g style="fill:none;stroke:var(--ink2);stroke-width:1.3"><path d="M120 88H142" marker-end="url(#i1)"/><path d="M240 88H262" marker-end="url(#i1)"/><path d="M360 88H382" marker-end="url(#i1)"/><path d="M494 88H516" marker-end="url(#i1)"/><path d="M614 88H636" marker-end="url(#i1)"/><path d="M566 60V36H439V58" marker-end="url(#i1)"/><path d="M192 116V150"/></g>
-  <text x="456" y="30" style="fill:var(--ink2);font-size:10px">revise (bounded)</text>
-  <text x="200" y="146" style="fill:var(--ink2);font-size:10px">questions back to the issue</text>
-  <rect x="144" y="176" width="470" height="40" rx="8" style="fill:var(--panel);stroke:var(--line);stroke-dasharray:4 3"/><text x="379" y="200" text-anchor="middle" style="fill:var(--ink2);font-size:11px">factory brain: short curated notes about the repo, read at the start of every run</text>
+<div class="svgwrap"><svg viewBox="0 0 760 230" width="760" style="max-width:100%;height:auto" role="img" aria-label="Foreman pipeline">
+  <defs><marker id="m1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="20" width="110" height="56" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="65.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Intake</text>
+  <text x="65.0" y="58.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">label, mention</text>
+  <rect x="136" y="20" width="110" height="56" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="191.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Triage</text>
+  <text x="191.0" y="58.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">lane, duplicates</text>
+  <path d="M122 48.0H133" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m1)"/>
+  <rect x="262" y="20" width="110" height="56" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="317.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Analyst</text>
+  <text x="317.0" y="58.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">plan, criteria</text>
+  <path d="M248 48.0H259" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m1)"/>
+  <rect x="388" y="20" width="110" height="56" rx="7" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="443.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Implementer</text>
+  <text x="443.0" y="58.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">own sandbox</text>
+  <path d="M374 48.0H385" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m1)"/>
+  <rect x="514" y="20" width="110" height="56" rx="7" style="fill:var(--bad-s);stroke:var(--bad)"/>
+  <text x="569.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Reviewer</text>
+  <text x="569.0" y="58.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">diff only</text>
+  <path d="M500 48.0H511" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m1)"/>
+  <rect x="646" y="20" width="104" height="56" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="698.0" y="44.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Draft PR</text>
+  <text x="698.0" y="58.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">human merges</text>
+  <path d="M626 48H642" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m1)"/>
+  <path d="M569 78V104H443V80" style="fill:none;stroke:var(--ink2);stroke-width:1.3;stroke-dasharray:4 3" marker-end="url(#m1)"/>
+  <text x="460" y="118" text-anchor="start" style="fill:var(--ink2);font-size:10px">revise (bounded)</text>
+  <path d="M317 78V140H65V80" style="fill:none;stroke:var(--ink2);stroke-width:1.3;stroke-dasharray:4 3" marker-end="url(#m1)"/>
+  <text x="120" y="154" text-anchor="start" style="fill:var(--ink2);font-size:10px">questions back to the issue</text>
+  <rect x="10" y="176" width="740" height="40" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="380.0" y="199.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">factory brain: short, curated, write-protected notes about the repo, read at the start of every run</text>
 </svg></div>
-<figcaption>Foreman's pipeline. Each station is its own agent with its own instructions, sandbox, tools and model.</figcaption>
+<figcaption>Figure 1. Foreman's pipeline (Vercel, built on eve). Each station is its own agent with its own instructions, sandbox, tools and model.</figcaption>
 </figure>
 
-<h2 id="tour">2. Code tour: Foreman</h2>
-<p><code>apps/templates/eve-software-factory-template/</code> is a complete, deployable factory. Read it in this order.</p>
-<ul>
-  <li><strong><code>agent/agent.ts</code></strong>: the orchestrator. Compaction at 75% of the window, and a session usage limit: stop when output passes 100,000 tokens or uncached input passes 40 million. "Crossing a limit asks an attended caller to continue; unattended work cannot wait."</li>
-  <li><strong><code>agent/lib/models.ts</code></strong>: one model per station, across vendors. Orchestrator and Implementer: Anthropic; Analyst and Classifier: a fast OpenAI model; Reviewer: a different OpenAI model; Researcher: Anthropic Opus; the triage decision: a Google model. Cheap models where judgement is narrow, strong ones where it is wide, and a reviewer that does not share the implementer's vendor.</li>
-  <li><strong><code>agent/subagents/</code></strong>: <code>classifier</code>, <code>analyst</code>, <code>implementer</code>, <code>reviewer</code>, <code>researcher</code>, each started by a <code>run_*</code> tool in <code>agent/tools/</code>.</li>
-  <li><strong><code>agent/channels/</code></strong>: <code>github.ts</code>, <code>linear.ts</code>, <code>intake.ts</code> (authenticated HTTP tickets), <code>eve.ts</code>. A <code>factory</code> label or an @mention starts work, but only from users GitHub verifies as having triage, write, maintain or admin rights.</li>
-  <li><strong><code>agent/lib/factory-brain.ts</code></strong>: the brain is "a short, curated set of durable notes about the target repository, not a transcript of every run", size-bounded, under a reserved storage prefix that only trusted callers may write.</li>
-  <li><strong><code>agent/tools/diagnose_ci_failure.ts</code></strong>: when CI goes red on a factory PR, Foreman classifies the failure first. Only code failures get a revision; missing logs, infrastructure, configuration and flaky failures stop for a person.</li>
-  <li><strong><code>evals/</code></strong>: <code>pipeline</code>, <code>routing</code> and <code>safety</code> suites. The factory is tested like the harness.</li>
-</ul>
-<p>The README's security details are worth copying: authenticated git runs in separate disposable transfer sandboxes, never in stations that execute repository code; only bounded git bundles cross that boundary; pushes target one branch prefix, refuse the default and protected branches and never force-push; label intake is at-most-once through a write-once claim; station sandboxes start with egress limited to GitHub and package registries, and install scripts are disabled by default.</p>
+<h2 id="decisions">2. The decisions, one at a time</h2>
+<h3 id="d-harness">Decision 1. Fork a harness, compose on one, or build one?</h3>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 166" width="760" style="max-width:100%;height:auto" role="img" aria-label="Factory foundations">
+  <defs><marker id="m2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <text x="10" y="18" text-anchor="start" style="fill:var(--ink);font-size:12px;font-weight:600">Fork</text>
+  <text x="10" y="34" text-anchor="start" style="fill:var(--ink2);font-size:10px">Stripe (Goose fork)</text>
+  <rect x="10" y="44" width="238" height="66" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="129.0" y="73.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">a heavily modified copy</text>
+  <text x="129.0" y="87.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">of an open-source harness</text>
+  <rect x="10" y="122" width="238" height="34" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="129.0" y="142.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">full control; you own the drift</text>
+  <text x="260" y="18" text-anchor="start" style="fill:var(--ink);font-size:12px;font-weight:600">Compose</text>
+  <text x="260" y="34" text-anchor="start" style="fill:var(--ink2);font-size:10px">Ramp (OpenCode), Foreman (eve)</text>
+  <rect x="260" y="44" width="238" height="66" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="379.0" y="66.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">stations are configured</text>
+  <text x="379.0" y="80.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">agents or subagents on</text>
+  <text x="379.0" y="94.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">an existing harness</text>
+  <rect x="260" y="122" width="238" height="34" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="379.0" y="142.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">fastest; bound to its design</text>
+  <text x="510" y="18" text-anchor="start" style="fill:var(--ink);font-size:12px;font-weight:600">Build</text>
+  <text x="510" y="34" text-anchor="start" style="fill:var(--ink2);font-size:10px">Coinbase, StrongDM</text>
+  <rect x="510" y="44" width="238" height="66" rx="7" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="629.0" y="73.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">an in-house harness</text>
+  <text x="629.0" y="87.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">for the factory</text>
+  <rect x="510" y="122" width="238" height="34" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="629.0" y="142.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">fits exactly; most work</text>
+</svg></div>
+<figcaption>Figure 2. Three companies reached the same architecture independently, from three different starting points.</figcaption>
+</figure>
+
+<h3 id="d-intake">Decision 2. Who may start work?</h3>
+<p>A factory triggered by any comment is a remote-control interface for anyone who can comment (Chapter 12). Foreman starts work from a factory label or a mention, but only from users GitHub verifies as having triage, write, maintain or admin rights, and label intake is at-most-once through a write-once claim, so a label applied twice does not start two runs. Public pull request content cannot start a privileged session. Its intake channels are GitHub, Linear and an authenticated HTTP ticket endpoint.</p>
+
+<h3 id="d-criteria">Decision 3. What does the plan contain?</h3>
+<p>The analyst station turns an issue into a plan with acceptance criteria that can be checked: commands to run, behaviours to observe, files that must not change. Criteria come before code because a check written after the code is shaped by it. If the issue is too vague to write criteria, the right output is a question back to the issue, not a guess.</p>
+
+<h3 id="d-models">Decision 4. Which model at which station?</h3>
+<p>Foreman assigns one model per station, across vendors: Anthropic models for the orchestrator and implementer, a fast OpenAI model for the analyst and classifier, a different OpenAI model for the reviewer, a stronger Anthropic model for research, and a Google model for the triage decision.</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 210" width="760" style="max-width:100%;height:auto" role="img" aria-label="Model per station">
+  <defs><marker id="m3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="14" width="177" height="56" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="98.5" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Orchestrator</text>
+  <text x="98.5" y="52.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">Anthropic</text>
+  <rect x="197" y="14" width="177" height="56" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="285.5" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Implementer</text>
+  <text x="285.5" y="52.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">Anthropic</text>
+  <rect x="384" y="14" width="177" height="56" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="472.5" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Analyst</text>
+  <text x="472.5" y="52.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">OpenAI, fast</text>
+  <rect x="571" y="14" width="177" height="56" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="659.5" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Classifier</text>
+  <text x="659.5" y="52.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">OpenAI, fast</text>
+  <rect x="10" y="84" width="177" height="56" rx="7" style="fill:var(--bad-s);stroke:var(--bad)"/>
+  <text x="98.5" y="108.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Reviewer</text>
+  <text x="98.5" y="122.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">OpenAI, different model</text>
+  <rect x="197" y="84" width="177" height="56" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="285.5" y="108.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Researcher</text>
+  <text x="285.5" y="122.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">Anthropic, strongest</text>
+  <rect x="384" y="84" width="177" height="56" rx="7" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="472.5" y="108.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Triage decision</text>
+  <text x="472.5" y="122.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">Google</text>
+  <text x="10" y="170" text-anchor="start" style="fill:var(--ink2);font-size:10px">Cheap models where judgement is narrow, strong ones where it is wide,</text>
+  <text x="10" y="186" text-anchor="start" style="fill:var(--ink2);font-size:10px">and a reviewer that does not share the implementer's vendor.</text>
+</svg></div>
+<figcaption>Figure 3. Foreman's model assignments. Vendor diversity at the review station is the point; the rest is cost.</figcaption>
+</figure>
+
+<h3 id="d-sandbox">Decision 5. How is the implementer isolated?</h3>
+<p>The implementer runs the repository's code: tests, builds, install scripts. That code is untrusted input (Chapter 7). Foreman's security design is worth copying in full.</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 230" width="760" style="max-width:100%;height:auto" role="img" aria-label="Foreman sandboxes">
+  <defs><marker id="m4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="20" width="340" height="130" rx="7" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="180.0" y="60.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Station sandbox (runs repo code)</text>
+  <text x="180.0" y="74.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">no git credentials</text>
+  <text x="180.0" y="88.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">egress: GitHub and package registries</text>
+  <text x="180.0" y="102.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">install scripts off by default</text>
+  <text x="180.0" y="116.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">receives a bounded git bundle</text>
+  <rect x="410" y="20" width="340" height="130" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="580.0" y="60.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Transfer sandbox (disposable)</text>
+  <text x="580.0" y="74.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">authenticated git only</text>
+  <text x="580.0" y="88.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">never runs repository code</text>
+  <text x="580.0" y="102.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">pushes to one branch prefix</text>
+  <text x="580.0" y="116.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">no default or protected branches, no force</text>
+  <path d="M352 85H406" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m4)"/>
+  <text x="358" y="78" text-anchor="start" style="fill:var(--ink2);font-size:10px">bundle</text>
+  <text x="10" y="180" text-anchor="start" style="fill:var(--ink2);font-size:10px">Only bounded git bundles cross the boundary. Credentials and untrusted code never share a machine.</text>
+  <text x="10" y="196" text-anchor="start" style="fill:var(--ink2);font-size:10px">Same idea as eve's trust zones (Chapter 7), applied to git.</text>
+</svg></div>
+<figcaption>Figure 4. Two sandboxes. The station that runs code has nothing to steal; the one with credentials runs nothing it did not write.</figcaption>
+</figure>
+
+<h3 id="d-review">Decision 6. How independent is the review?</h3>
+<p>Foreman's reviewer is a different model from a different vendor, sees only the diff and the criteria (never the implementer's reasoning, on purpose), and must give evidence for each verdict. A human still marks the pull request ready and merges. StrongDM went further, with a rule that code is neither written nor reviewed by humans; people write specifications and scenarios instead. Chapter 14 covers the verification gates in depth.</p>
+
+<h3 id="d-revise">Decision 7. How many revisions, and for which failures?</h3>
+<p>A model that failed twice on the same feedback is unlikely to succeed on the tenth try, while the bill keeps growing (fact 4). So the loop is bounded. Foreman adds a second filter: when CI goes red on a factory pull request, it classifies the failure first.</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 200" width="760" style="max-width:100%;height:auto" role="img" aria-label="CI failure classification">
+  <defs><marker id="m5" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="70" width="150" height="46" rx="7" style="fill:var(--bad-s);stroke:var(--bad)"/>
+  <text x="85.0" y="89.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">CI red on a</text>
+  <text x="85.0" y="103.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">factory PR</text>
+  <path d="M162 93H206" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m5)"/>
+  <rect x="210" y="70" width="150" height="46" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="285.0" y="89.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">classify the</text>
+  <text x="285.0" y="103.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">failure</text>
+  <path d="M362 93L420 45" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m5)"/>
+  <path d="M362 93L420 140" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m5)"/>
+  <rect x="424" y="20" width="326" height="46" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="587.0" y="39.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">code failure</text>
+  <text x="587.0" y="53.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">-> revision (bounded)</text>
+  <rect x="424" y="116" width="326" height="60" rx="7" style="fill:var(--panel2);stroke:var(--line)"/>
+  <text x="587.0" y="135.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">missing logs, infrastructure,</text>
+  <text x="587.0" y="149.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">configuration, flaky test</text>
+  <text x="587.0" y="163.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">-> stop for a person</text>
+</svg></div>
+<figcaption>Figure 5. Only code failures are fixed by revising code. Everything else needs someone with access the agent does not have.</figcaption>
+</figure>
+
+<h3 id="d-budget">Decision 8. What stops a runaway run?</h3>
+<p>Foreman's orchestrator compacts at 75% of the window and has a session usage limit: stop when output passes 100,000 tokens or uncached input passes 40 million. In its own words, crossing a limit asks an attended caller to continue; unattended work cannot wait. Open SWE, LangChain's packaging of the Stripe, Ramp and Coinbase pattern, lists budget limits as a core piece alongside isolated sandboxes and resumable sessions.</p>
+
+<h3 id="d-brain">Decision 9. What does the factory remember?</h3>
+<p>Memory across runs is loaded into every station's window, so it must be small. Foreman's factory brain is, in its own description, a short, curated set of durable notes about the target repository, not a transcript of every run. It is size-bounded and kept under a reserved storage prefix that only trusted callers may write, so a malicious issue cannot plant a permanent instruction (Chapter 6, decision 9).</p>
+
+<h3 id="d-test">Decision 10. How is the factory itself tested?</h3>
+<p>Foreman ships eval suites for its pipeline, its routing and its safety: does the right issue reach the right lane, does a stranger's label start nothing, does a red CI on infrastructure stop for a person. The factory is tested like the harness (Chapter 10), because it is one.</p>
 
 <h2 id="industry">3. Factories in industry</h2>
 <div class="tbl"><table>
   <tr><th>Company</th><th>System</th><th>Harness</th><th>Humans</th><th>Published result</th></tr>
-  <tr><td><a href="https://stripe.dev/blog/minions-stripes-one-shot-end-to-end-coding-agents-part-2">Stripe</a></td><td>Minions: unattended, one-shot, Slack to CI-passing PR</td><td>Heavily modified fork of Goose</td><td>Review every PR</td><td>1,300+ merged PRs a week with no human-written code</td></tr>
-  <tr><td>Ramp</td><td>Inspect</td><td>Composed on OpenCode</td><td>Review</td><td>Over half of merged PRs in its frontend and backend repos (<a href="https://ona.com/files/background_agents_white_paper.pdf">Ona</a>)</td></tr>
+  <tr><td>Stripe</td><td>Minions: unattended, one-shot, Slack to CI-passing pull request</td><td>Heavily modified fork of Goose</td><td>Review every pull request</td><td>1,300+ merged pull requests a week with no human-written code</td></tr>
+  <tr><td>Ramp</td><td>Inspect</td><td>Composed on OpenCode</td><td>Review</td><td>Over half of merged pull requests in its frontend and backend repos</td></tr>
   <tr><td>Coinbase</td><td>Cloudbot</td><td>Built from scratch</td><td>Review</td><td>Same architecture, reached independently</td></tr>
-  <tr><td><a href="https://simonwillison.net/2026/feb/7/software-factory/">StrongDM</a></td><td>Software Factory with the Attractor agent</td><td>In-house</td><td>Write specs and scenarios; review no code</td><td>Rules: code must not be written or reviewed by humans</td></tr>
+  <tr><td>StrongDM</td><td>Software Factory with its Attractor agent</td><td>In-house</td><td>Write specifications and scenarios; review no code</td><td>Rule: code is not written or reviewed by humans</td></tr>
   <tr><td>Vercel</td><td>Foreman</td><td>eve</td><td>Mark ready and merge</td><td>Open source, deployable</td></tr>
 </table></div>
-<p>LangChain packaged the shared Stripe, Ramp and Coinbase pattern as Open SWE: isolated cloud sandboxes, entry points in Slack, Linear and GitHub, curated tools, resumable sessions and budget limits (<a href="https://github.com/langchain-ai/open-swe">Open SWE</a>). Stripe's lesson, often repeated: tool curation matters more than tool count.</p>
+<p>Stripe's often-repeated lesson: tool curation matters more than tool count (Chapter 3).</p>
 
-<h3>Factory pieces inside the reference harnesses</h3>
-<p>None of the five reference harnesses is a factory, but each ships the parts one is built from, and which parts they chose says a lot.</p>
+<h2 id="harnesses">4. Factory parts in each harness</h2><p>Only eve ships a complete factory (Foreman). Each of the others ships parts, and which parts they chose says a lot.</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 140" width="760" style="max-width:100%;height:auto" role="img" aria-label="Factory parts">
+  <defs><marker id="m6" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <text x="10" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">eve</text>
+  <rect x="10" y="24" width="124" height="22" rx="4" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="72.0" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Foreman template</text>
+  <rect x="10" y="50" width="124" height="22" rx="4" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="72.0" y="64.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">stations</text>
+  <rect x="10" y="76" width="124" height="22" rx="4" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="72.0" y="90.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">channels</text>
+  <rect x="10" y="102" width="124" height="22" rx="4" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="72.0" y="116.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">evals</text>
+  <text x="146" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">Codex</text>
+  <rect x="146" y="24" width="110" height="22" rx="4" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="201.0" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">exec + schema</text>
+  <rect x="146" y="50" width="110" height="22" rx="4" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="201.0" y="64.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">review</text>
+  <rect x="146" y="76" width="110" height="22" rx="4" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="201.0" y="90.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">cloud tasks</text>
+  <text x="268" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">Claude Code</text>
+  <rect x="268" y="24" width="110" height="22" rx="4" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="323.0" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">print mode</text>
+  <rect x="268" y="50" width="110" height="22" rx="4" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="323.0" y="64.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">GitHub Actions</text>
+  <rect x="268" y="76" width="110" height="22" rx="4" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="323.0" y="90.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">custom agents</text>
+  <text x="390" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">Qwen Code</text>
+  <rect x="390" y="24" width="124" height="22" rx="4" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="452.0" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">autofix PR watch</text>
+  <rect x="390" y="50" width="124" height="22" rx="4" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="452.0" y="64.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">teams + approval</text>
+  <rect x="390" y="76" width="124" height="22" rx="4" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="452.0" y="90.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">worktrees</text>
+  <rect x="390" y="102" width="124" height="22" rx="4" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="452.0" y="116.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">GitHub, GitLab</text>
+</svg></div>
+<figcaption>Figure 6. The four with the most factory-shaped pieces.</figcaption>
+</figure>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 120" width="760" style="max-width:100%;height:auto" role="img" aria-label="Factory parts 2">
+  <defs><marker id="m7" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <text x="10" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">Kimi Code</text>
+  <rect x="10" y="24" width="124" height="22" rx="4" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="72.0" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">goals, deadlines</text>
+  <rect x="10" y="50" width="124" height="22" rx="4" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="72.0" y="64.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">cron</text>
+  <rect x="10" y="76" width="124" height="22" rx="4" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="72.0" y="90.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">swarm</text>
+  <text x="146" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">Trae Agent</text>
+  <rect x="146" y="24" width="110" height="22" rx="4" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="201.0" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">many attempts</text>
+  <rect x="146" y="50" width="110" height="22" rx="4" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="201.0" y="64.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">selector agent</text>
+  <text x="268" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">Pi</text>
+  <rect x="268" y="24" width="124" height="22" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="330.0" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Durable sessions</text>
+  <rect x="268" y="50" width="124" height="22" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="330.0" y="64.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">print mode</text>
+  <text x="404" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">fx</text>
+  <rect x="404" y="24" width="110" height="22" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="459.0" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">ask --json</text>
+  <rect x="404" y="50" width="110" height="22" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="459.0" y="64.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">libfx</text>
+  <text x="526" y="16" text-anchor="start" style="fill:var(--ink2);font-size:10px;font-weight:600">nanocode</text>
+  <rect x="526" y="24" width="131" height="22" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="591.5" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">durable task tree</text>
+  <rect x="526" y="50" width="131" height="22" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="591.5" y="64.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">cost fold</text>
+</svg></div>
+<figcaption>Figure 7. The others: long-running, scheduled, ensemble and embedding pieces.</figcaption>
+</figure>
+
 <ul>
-  <li><strong>Codex</strong> has the unattended pieces: <code>codex exec</code> with <code>--json</code> and <code>--output-schema</code> for CI, <code>codex review</code> against a base branch or commit, and cloud tasks (<code>codex-rs/cloud-tasks/</code>) that run in OpenAI's environments. Its flag for running without approvals or sandbox is named <code>--dangerously-bypass-approvals-and-sandbox</code> and documented as "intended solely for running in environments that are externally sandboxed": the factory, not the agent, must provide the boundary.</li>
-  <li><strong>Claude Code</strong> runs headless with <code>claude -p</code>, and Anthropic's GitHub Actions integration starts it from issue and PR comments. The paper's custom-agent frontmatter (tools, model, permission mode, isolation, max turns) is effectively a station definition.</li>
-  <li><strong>Qwen Code</strong> has the most factory-shaped code: an <code>autofix_pr</code> tool (<code>tools/autofix-pr.ts</code>) that runs a watch on a pull request and lets the fix agent run its commands unattended only after the user confirmed that watch; teams with a plan-approval step (<code>team_create</code>, <code>team_plan_approval</code>); git worktrees per agent; and GitHub and GitLab channels for intake.</li>
-  <li><strong>Kimi Code</strong> has goals with deadlines (<code>features/goal/</code>), cron, and a swarm mode, which are the long-running, scheduled parts of a factory.</li>
-  <li><strong>Trae Agent</strong> is a factory of attempts rather than of stations: generate many candidate patches, prune them, and let a selector agent choose (Chapter 14).</li>
+  <li><strong>Codex</strong> has the unattended pieces: exec with JSON and an output schema for CI, a review command against a base branch or commit, and cloud tasks that run in OpenAI's environments. Its flag for running without approvals or sandbox is named to warn and documented as intended solely for environments that are externally sandboxed: the factory, not the agent, must provide the boundary.</li>
+  <li><strong>Claude Code</strong> runs headless, and Anthropic's GitHub Actions integration starts it from issue and pull request comments. Its custom agent definitions (tools, model, permission mode, isolation, turn limit) are effectively station definitions.</li>
+  <li><strong>Qwen Code</strong> has the most factory-shaped code among the CLIs: an autofix tool that watches a pull request and lets the fix agent run unattended only after the user confirmed that watch; teams with a plan-approval step; worktrees per agent; and GitHub and GitLab channels for intake.</li>
+  <li><strong>Kimi Code</strong> has goals with deadlines, cron and a swarm mode: the long-running, scheduled parts of a factory.</li>
+  <li><strong>Trae Agent</strong> is a factory of attempts rather than of stations: generate many candidate patches, prune them, and let a selector choose (Chapter 14).</li>
+  <li><strong>Pi, fx and nanocode</strong> supply foundations: durable sessions, one-shot JSON modes, embeddable cores and cost accounting.</li>
 </ul>
 
-<h2 id="decisions">4. Design decisions</h2>
+<h2 id="compare">5. Foreman's decisions in one table</h2>
 <div class="tbl"><table>
   <tr><th>Decision</th><th>Options</th><th>Foreman's choice and why</th></tr>
-  <tr><td>Harness</td><td>Fork, compose, build</td><td>Compose on eve; stations are subagents</td></tr>
-  <tr><td>Review independence</td><td>Same model, other model, human</td><td>Other vendor, diff only, evidence per verdict, human merges</td></tr>
-  <tr><td>Who may start work</td><td>Anyone, collaborators, a label</td><td>Verified writers only; public PR content cannot start privileged sessions</td></tr>
-  <tr><td>Revision on failure</td><td>Always retry, classify first, stop</td><td>Classify CI failures; revise only for code failures</td></tr>
-  <tr><td>Memory across runs</td><td>None, transcripts, curated notes</td><td>A small, curated, write-protected factory brain</td></tr>
-  <tr><td>Spend control</td><td>None, per run, per session</td><td>Session usage limits; unattended runs stop at the limit</td></tr>
+  <tr><td>Foundation</td><td>Fork, compose, build</td><td>Compose on eve; stations are subagents</td></tr>
+  <tr><td>Who may start work</td><td>Anyone, collaborators, a label</td><td>Verified writers only; at-most-once label intake</td></tr>
+  <tr><td>Plan</td><td>None, free text, criteria</td><td>Checkable acceptance criteria before code</td></tr>
+  <tr><td>Models</td><td>One for all, one per station</td><td>One per station, across vendors</td></tr>
+  <tr><td>Isolation</td><td>Shared, one sandbox, split</td><td>Code sandbox without credentials; separate transfer sandbox</td></tr>
+  <tr><td>Review</td><td>Same model, other model, human</td><td>Other vendor, diff only, evidence per verdict; human merges</td></tr>
+  <tr><td>Revision</td><td>Always retry, classify, stop</td><td>Classify CI failures; revise only code failures, bounded</td></tr>
+  <tr><td>Spend</td><td>None, per run, per session</td><td>Session limits; unattended runs stop at the limit</td></tr>
+  <tr><td>Memory</td><td>None, transcripts, curated</td><td>Small, curated, write-protected factory brain</td></tr>
+  <tr><td>Testing</td><td>None, manual, evals</td><td>Pipeline, routing and safety eval suites</td></tr>
 </table></div>
 
-<h2 id="china">5. The Chinese view</h2>
+<h2 id="choose">6. Choosing a factory design</h2>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 274" width="760" style="max-width:100%;height:auto" role="img" aria-label="Choosing a factory">
+  <defs><marker id="m8" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="10" width="280" height="52" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="150.0" y="32.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Do you already run a</text>
+  <text x="150.0" y="46.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">harness you trust?</text>
+  <rect x="340" y="10" width="410" height="52" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="545.0" y="32.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Compose stations on it as subagents;</text>
+  <text x="545.0" y="46.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">fork or build only when it blocks you</text>
+  <path d="M292 36H336" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m8)"/>
+  <text x="300" y="30" text-anchor="start" style="fill:var(--ink2);font-size:10px">yes</text>
+  <rect x="10" y="76" width="280" height="52" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="150.0" y="98.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Will it run code from</text>
+  <text x="150.0" y="112.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">the repository?</text>
+  <rect x="340" y="76" width="410" height="52" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="545.0" y="98.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Split sandboxes: code without credentials,</text>
+  <text x="545.0" y="112.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">git with credentials and no code</text>
+  <path d="M292 102H336" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m8)"/>
+  <text x="300" y="96" text-anchor="start" style="fill:var(--ink2);font-size:10px">yes</text>
+  <rect x="10" y="142" width="280" height="52" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="150.0" y="171.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Can anyone trigger it?</text>
+  <rect x="340" y="142" width="410" height="52" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="545.0" y="164.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Verified writers only; at-most-once intake;</text>
+  <text x="545.0" y="178.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">public content never starts privileged work</text>
+  <path d="M292 168H336" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m8)"/>
+  <text x="300" y="162" text-anchor="start" style="fill:var(--ink2);font-size:10px">yes</text>
+  <rect x="10" y="208" width="280" height="52" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="150.0" y="237.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Will it run unattended?</text>
+  <rect x="340" y="208" width="410" height="52" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="545.0" y="230.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Session limits that stop, CI failure</text>
+  <text x="545.0" y="244.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">classification, bounded revisions</text>
+  <path d="M292 234H336" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m8)"/>
+  <text x="300" y="228" text-anchor="start" style="fill:var(--ink2);font-size:10px">yes</text>
+</svg></div>
+<figcaption>Figure 8. The safety answers matter more than the station layout.</figcaption>
+</figure>
+
+<h2 id="research">7. The Chinese view</h2>
 <ul>
-  <li>An Aliyun article on the "second half" of coding agents frames Stripe, Ramp and Coinbase converging on one architecture as the move from personal productivity to organization-level engineering systems, and lists the forcing problems: sandboxes, resumable sessions, many entry points (including Feishu) and budget limits (<a href="https://developer.aliyun.com/article/1742143">Aliyun</a>).</li>
-  <li>Chinese coverage of StrongDM's "lights-out factory" focused on the shock of a security company dropping human code review, and on its $1,000 per engineer per day token benchmark (<a href="https://eu.36kr.com/en/p/3675741413302915">36Kr</a>).</li>
+  <li>An Aliyun article on the "second half" of coding agents frames Stripe, Ramp and Coinbase converging on one architecture as the move from personal productivity to organisation-level engineering systems, and lists the forcing problems: sandboxes, resumable sessions, many entry points (including Feishu) and budget limits.</li>
+  <li>Chinese coverage of StrongDM's "lights-out factory" focused on a security company dropping human code review, and on its benchmark of $1,000 of tokens per engineer per day.</li>
+  <li>Qwen Code's autofix watch and team plan approval, and Kimi Code's goals and swarm, are the Chinese CLIs' factory pieces; Qwen Code's DingTalk, Feishu and WeCom channels (Chapter 12) are the natural intake for a factory in a Chinese company.</li>
 </ul>
 
-<h2 id="build">6. Build: four stations on your own repo</h2>
+<h2 id="build">8. Build: four stations on your own repo</h2>
 <pre>&quot;&quot;&quot;A small software factory: triage -&gt; analyst -&gt; implementer -&gt; reviewer -&gt; draft PR.
 Each station is your harness with its own prompt, tools, model and working copy.&quot;&quot;&quot;
 import json, re, subprocess
@@ -195,31 +456,34 @@ def open_draft_pr(result, issue, repo):
 <h3>Measure</h3>
 <p>File 10 small issues. Record for each: lane chosen, revisions used, review verdicts, whether you merged the PR unchanged, and cost. Your merge-unchanged rate is the factory's real score.</p>
 
-<h2 id="exercises">7. Exercises</h2>
+
+<h2 id="exercises">9. Exercises</h2>
 <ol>
-  <li>Add Foreman's CI-failure classifier: on a red check, decide code, flaky, infrastructure or configuration before spending a revision.</li>
-  <li>Add a factory brain update step: after a merged PR, the orchestrator proposes at most one new note; you approve it.</li>
-  <li>Swap the reviewer to the same vendor as the implementer and compare how often it approves a change you later reject.</li>
+  <li><strong>Criteria first.</strong> For five real issues, have the analyst write acceptance criteria, then implement. How many pull requests would a reviewer reject against the criteria?</li>
+  <li><strong>Independent review.</strong> Review the same ten diffs with the implementer's model and with a different vendor's model. Count real bugs each finds.</li>
+  <li><strong>CI classification.</strong> Collect 20 red CI runs and label them code, infrastructure, configuration or flaky. Build a classifier and measure how many wasted revisions it would have prevented.</li>
+  <li><strong>Split sandboxes.</strong> Move git credentials into a separate container that only receives bundles. Prove a test that prints the environment finds no token.</li>
+  <li><strong>Intake policy.</strong> Apply the factory label from a non-collaborator account and twice from a collaborator. Exactly one run should start.</li>
 </ol>
 
-<h2 id="quiz">8. Check yourself</h2>
+<h2 id="quiz">10. Check yourself</h2>
 <div class="widget quiz" data-quiz="qz13"></div>
 <script type="application/json" id="qz13">[
-{"q":"What does Foreman do when CI fails on its draft PR?","o":["Always revises","Classifies the failure first; only code failures get a revision, others stop for a person","Closes the PR","Retries CI forever"],"a":1,"e":"diagnose_ci_failure avoids spending revisions on flaky or infrastructure failures."},
-{"q":"What is Foreman's factory brain?","o":["A transcript of every run","A short, curated, size-bounded set of repo notes only trusted callers can write","The orchestrator model","A vector database"],"a":1,"e":"Small enough to load at the start of every task, protected from being used as a side channel."},
-{"q":"Which harness does Stripe's Minions build on?","o":["eve","A heavily modified fork of Block's Goose","OpenCode","Built from scratch"],"a":1,"e":"Ramp composed on OpenCode; Coinbase built from scratch."},
-{"q":"StrongDM's factory charter says:","o":["Humans review every PR","Code must not be written by humans and must not be reviewed by humans","Agents may not push code","Only one agent per repo"],"a":1,"e":"Humans write specs and scenarios and watch scores."},
-{"q":"Why does Foreman run authenticated git in separate transfer sandboxes?","o":["Speed","Stations execute repository code; credentials must never be reachable from that code","Git requires it","To save storage"],"a":1,"e":"Only bounded git bundles cross the boundary, without hooks or executables."}
+{"q":"Why split a factory into stations?","o":["To use more models","Each station gets a fresh, focused context, and the reviewer can be independent of the implementer","It is cheaper per token","Providers require it"],"a":1,"e":"Two samples with different blind spots catch more than one sample checked twice."},
+{"q":"Who may start work in Foreman?","o":["Anyone who comments","Users GitHub verifies as having triage, write, maintain or admin rights","Only admins","Only bots"],"a":1,"e":"Label intake is at-most-once through a write-once claim."},
+{"q":"Why does Foreman's reviewer use a different vendor's model?","o":["Cost","So its errors are independent of the implementer's","Speed","Licensing"],"a":1,"e":"It sees only the diff and the criteria, never the implementer's reasoning."},
+{"q":"What does Foreman do when CI fails on a factory PR?","o":["Always revises","Classifies the failure; only code failures get a revision, others stop for a person","Closes the PR","Retries CI forever"],"a":1,"e":"Infrastructure and flaky failures cannot be fixed by revising code."},
+{"q":"Why are git credentials in a separate transfer sandbox?","o":["Speed","Repository code is untrusted and must never share a machine with credentials","Git requires it","For logging"],"a":1,"e":"Only bounded git bundles cross the boundary."},
+{"q":"What are Foreman's session usage limits?","o":["None","Stop when output passes 100,000 tokens or uncached input passes 40 million","1 million tokens","Ten turns"],"a":1,"e":"Unattended work cannot wait for someone to approve more spend."},
+{"q":"What is the factory brain?","o":["A transcript of every run","A short, curated, size-bounded set of notes about the repository that only trusted callers may write","The orchestrator model","A vector database"],"a":1,"e":"It is loaded into every station, so it must be small and protected."},
+{"q":"What does Codex's documentation say about its flag to bypass approvals and sandbox?","o":["Use it by default","It is intended solely for environments that are externally sandboxed","It is deprecated","It is safe"],"a":1,"e":"The factory, not the agent, must provide the boundary."}
 ]</script>
 
-<h2 id="refs">9. References</h2>
+<h2 id="refs">11. References</h2>
 <ul>
-  <li>eve: <code>apps/templates/eve-software-factory-template/</code> (<code>README.md</code>, <code>agent/agent.ts</code>, <code>agent/lib/models.ts</code>, <code>agent/lib/factory-brain.ts</code>, <code>agent/tools/diagnose_ci_failure.ts</code>).</li>
-  <li><a href="https://stripe.dev/blog/minions-stripes-one-shot-end-to-end-coding-agents-part-2">Minions: Stripe's one-shot, end-to-end coding agents, Part 2</a>, 2026.</li>
-  <li><a href="https://simonwillison.net/2026/feb/7/software-factory/">How StrongDM's AI team build serious software without even looking at the code</a>, Simon Willison, Feb 2026.</li>
-  <li><a href="https://langchain.com/blog/open-swe-an-open-source-framework-for-internal-coding-agents">Open SWE</a>, LangChain, Mar 2026.</li>
-  <li><a href="https://factory.ai/news/software-factory">Factory 2.0: from coding agents to software factories</a>, Factory, Jun 2026.</li>
-  <li><a href="https://ona.com/files/background_agents_white_paper.pdf">Background agents white paper</a>, Ona.</li>
+  <li>Foreman (eve software factory template): <a href="https://github.com/vercel/eve">github.com/vercel/eve</a> (5c52fbf).</li>
+  <li>Codex CLI: <a href="https://github.com/openai/codex">github.com/openai/codex</a> (50aeac2). Claude Code: Dive into Claude Code, arXiv 2604.14228. Qwen Code: <a href="https://github.com/QwenLM/qwen-code">github.com/QwenLM/qwen-code</a> (c56424fc). Kimi Code: <a href="https://github.com/MoonshotAI/kimi-code">github.com/MoonshotAI/kimi-code</a> (111aae2). Trae Agent: <a href="https://github.com/bytedance/trae-agent">github.com/bytedance/trae-agent</a> (e839e55).</li>
+  <li>Stripe, Minions; Ramp, Inspect; StrongDM, Software Factory; LangChain, Open SWE.</li>
 </ul>
 
 <div class="navfoot"></div>
