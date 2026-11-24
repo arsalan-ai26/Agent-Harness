@@ -15,30 +15,390 @@
 <main><article>
 <div class="kicker">Stage 5 · Software factory · Chapter 15</div>
 <h1>Capstone: benchmark and retrospective</h1>
-<p class="lede">Sixteen weeks ago the loop was 120 lines. Now it has a provider layer, typed tools, cache-stable context, compaction, session trees, a safety gate, skills and hooks, subagents and Code Mode, evals, durability, a server, channels and a factory. This chapter measures it honestly against Pi, fx, Codex, Claude Code, Kimi Code, Qwen Code and Trae Agent on the same tasks, writes down what each design choice bought, and tags version 1.0.</p>
+<p class="lede">Sixteen weeks ago the loop was a page of code. Now it has a provider layer, typed tools, cache-stable context, compaction, session trees, a safety gate, skills and hooks, subagents and Code Mode, evals, durability, a server, channels and a factory. This chapter does three things. It measures your harness honestly against the reference harnesses on the same tasks. It pulls the whole book together: one profile per harness, one map of every decision, and a guide to choosing which kind of harness to build. And it closes with a retrospective and a release checklist for version 1.0.</p>
 <div class="meta">
   <span class="chip">Level: advanced</span>
   <span class="chip">Time: about 20 hours</span>
   <span class="chip">Needs: all earlier chapters</span>
-  <span class="chip">Facts checked: 22 Nov 2026</span>
+  <span class="chip">Facts checked: 24 Nov 2026</span>
 </div>
+
 
 <h2 id="why">1. Why compare against real harnesses</h2>
-<p>Your weekly eval tells you whether your harness improved. It does not tell you whether it is good. Reason from what a score is: a pass rate is produced jointly by the model, the harness and the tasks, and the model's outputs vary from run to run (fact 5). To learn what the harness contributes, you must hold the other two fixed and repeat enough to see through the noise. Running the other harnesses on the same tasks, with the same model where they allow it, separates three things: the model, the harness and the task. Several 2026 papers make the same point: benchmark scores mix model and harness, so honest comparisons hold one fixed while changing the other (<a href="https://arxiv.org/abs/2608.26218">Same model, different harness</a>).</p>
-<div class="box watch">
-  <span class="lbl">Safety</span>
-  <p>Pi has no permission gate, <code>fx ask --full-access</code> turns fx's checks off, and the flags in the runner below switch off the gates of Codex, Claude Code, Kimi Code and Qwen Code. Run every harness in this chapter inside a container with only the task's copy of the repository mounted.</p>
-</div>
+<p>Your weekly eval tells you whether your harness improved. It does not tell you whether it is good. A pass rate is produced jointly by the model, the harness and the tasks, and the model's output varies from run to run (fact 5). To learn what the harness contributes, hold the other two fixed and repeat enough to see through the noise.</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 200" width="760" style="max-width:100%;height:auto" role="img" aria-label="Three factors in a score">
+  <defs><marker id="m1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="30" width="160" height="60" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="90.0" y="56.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Model</text>
+  <text x="90.0" y="70.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">held fixed</text>
+  <text x="185" y="64" text-anchor="middle" style="fill:var(--ink);font-size:14px">x</text>
+  <rect x="200" y="30" width="160" height="60" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="280.0" y="56.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Harness</text>
+  <text x="280.0" y="70.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">the thing you vary</text>
+  <text x="375" y="64" text-anchor="middle" style="fill:var(--ink);font-size:14px">x</text>
+  <rect x="390" y="30" width="160" height="60" rx="7" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="470.0" y="56.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Tasks</text>
+  <text x="470.0" y="70.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">same set, plus a holdout</text>
+  <text x="580" y="64" text-anchor="start" style="fill:var(--ink);font-size:14px">=  pass rate</text>
+  <text x="10" y="130" text-anchor="start" style="fill:var(--ink2);font-size:10px">Several 2026 papers make the same point: benchmark scores mix model and harness, so honest comparisons</text>
+  <text x="10" y="146" text-anchor="start" style="fill:var(--ink2);font-size:10px">change one while holding the other fixed. A September 2026 survey adds the environment and the evaluator</text>
+  <text x="10" y="162" text-anchor="start" style="fill:var(--ink2);font-size:10px">as two more factors (Chapter 10).</text>
+</svg></div>
+<figcaption>Figure 1. Change one factor at a time, repeat, and report all of them.</figcaption>
+</figure>
+
+<div class="box watch"><span class="lbl">Safety</span><p>Pi has no permission gate, fx can run with full access, and the flags in the runner below switch off the gates of Codex, Claude Code, Kimi Code and Qwen Code. Run every harness in this chapter inside a container with only the task's copy of the repository mounted (Chapter 7).</p></div>
 
 <h2 id="method">2. Method</h2>
-<ol>
-  <li><strong>Tasks.</strong> Your test tasks from Chapter 1 and 10, plus at least 10 new ones you have never tuned against (a holdout). Optionally add a subset of Terminal-Bench 2.0 or Alibaba's Terminal-Bench Pro through their official runners.</li>
-  <li><strong>Models.</strong> Use the same model for all three where possible (fx talks to one provider at a time through Vercel AI Gateway, a subscription or any OpenAI-compatible endpoint; Pi supports most providers). Then repeat with each harness's preferred model.</li>
-  <li><strong>Repeats.</strong> At least 3 runs per task per harness. Report pass rate, mean time, mean cost and failure categories.</li>
-  <li><strong>Failure analysis.</strong> Read every failed transcript and label it: wrong plan, wrong edit, gave up, stopped early, tool misuse, environment, timeout.</li>
-</ol>
 
-<h2 id="build">3. Build: the comparison runner</h2>
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 170" width="760" style="max-width:100%;height:auto" role="img" aria-label="Benchmark method">
+  <defs><marker id="m2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="16" width="134" height="56" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="77.0" y="40.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">tasks: yours +</text>
+  <text x="77.0" y="54.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">10 holdout</text>
+  <rect x="161" y="16" width="134" height="56" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="228.0" y="40.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">same model</text>
+  <text x="228.0" y="54.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">where possible</text>
+  <path d="M146 44.0H158" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m2)"/>
+  <rect x="312" y="16" width="134" height="56" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="379.0" y="40.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">3+ runs per task</text>
+  <text x="379.0" y="54.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">per harness</text>
+  <path d="M297 44.0H309" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m2)"/>
+  <rect x="463" y="16" width="134" height="56" rx="7" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="530.0" y="40.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">in a container,</text>
+  <text x="530.0" y="54.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">fresh repo copy</text>
+  <path d="M448 44.0H460" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m2)"/>
+  <rect x="614" y="16" width="134" height="56" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="681.0" y="40.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">label every</text>
+  <text x="681.0" y="54.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">failure</text>
+  <path d="M599 44.0H611" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m2)"/>
+  <text x="10" y="100" text-anchor="start" style="fill:var(--ink2);font-size:10px">Report pass rate (training and holdout separately), mean time, mean cost and failure categories:</text>
+  <text x="10" y="116" text-anchor="start" style="fill:var(--ink2);font-size:10px">wrong plan, wrong edit, gave up, stopped early, tool misuse, environment, timeout.</text>
+  <text x="10" y="140" text-anchor="start" style="fill:var(--ink2);font-size:10px">Optional: a subset of Terminal-Bench 2.0 or Alibaba's Terminal-Bench Pro through their official runners.</text>
+</svg></div>
+<figcaption>Figure 2. The method from Chapter 10, applied across harnesses instead of across versions.</figcaption>
+</figure>
+
+<p>Use the same model for every harness where possible (Pi supports most providers; fx talks to one provider at a time through a gateway, a subscription or any OpenAI-compatible endpoint), then repeat with each harness's preferred model. The second run matters: Chapter 2 showed that models trained inside a harness behave best with its prompts and tool names, so a "same model" comparison can understate a vendor harness.</p>
+
+<h2 id="profiles">3. The nine harnesses at a glance</h2>
+<p>Each profile names the harness's central idea and its signature answer in each part of the book. Together they are the holistic view: nine coherent sets of trade-offs, not a ranking.</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 250" width="760" style="max-width:100%;height:auto" role="img" aria-label="Pi">
+  <defs><marker id="m3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="6" width="740" height="28" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="380.0" y="24.0" text-anchor="middle" style="fill:var(--ink);font-size:11px">Pi: a small core you can read, extended by code the agent writes</text>
+  <rect x="10" y="40" width="150" height="24" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="85.0" y="55.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Loop and model</text>
+  <text x="172" y="56" text-anchor="start" style="fill:var(--ink2);font-size:10px">minimal loop; many providers; transcript-declared tools and prompt sections</text>
+  <rect x="10" y="70" width="150" height="24" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="85.0" y="85.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Tools</text>
+  <text x="172" y="86" text-anchor="start" style="fill:var(--ink2);font-size:10px">read, write, edit, bash; tolerant multi-edit; saved output</text>
+  <rect x="10" y="100" width="150" height="24" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="85.0" y="115.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Context</text>
+  <text x="172" y="116" text-anchor="start" style="fill:var(--ink2);font-size:10px">one-sentence base prompt; AGENTS or CLAUDE files; section patches</text>
+  <rect x="10" y="130" width="150" height="24" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="85.0" y="145.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Sessions</text>
+  <text x="172" y="146" text-anchor="start" style="fill:var(--ink2);font-size:10px">append-only tree in one file; branch, fork, clone</text>
+  <rect x="10" y="160" width="150" height="24" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="85.0" y="175.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Safety</text>
+  <text x="172" y="176" text-anchor="start" style="fill:var(--ink2);font-size:10px">none built in; run it in a container</text>
+  <rect x="10" y="190" width="150" height="24" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="85.0" y="205.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Extensions</text>
+  <text x="172" y="206" text-anchor="start" style="fill:var(--ink2);font-size:10px">TypeScript extensions, hot reload; own MCP client</text>
+  <rect x="10" y="220" width="150" height="24" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="85.0" y="235.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Durability</text>
+  <text x="172" y="236" text-anchor="start" style="fill:var(--ink2);font-size:10px">Pi Durable: specification, effect sandwich, four stores</text>
+</svg></div>
+<figcaption>Figure 3. Pi.</figcaption>
+</figure>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 220" width="760" style="max-width:100%;height:auto" role="img" aria-label="eve">
+  <defs><marker id="m4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="6" width="740" height="28" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="380.0" y="24.0" text-anchor="middle" style="fill:var(--ink);font-size:11px">eve: an agent is a directory, deployed as a durable workflow</text>
+  <rect x="10" y="40" width="150" height="24" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="85.0" y="55.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Loop and model</text>
+  <text x="172" y="56" text-anchor="start" style="fill:var(--ink2);font-size:10px">step kernel returning the next step; workflow per session</text>
+  <rect x="10" y="70" width="150" height="24" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="85.0" y="85.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Tools</text>
+  <text x="172" y="86" text-anchor="start" style="fill:var(--ink2);font-size:10px">app-side tools proxying into a secret-free sandbox; deferred catalog</text>
+  <rect x="10" y="100" width="150" height="24" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="85.0" y="115.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Context</text>
+  <text x="172" y="116" text-anchor="start" style="fill:var(--ink2);font-size:10px">authored and computed instructions; memory slots recalled as content</text>
+  <rect x="10" y="130" width="150" height="24" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="85.0" y="145.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Safety</text>
+  <text x="172" y="146" text-anchor="start" style="fill:var(--ink2);font-size:10px">two trust zones; durable approvals</text>
+  <rect x="10" y="160" width="150" height="24" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="85.0" y="175.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Surfaces</text>
+  <text x="172" y="176" text-anchor="start" style="fill:var(--ink2);font-size:10px">HTTP API and many channels with a conformance kit</text>
+  <rect x="10" y="190" width="150" height="24" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="85.0" y="205.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Factory</text>
+  <text x="172" y="206" text-anchor="start" style="fill:var(--ink2);font-size:10px">Foreman: stations, split sandboxes, factory brain, evals</text>
+</svg></div>
+<figcaption>Figure 4. eve.</figcaption>
+</figure>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 220" width="760" style="max-width:100%;height:auto" role="img" aria-label="fx">
+  <defs><marker id="m5" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="6" width="740" height="28" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="380.0" y="24.0" text-anchor="middle" style="fill:var(--ink);font-size:11px">fx: a fast, embeddable core that treats its own outputs as untrusted</text>
+  <rect x="10" y="40" width="150" height="24" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="85.0" y="55.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Tools</text>
+  <text x="172" y="56" text-anchor="start" style="fill:var(--ink2);font-size:10px">dedicated file tools; process-session shell; 64 KB results with handles</text>
+  <rect x="10" y="70" width="150" height="24" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="85.0" y="85.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Context</text>
+  <text x="172" y="86" text-anchor="start" style="fill:var(--ink2);font-size:10px">operating manual; appended updates; folder rules on first touch</text>
+  <rect x="10" y="100" width="150" height="24" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="85.0" y="115.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Compaction</text>
+  <text x="172" y="116" text-anchor="start" style="fill:var(--ink2);font-size:10px">handles for every turn; notes linted against the record</text>
+  <rect x="10" y="130" width="150" height="24" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="85.0" y="145.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Safety</text>
+  <text x="172" y="146" text-anchor="start" style="fill:var(--ink2);font-size:10px">classifier that must quote evidence, confirmed twice</text>
+  <rect x="10" y="160" width="150" height="24" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="85.0" y="175.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Surfaces</text>
+  <text x="172" y="176" text-anchor="start" style="fill:var(--ink2);font-size:10px">one-shot JSON, ACP, Node addon and WebAssembly</text>
+  <rect x="10" y="190" width="150" height="24" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="85.0" y="205.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Quality</text>
+  <text x="172" y="206" text-anchor="start" style="fill:var(--ink2);font-size:10px">2 ms command budget and size budget in CI</text>
+</svg></div>
+<figcaption>Figure 5. fx.</figcaption>
+</figure>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 220" width="760" style="max-width:100%;height:auto" role="img" aria-label="nanocode">
+  <defs><marker id="m6" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="6" width="740" height="28" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="380.0" y="24.0" text-anchor="middle" style="fill:var(--ink);font-size:11px">nanocode: respect each vendor's native harness; one durable core everywhere</text>
+  <rect x="10" y="40" width="150" height="24" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="85.0" y="55.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Model layer</text>
+  <text x="172" y="56" text-anchor="start" style="fill:var(--ink2);font-size:10px">drivers reproduce each vendor's prompts and tools</text>
+  <rect x="10" y="70" width="150" height="24" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="85.0" y="85.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Tools</text>
+  <text x="172" y="86" text-anchor="start" style="fill:var(--ink2);font-size:10px">vendor tools or Code Mode (exec and wait)</text>
+  <rect x="10" y="100" width="150" height="24" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="85.0" y="115.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Sessions</text>
+  <text x="172" y="116" text-anchor="start" style="fill:var(--ink2);font-size:10px">append-only records on JSONL, SQL and edge stores</text>
+  <rect x="10" y="130" width="150" height="24" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="85.0" y="145.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Subagents</text>
+  <text x="172" y="146" text-anchor="start" style="fill:var(--ink2);font-size:10px">durable task tree; cells can spawn children</text>
+  <rect x="10" y="160" width="150" height="24" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="85.0" y="175.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Safety</text>
+  <text x="172" y="176" text-anchor="start" style="fill:var(--ink2);font-size:10px">bubblewrap, Landlock, seccomp, cgroups, egress proxy</text>
+  <rect x="10" y="190" width="150" height="24" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="85.0" y="205.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Accounting</text>
+  <text x="172" y="206" text-anchor="start" style="fill:var(--ink2);font-size:10px">cost fold by agent, turn, task, commit; invariants as numbers</text>
+</svg></div>
+<figcaption>Figure 6. nanocode.</figcaption>
+</figure>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 220" width="760" style="max-width:100%;height:auto" role="img" aria-label="Codex">
+  <defs><marker id="m7" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="6" width="740" height="28" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="380.0" y="24.0" text-anchor="middle" style="fill:var(--ink);font-size:11px">Codex: separate what is possible from when to ask, and enforce it in the OS</text>
+  <rect x="10" y="40" width="150" height="24" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="85.0" y="55.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Tools</text>
+  <text x="172" y="56" text-anchor="start" style="fill:var(--ink2);font-size:10px">shell-first; process sessions; patch grammar</text>
+  <rect x="10" y="70" width="150" height="24" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="85.0" y="85.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Context</text>
+  <text x="172" y="86" text-anchor="start" style="fill:var(--ink2);font-size:10px">typed sections that send only diffs with replace notices</text>
+  <rect x="10" y="100" width="150" height="24" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="85.0" y="115.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Compaction</text>
+  <text x="172" y="116" text-anchor="start" style="fill:var(--ink2);font-size:10px">handoff summary; server-side option; async start at 65%</text>
+  <rect x="10" y="130" width="150" height="24" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="85.0" y="145.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Safety</text>
+  <text x="172" y="146" text-anchor="start" style="fill:var(--ink2);font-size:10px">two dials; OS sandboxes; tested policy rules; evidence-based reviewer</text>
+  <rect x="10" y="160" width="150" height="24" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="85.0" y="175.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Memory</text>
+  <text x="172" y="176" text-anchor="start" style="fill:var(--ink2);font-size:10px">two-phase background pipeline into a git-tracked folder</text>
+  <rect x="10" y="190" width="150" height="24" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="85.0" y="205.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Surfaces</text>
+  <text x="172" y="206" text-anchor="start" style="fill:var(--ink2);font-size:10px">JSON-RPC app server; exec with output schema</text>
+</svg></div>
+<figcaption>Figure 7. Codex.</figcaption>
+</figure>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 220" width="760" style="max-width:100%;height:auto" role="img" aria-label="Claude Code">
+  <defs><marker id="m8" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="6" width="740" height="28" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="380.0" y="24.0" text-anchor="middle" style="fill:var(--ink);font-size:11px">Claude Code: one loop, layered defences, cheapest first</text>
+  <rect x="10" y="40" width="150" height="24" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="85.0" y="55.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Context</text>
+  <text x="172" y="56" text-anchor="start" style="fill:var(--ink2);font-size:10px">CLAUDE.md as user context; on-demand rules; re-injected after compaction</text>
+  <rect x="10" y="70" width="150" height="24" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="85.0" y="85.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Compaction</text>
+  <text x="172" y="86" text-anchor="start" style="fill:var(--ink2);font-size:10px">five stages from budget reduction to auto-compact</text>
+  <rect x="10" y="100" width="150" height="24" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="85.0" y="115.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Sessions</text>
+  <text x="172" y="116" text-anchor="start" style="fill:var(--ink2);font-size:10px">transcripts and sidechains; checkpoints per prompt; rewind code or words</text>
+  <rect x="10" y="130" width="150" height="24" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="85.0" y="145.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Safety</text>
+  <text x="172" y="146" text-anchor="start" style="fill:var(--ink2);font-size:10px">modes, deny-first rules, hooks, auto-mode classifier</text>
+  <rect x="10" y="160" width="150" height="24" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="85.0" y="175.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Extensions</text>
+  <text x="172" y="176" text-anchor="start" style="fill:var(--ink2);font-size:10px">33 hook events, skills with three levels, plugins</text>
+  <rect x="10" y="190" width="150" height="24" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="85.0" y="205.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Subagents</text>
+  <text x="172" y="206" text-anchor="start" style="fill:var(--ink2);font-size:10px">typed agents, worktrees, scanned and labelled reports</text>
+</svg></div>
+<figcaption>Figure 8. Claude Code (from its paper and documentation).</figcaption>
+</figure>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 220" width="760" style="max-width:100%;height:auto" role="img" aria-label="Kimi Code">
+  <defs><marker id="m9" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="6" width="740" height="28" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="380.0" y="24.0" text-anchor="middle" style="fill:var(--ink);font-size:11px">Kimi Code: the log is the truth; everything else is a projection</text>
+  <rect x="10" y="40" width="150" height="24" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="85.0" y="55.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Tools</text>
+  <text x="172" y="56" text-anchor="start" style="fill:var(--ink2);font-size:10px">dedicated tools with explicit budgets; Bash told to translate</text>
+  <rect x="10" y="70" width="150" height="24" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="85.0" y="85.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Context</text>
+  <text x="172" y="86" text-anchor="start" style="fill:var(--ink2);font-size:10px">typed system reminders; repeat breaker; folder reminders</text>
+  <rect x="10" y="100" width="150" height="24" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="85.0" y="115.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Compaction</text>
+  <text x="172" y="116" text-anchor="start" style="fill:var(--ink2);font-size:10px">detailed handoff plus a footer that says how to grep the log</text>
+  <rect x="10" y="130" width="150" height="24" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="85.0" y="145.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Sessions</text>
+  <text x="172" y="146" text-anchor="start" style="fill:var(--ink2);font-size:10px">event log per agent; undo by retraction record</text>
+  <rect x="10" y="160" width="150" height="24" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="85.0" y="175.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Safety</text>
+  <text x="172" y="176" text-anchor="start" style="fill:var(--ink2);font-size:10px">fifteen ordered policies; parsed shell commands</text>
+  <rect x="10" y="190" width="150" height="24" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="85.0" y="205.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Surfaces</text>
+  <text x="172" y="206" text-anchor="start" style="fill:var(--ink2);font-size:10px">server protocol behind TUI, web, desktop, VS Code; relay</text>
+</svg></div>
+<figcaption>Figure 9. Kimi Code.</figcaption>
+</figure>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 220" width="760" style="max-width:100%;height:auto" role="img" aria-label="Qwen Code">
+  <defs><marker id="m10" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="6" width="740" height="28" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="380.0" y="24.0" text-anchor="middle" style="fill:var(--ink);font-size:11px">Qwen Code: converge on proven designs, invest where users differ</text>
+  <rect x="10" y="40" width="150" height="24" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="85.0" y="55.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Tools</text>
+  <text x="172" y="56" text-anchor="start" style="fill:var(--ink2);font-size:10px">broad set behind tool search; read-before-write with fingerprints</text>
+  <rect x="10" y="70" width="150" height="24" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="85.0" y="85.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Context</text>
+  <text x="172" y="86" text-anchor="start" style="fill:var(--ink2);font-size:10px">tested order; user's text read last</text>
+  <rect x="10" y="100" width="150" height="24" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="85.0" y="115.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Compaction</text>
+  <text x="172" y="116" text-anchor="start" style="fill:var(--ink2);font-size:10px">Claude Code's thresholds; CJK token weighting; circuit breaker</text>
+  <rect x="10" y="130" width="150" height="24" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="85.0" y="145.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Safety</text>
+  <text x="172" y="146" text-anchor="start" style="fill:var(--ink2);font-size:10px">two-stage classifier that fails closed; Linux sandboxes</text>
+  <rect x="10" y="160" width="150" height="24" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="85.0" y="175.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Subagents</text>
+  <text x="172" y="176" text-anchor="start" style="fill:var(--ink2);font-size:10px">built-ins include Claude Code and Codex</text>
+  <rect x="10" y="190" width="150" height="24" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="85.0" y="205.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Surfaces</text>
+  <text x="172" y="206" text-anchor="start" style="fill:var(--ink2);font-size:10px">SDKs in three languages; DingTalk, Feishu, WeCom, WeChat, QQ</text>
+</svg></div>
+<figcaption>Figure 10. Qwen Code.</figcaption>
+</figure>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 190" width="760" style="max-width:100%;height:auto" role="img" aria-label="Trae Agent">
+  <defs><marker id="m11" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="6" width="740" height="28" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="380.0" y="24.0" text-anchor="middle" style="fill:var(--ink);font-size:11px">Trae Agent: a small, stable instrument for research</text>
+  <rect x="10" y="40" width="150" height="24" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="85.0" y="55.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Loop</text>
+  <text x="172" y="56" text-anchor="start" style="fill:var(--ink2);font-size:10px">fixed prompt, five tools, step cap</text>
+  <rect x="10" y="70" width="150" height="24" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="85.0" y="85.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Tools</text>
+  <text x="172" y="86" text-anchor="start" style="fill:var(--ink2);font-size:10px">persistent bash; view-create-replace editor</text>
+  <rect x="10" y="100" width="150" height="24" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="85.0" y="115.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Context</text>
+  <text x="172" y="116" text-anchor="start" style="fill:var(--ink2);font-size:10px">no project files; no compaction</text>
+  <rect x="10" y="130" width="150" height="24" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="85.0" y="145.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Evaluation</text>
+  <text x="172" y="146" text-anchor="start" style="fill:var(--ink2);font-size:10px">trajectories, step labels, SWE-bench</text>
+  <rect x="10" y="160" width="150" height="24" rx="4" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="85.0" y="175.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Verification</text>
+  <text x="172" y="176" text-anchor="start" style="fill:var(--ink2);font-size:10px">many attempts, regression filter, selector agent</text>
+</svg></div>
+<figcaption>Figure 11. Trae Agent.</figcaption>
+</figure>
+
+<h2 id="map">4. Every decision in one map</h2>
+<p>The book's main decisions, with the range of answers the nine harnesses chose. Use it as a checklist when you design your own.</p>
+<div class="tbl"><table>
+  <tr><th>Ch.</th><th>Decision</th><th>Range of answers</th></tr>
+  <tr><td>1</td><td>Loop shape and stop rule</td><td>Plain loop (Pi, Trae) to step kernel in a workflow (eve); stop on no tool calls, a done tool, or a checked stop</td></tr>
+  <tr><td>2</td><td>Provider layer</td><td>One normalised interface (Pi, eve) to vendor-native drivers (nanocode)</td></tr>
+  <tr><td>3</td><td>Shell or dedicated tools; edit format</td><td>Shell-first (Codex) to dedicated-first (fx, Kimi); exact, tolerant multi-edit or patch</td></tr>
+  <tr><td>4</td><td>Context layout and changes</td><td>Rebuild never; append diffs (Codex sections, fx updates, Pi patches)</td></tr>
+  <tr><td>5</td><td>Compaction</td><td>None (Trae) to five stages (Claude Code); lossless with handles or a log footer</td></tr>
+  <tr><td>6</td><td>History, state, memory</td><td>Line, tree or event log; memory by files, model or background pipeline</td></tr>
+  <tr><td>7</td><td>Safety</td><td>Container only (Pi, Trae) to two dials with OS sandbox and reviewer (Codex)</td></tr>
+  <tr><td>8</td><td>Extensions</td><td>MCP only (Trae) to 33 hook events and plugins (Claude Code)</td></tr>
+  <tr><td>9</td><td>Delegation</td><td>None (Pi, Trae) to typed agents, worktrees and other harnesses as subagents</td></tr>
+  <tr><td>10</td><td>Verification and traces</td><td>Checked stop; paired evals; local traces; cost fold</td></tr>
+  <tr><td>11</td><td>Durability</td><td>Rerun (Trae) to every effect journaled (Pi Durable, eve, nanocode)</td></tr>
+  <tr><td>12</td><td>Surfaces</td><td>CLI only to one core behind a protocol, SDKs and channels</td></tr>
+  <tr><td>13 to 14</td><td>Factory and gates</td><td>Parts (most) to a full factory (Foreman); single attempt to ensembles (Trae)</td></tr>
+</table></div>
+
+<h2 id="choose">5. Choosing what kind of harness to build</h2>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 360" width="760" style="max-width:100%;height:auto" role="img" aria-label="Harness archetypes">
+  <defs><marker id="m12" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="10" width="230" height="56" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="125.0" y="34.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Personal coding CLI</text>
+  <text x="125.0" y="48.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">you at the terminal, one repo</text>
+  <path d="M242 38H276" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m12)"/>
+  <rect x="280" y="10" width="470" height="56" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="515.0" y="41.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Pi's core + Codex's safety dials + Claude Code's staged compaction</text>
+  <rect x="10" y="78" width="230" height="56" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="125.0" y="102.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Embedded agent in a product</text>
+  <text x="125.0" y="116.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">your app, your tools, your users</text>
+  <path d="M242 106H276" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m12)"/>
+  <rect x="280" y="78" width="470" height="56" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="515.0" y="109.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">fx's or nanocode's embeddable core + Kimi's server protocol</text>
+  <rect x="10" y="146" width="230" height="56" rx="7" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="125.0" y="170.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Hosted multi-user agent</text>
+  <text x="125.0" y="184.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">channels, many users, long waits</text>
+  <path d="M242 174H276" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m12)"/>
+  <rect x="280" y="146" width="470" height="56" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="515.0" y="177.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">eve's directory, durable workflow, trust zones and channels</text>
+  <rect x="10" y="214" width="230" height="56" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="125.0" y="238.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Unattended software factory</text>
+  <text x="125.0" y="252.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">issues in, pull requests out</text>
+  <path d="M242 242H276" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m12)"/>
+  <rect x="280" y="214" width="470" height="56" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="515.0" y="245.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Foreman's stations + Codex's sandbox + Trae's ensembles + holdouts</text>
+  <rect x="10" y="282" width="230" height="56" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="125.0" y="306.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Research instrument</text>
+  <text x="125.0" y="320.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">benchmarks and ablations</text>
+  <path d="M242 310H276" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m12)"/>
+  <rect x="280" y="282" width="470" height="56" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="515.0" y="313.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Trae Agent's fixed prompt, small tool set and trajectories</text>
+</svg></div>
+<figcaption>Figure 12. Five archetypes and the reference designs to borrow for each. Most real projects start as the first and grow toward another.</figcaption>
+</figure>
+
+<p>Whichever you choose, five decisions are hard to change later and should be settled first: the log format (Chapter 6), whether effects are journaled (Chapter 11), where the safety boundary is (Chapter 7), how context changes are delivered (Chapter 4), and whether the core sits behind a session API (Chapter 12). Everything else can be added when its absence costs you.</p>
+
+<h2 id="china">6. The Chinese view, across the book</h2>
+<ul>
+  <li><strong>Kimi Code</strong> is the purest event-sourced design read for this book, with the best compaction prompt and the clearest tool descriptions about the cost of delegation.</li>
+  <li><strong>Qwen Code</strong> shows that borrowing a proven design is a strategy: Claude Code's thresholds and hook names, Gemini CLI's context files, then real investment where its users differ (CJK token counts, Chinese workplace channels, a DashScope search backend, other harnesses as subagents).</li>
+  <li><strong>Trae Agent</strong> shows that a small harness is the right instrument for research, and that breadth can come from many attempts plus a selector.</li>
+  <li><strong>Practice.</strong> Zero-tolerance AGENTS.md, "harness is the new dataset", semantic gradient descent, and skills marketplaces from Alibaba, ByteDance and Tencent: Chinese teams treat the harness, not the model, as where most competition now happens.</li>
+</ul>
+
+<h2 id="build">7. Build: the comparison runner</h2>
 <pre>&quot;&quot;&quot;Capstone: run three harnesses headless on the same tasks, same model where possible, and compare.&quot;&quot;&quot;
 import json, shutil, subprocess, sys, tempfile, time
 from pathlib import Path
@@ -85,50 +445,55 @@ if __name__ == &quot;__main__&quot;:
     main(*sys.argv[1:3])</pre>
 <p>Run it as <code>python capstone.py tasks/ scratch-repo/</code>. Add token and cost columns where a harness reports them (your own harness and fx's JSON output; Pi's session files record usage).</p>
 
-<h2 id="report">4. The results table to publish</h2>
+
+<h2 id="report">8. The results table to publish</h2>
 <div class="tbl"><table>
-  <tr><th>Harness</th><th>Model</th><th>Pass rate (train)</th><th>Pass rate (holdout)</th><th>Mean time</th><th>Mean cost</th><th>Top failure</th></tr>
+  <tr><th>Harness</th><th>Model</th><th>Pass rate (training)</th><th>Pass rate (holdout)</th><th>Mean time</th><th>Mean cost</th><th>Top failure</th></tr>
   <tr><td>Yours</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
   <tr><td>Pi</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
   <tr><td>fx</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+  <tr><td>Codex</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+  <tr><td>Claude Code</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+  <tr><td>Kimi Code</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+  <tr><td>Qwen Code</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+  <tr><td>Trae Agent</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
 </table></div>
-<p class="note">Fill this in with your measured numbers. If your harness wins on your training tasks but loses on the holdout, say so; that is the most useful finding in the book.</p>
+<p>Fill this in with your measured numbers. If your harness wins on your training tasks but loses on the holdout, say so; that is the most useful finding in the book.</p>
 
-<h2 id="retro">5. Retrospective: what each choice bought</h2>
+<h2 id="retro">9. Retrospective: what each choice bought</h2>
 <p>For each feature, write which of the six facts it answers, the measured effect from your weekly evals, and one sentence on whether you would build it again. If a feature answers a fact but showed no measured effect, ask whether the fact simply did not bite on your tasks (short sessions never hit fact 3) before deleting it.</p>
 <div class="tbl"><table>
-  <tr><th>Chapter</th><th>Choice</th><th>Borrowed from</th><th>Measured effect</th><th>Keep?</th></tr>
-  <tr><td>1</td><td>Step function loop</td><td>eve</td><td></td><td></td></tr>
-  <tr><td>2</td><td>Two provider adapters, retries, cache accounting</td><td>Pi, eve, nanocode</td><td></td><td></td></tr>
-  <tr><td>3</td><td>Bounded output, multi-edit, background jobs</td><td>Pi, eve</td><td></td><td></td></tr>
-  <tr><td>4</td><td>Stable prefix, appended updates, folder rules</td><td>fx, Codex</td><td></td><td></td></tr>
-  <tr><td>5</td><td>Compaction with handles and lint</td><td>fx, eve</td><td></td><td></td></tr>
-  <tr><td>6</td><td>Session tree, memory outside history</td><td>Pi, eve</td><td></td><td></td></tr>
-  <tr><td>7</td><td>Rules, evidence-checked classifier, Docker</td><td>fx, eve, nanocode</td><td></td><td></td></tr>
-  <tr><td>8</td><td>Skills, hooks, MCP</td><td>eve, fx, Pi</td><td></td><td></td></tr>
-  <tr><td>9</td><td>Subagents and Code Mode</td><td>nanocode, Pi</td><td></td><td></td></tr>
-  <tr><td>10</td><td>Paired evals and traces</td><td>Pi, eve</td><td></td><td></td></tr>
-  <tr><td>11</td><td>Journal with the effect sandwich</td><td>Pi Durable</td><td></td><td></td></tr>
-  <tr><td>12</td><td>Session server and channels</td><td>eve, fx</td><td></td><td></td></tr>
-  <tr><td>13 to 14</td><td>Factory stations, gates, improvement loop</td><td>Foreman, StrongDM, Meta-Harness</td><td></td><td></td></tr>
+  <tr><th>Ch.</th><th>Choice</th><th>Borrowed from</th><th>Fact</th><th>Measured effect</th><th>Keep?</th></tr>
+  <tr><td>1</td><td>Step function loop</td><td>eve</td><td>2, 6</td><td></td><td></td></tr>
+  <tr><td>2</td><td>Two provider adapters, retries, cache accounting</td><td>Pi, eve, nanocode</td><td>4, 6</td><td></td><td></td></tr>
+  <tr><td>3</td><td>Bounded output, multi-edit, background jobs</td><td>Pi, eve</td><td>1, 3</td><td></td><td></td></tr>
+  <tr><td>4</td><td>Stable prefix, appended updates, folder rules</td><td>fx, Codex</td><td>3, 4</td><td></td><td></td></tr>
+  <tr><td>5</td><td>Compaction with handles and lint</td><td>fx, Kimi Code</td><td>3, 5</td><td></td><td></td></tr>
+  <tr><td>6</td><td>Session tree, memory outside history</td><td>Pi, eve</td><td>2</td><td></td><td></td></tr>
+  <tr><td>7</td><td>Rules, evidence-checked classifier, container</td><td>Codex, fx, eve</td><td>5, 6</td><td></td><td></td></tr>
+  <tr><td>8</td><td>Skills, hooks, MCP</td><td>Claude Code, fx, Pi</td><td>3, 5</td><td></td><td></td></tr>
+  <tr><td>9</td><td>Subagents and Code Mode</td><td>Claude Code, nanocode</td><td>2, 3, 4</td><td></td><td></td></tr>
+  <tr><td>10</td><td>Checked stop, paired evals, traces</td><td>Pi, Codex, Trae</td><td>5</td><td></td><td></td></tr>
+  <tr><td>11</td><td>Journal with the effect sandwich</td><td>Pi Durable, Qwen Code</td><td>6</td><td></td><td></td></tr>
+  <tr><td>12</td><td>Session server and channels</td><td>Kimi Code, eve</td><td>1, 6</td><td></td><td></td></tr>
+  <tr><td>13 to 14</td><td>Stations, gates, improvement loop</td><td>Foreman, StrongDM, Meta-Harness</td><td>3, 5</td><td></td><td></td></tr>
 </table></div>
 
-<h2 id="lessons">6. Lessons the harnesses teach</h2>
+<h2 id="lessons">10. Lessons the harnesses teach</h2>
 <ul>
   <li><strong>Pi:</strong> a small core you can read in an afternoon beats a large one you cannot. Add a feature when its absence costs you, not before.</li>
-  <li><strong>fx:</strong> treat your own outputs as untrusted. fx checks its summaries against the record and makes its safety reviewer prove its claims.</li>
-  <li><strong>eve:</strong> shape the loop for durability from day one, and keep secrets out of the place where the model's commands run.</li>
-  <li><strong>nanocode:</strong> respect each model's native harness, and state your invariants as numbers you can test.</li>
   <li><strong>Pi Durable:</strong> write the specification before the code when correctness is hard. The effect sandwich fits on a napkin and prevents a class of bugs.</li>
-  <li><strong>Codex:</strong> separate what is possible (the sandbox) from when to ask (approvals), and enforce the first in the operating system. Test your rules the way you test code.</li>
-  <li><strong>Claude Code:</strong> order your context defences from cheapest to most lossy, and never rewrite the record; patch the view when it is read.</li>
+  <li><strong>eve:</strong> shape the loop for durability from day one, and keep secrets out of the place where the model's commands run.</li>
+  <li><strong>fx:</strong> treat your own outputs as untrusted. Check summaries against the record and make the safety reviewer prove its claims.</li>
+  <li><strong>nanocode:</strong> respect each model's native harness, and state your invariants as numbers you can test.</li>
+  <li><strong>Codex:</strong> separate what is possible from when to ask, enforce the first in the operating system, and test your rules like code.</li>
+  <li><strong>Claude Code:</strong> order your defences from cheapest to most lossy, and never rewrite the record; patch the view when it is read.</li>
   <li><strong>Kimi Code:</strong> make the log the truth and everything else a projection, then tell the model where the log is.</li>
-  <li><strong>Qwen Code:</strong> borrowing a proven design is a strategy. Converge on what works and spend your effort where your users differ (models, language, channels).</li>
-  <li><strong>Trae Agent:</strong> a small, stable harness is the right instrument for experiments, and breadth can come from many attempts plus a good selector instead of more features.</li>
-  <li><strong>Chinese practice:</strong> every rule must trace to a failure, and the harness, not the model, is where most teams now compete.</li>
+  <li><strong>Qwen Code:</strong> converge on what works and spend your effort where your users differ.</li>
+  <li><strong>Trae Agent:</strong> a stable harness is the right instrument for experiments, and breadth can come from many attempts plus a good selector.</li>
 </ul>
 
-<h2 id="release">7. Release checklist for v1.0</h2>
+<h2 id="release">11. Release checklist for v1.0</h2>
 <ul>
   <li>README with a 60-second quick start, the results table and a link to this book.</li>
   <li>A container image that runs the harness safely by default.</li>
@@ -137,31 +502,29 @@ if __name__ == &quot;__main__&quot;:
   <li>A tagged release and a final post: what you built, what it scores, what you would do differently.</li>
 </ul>
 
-<h2 id="next">8. Where to go next</h2>
+<h2 id="next">12. Where to go next</h2>
 <ul>
   <li>Contribute one fix upstream to Pi, fx, eve, nanocode, Codex, Kimi Code, Qwen Code or Trae Agent, in a component you now understand deeply.</li>
   <li>Read the research frontier: harness search (Meta-Harness), natural-language harnesses (NLAH), harness-aware evaluation, and test-time harness evolution.</li>
   <li>Run your factory on a real project for a month and publish the merge-unchanged rate.</li>
 </ul>
 
-
-<h2 id="quiz">Check yourself</h2>
+<h2 id="quiz">13. Check yourself</h2>
 <div class="widget quiz" data-quiz="qz15"></div>
 <script type="application/json" id="qz15">[
-{"q":"Why run other harnesses on the same tasks as your harness?","o":["To copy their prompts","To separate the effect of the harness from the model and the task","Because your evals are wrong","To get a higher score"],"a":1,"e":"Holding the model and tasks fixed while changing the harness shows what the harness itself contributes."},
-{"q":"Your harness wins on training tasks but loses on the holdout. What does that most likely mean?","o":["The holdout is broken","You overfit the harness to tasks you tuned against","The model got worse","Pi cheated"],"a":1,"e":"Tuning against a fixed set of tasks can produce gains that do not generalize. Publishing this is the honest result."},
-{"q":"Why run every harness in a container for this chapter?","o":["Containers are faster","Pi has no permission gate and fx can run with full access, so isolation is the safety boundary","fx only runs in Docker","To share a cache"],"a":1,"e":"Without a gate, the container and the mounted copy of the repo are what limit damage."},
-{"q":"How many runs per task per harness does the method ask for at minimum?","o":["1","3","10","100"],"a":1,"e":"Agent runs vary. At least three repeats give a rough pass rate instead of a single coin flip."},
-{"q":"What should every rule in your v1.0 AGENTS.md name?","o":["The author","The model it was tested on","The failure that created it","Its token cost"],"a":2,"e":"Tying each rule to the failure behind it keeps the file short and lets you delete rules that no longer matter."}
+{"q":"Why run other harnesses on the same tasks as yours?","o":["To copy their prompts","To separate the harness's effect from the model's and the tasks'","Because your evals are wrong","To get a higher score"],"a":1,"e":"Hold the model and tasks fixed while changing the harness."},
+{"q":"Why also run each harness with its preferred model?","o":["It is cheaper","Models trained inside a harness behave best with its prompts and tools, so a same-model run can understate it","To use more tokens","For licensing"],"a":1,"e":"Chapter 2: nanocode reproduces vendor prompts for this reason."},
+{"q":"Your harness wins on training tasks but loses on the holdout. What does that mean?","o":["The holdout is broken","You overfit the harness to tasks you tuned against","The model got worse","Another harness cheated"],"a":1,"e":"Publishing it is the honest result."},
+{"q":"Which five decisions are hardest to change later?","o":["Colours, fonts, names, icons, logos","Log format, effect journaling, safety boundary, context-change delivery, session API","Model, provider, price, region, language","Tests, lint, types, docs, CI"],"a":1,"e":"Everything else can be added when its absence costs you."},
+{"q":"Which archetype borrows most from eve?","o":["Research instrument","Hosted multi-user agent","Personal CLI","None"],"a":1,"e":"Directory as contract, durable workflows, trust zones and channels."},
+{"q":"What should every rule in your v1.0 AGENTS.md name?","o":["The author","The model it was tested on","The failure that created it","Its token cost"],"a":2,"e":"It keeps the file short and lets you delete rules that no longer matter."}
 ]</script>
 
-<h2 id="refs">9. References</h2>
+<h2 id="refs">14. References</h2>
 <ul>
-  <li>Pi: <code>pi --print</code> (non-interactive mode), <a href="https://github.com/earendil-works/pi">earendil-works/pi</a>.</li>
-  <li>fx: <code>fx ask --json</code>, <a href="https://github.com/vercel-labs/fx">vercel-labs/fx</a>.</li>
-  <li><a href="https://arxiv.org/pdf/2609.00006">Harness Engineering: a source-code study of eleven coding-agent systems</a>, 2026.</li>
-  <li><a href="https://www.preprints.org/manuscript/202609.2140">Harness-aware evaluation of LLM agents</a>, 2026.</li>
-  <li><a href="https://arxiv.org/abs/2608.26218">Same model, different harness</a>, 2026.</li>
+  <li>Pi <a href="https://github.com/earendil-works/pi">github.com/earendil-works/pi</a>; eve <a href="https://github.com/vercel/eve">github.com/vercel/eve</a>; fx <a href="https://github.com/vercel-labs/fx">github.com/vercel-labs/fx</a>; nanocode <a href="https://github.com/gakonst/nanocode">github.com/gakonst/nanocode</a>; Codex <a href="https://github.com/openai/codex">github.com/openai/codex</a>; Kimi Code <a href="https://github.com/MoonshotAI/kimi-code">github.com/MoonshotAI/kimi-code</a>; Qwen Code <a href="https://github.com/QwenLM/qwen-code">github.com/QwenLM/qwen-code</a>; Trae Agent <a href="https://github.com/bytedance/trae-agent">github.com/bytedance/trae-agent</a>.</li>
+  <li>Claude Code: <a href="https://code.claude.com/docs">documentation</a>; Dive into Claude Code, arXiv 2604.14228.</li>
+  <li>Harness Engineering: a source-code study of eleven coding-agent systems, 2026. Harness-aware evaluation of LLM agents, 2026. Same model, different harness, 2026.</li>
 </ul>
 
 <div class="navfoot"></div>
