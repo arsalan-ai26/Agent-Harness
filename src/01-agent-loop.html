@@ -1,149 +1,979 @@
 <div class="kicker">Stage 1 · Foundations · Chapter 1</div>
 <h1>The agent loop</h1>
-<p class="lede">The loop exists because the model can neither act nor remember (facts 1 and 2 from Chapter 0), so something has to alternate between asking it and acting for it. It is the smallest part of a harness and the one every other part plugs into. This chapter shows how four harnesses shape it, why eve does not loop at all, and how the shape you choose today decides whether your agent can become durable later. You end the chapter with a working 120-line agent and a baseline score.</p>
+<p class="lede">The model can neither act nor remember (facts 1 and 2 from Chapter 0), so something has to alternate between asking it and acting for it. That alternation is the agent loop. It looks like ten lines of code, and every harness agrees on those ten lines. They disagree on everything around them: who owns the loop, when a turn is allowed to end, when tools start, what happens to a message typed mid-turn, where retries live and what a crash costs. This chapter takes those decisions one at a time, shows how nine harnesses answered each one and why, and ends with a working agent you build yourself.</p>
 <div class="meta">
   <span class="chip">Level: intermediate</span>
   <span class="chip">Time: about 20 hours with the build</span>
   <span class="chip">Needs: Python 3.11+, an API key for any OpenAI-compatible endpoint</span>
-  <span class="chip">Code read at: Pi fb248c7, eve 5c52fbf, fx cbe7daf, nanocode 015cbfa</span>
+  <span class="chip">Harnesses read: Pi, Pi Durable, eve, fx, nanocode, Codex, Claude Code, Kimi Code, Qwen Code, Trae Agent</span>
 </div>
 
 <div class="box skip">
   <span class="lbl">Before you start: skip check</span>
   <ol>
-    <li>What is the difference between a turn and a step?</li>
-    <li>A user types a correction while the agent is running tools. When should the model see it?</li>
-    <li>Why would you write the loop body as a function that returns the next state instead of a <code>while</code> loop?</li>
+    <li>What is the difference between a turn and a step, and why does Pi use the word "turn" for what eve calls a "step"?</li>
+    <li>A user types a correction while the agent is running tools. Name three different moments a harness could deliver it, and one harness that uses each.</li>
+    <li>Codex and Claude Code start a tool before the model has finished its reply. What does that buy, and what does it make harder?</li>
+    <li>Why can't "the model replied without a tool call" be the only way a turn ends?</li>
   </ol>
   <details><summary>Answers</summary><ol>
-    <li>A turn is one user message and all the work until the agent replies. A step is one model call plus the tool calls it asked for. A turn has one or more steps.</li>
-    <li>Before the next model call: queue it, and deliver it at the next step boundary (this is "steering").</li>
-    <li>Each return is a natural checkpoint. You can save the state, crash, and continue from the last step. That is how eve becomes durable.</li>
+    <li>A step is one model call plus the tool calls it asked for; a turn is one user input and every step until the agent answers. Pi's loop calls one model reply plus its tool calls a "turn" and the whole run an "agent run". The concepts are the same; the names are not, so always check a harness's glossary.</li>
+    <li>At the next step boundary (Pi's steering queue, Codex, fx, Kimi Code), by cancelling a model call that has not produced output yet (eve's default steering, nanocode's optional preemption), or only after the turn ends (Pi's follow-up queue, eve's <code>queue</code> policy).</li>
+    <li>Latency: a slow read can run while the model is still writing the rest of its reply. It makes ordering, cancellation and permission checks harder, because a tool can be running while the reply that asked for it is still incomplete.</li>
+    <li>That signal is a sample (fact 5). A model can stop before the work is done, or never stop. Every serious harness adds checks it does not leave to the model: limits, loop detectors, budgets, stop hooks and completion checks.</li>
   </ol></details>
 </div>
 
-<h2 id="vocab">1. Turn, step, run, session</h2>
-<p>Start from fact 2: the model is stateless, so the only state an agent has is the message list the harness keeps. That list changes at exactly one kind of moment: after the model replies and its tool calls have run. Between those moments nothing new exists. So the natural unit of an agent is that change, and every other unit is a group of them. This is why harnesses save, resume and accept new input at these boundaries and nowhere else, and why the words need to be exact.</p>
-<div class="box def">
-  <span class="lbl">Definitions</span>
-  <p><strong>Step:</strong> one model call plus the tool calls it asks for. The smallest unit that changes the conversation.</p>
-  <p><strong>Turn:</strong> one user input and every step it triggers until the model answers without a tool call.</p>
-  <p><strong>Run:</strong> Pi Durable's word for the steps from one admitted input to the final answer, possibly including follow-up input that arrived meanwhile.</p>
-  <p><strong>Session:</strong> all turns of one conversation. It can span days.</p>
-  <p><strong>Steering message:</strong> user input that arrives while a turn is running. <strong>Follow-up message:</strong> input that arrives just as the agent was about to stop.</p>
-</div>
 
-<h2 id="anatomy">2. What the loop must decide</h2>
-<p>The toy loop from Chapter 0 hides six decisions. You can derive each one, and the reasonable answers, from the facts.</p>
-<ol>
-  <li><strong>When to stop.</strong> The only signal the model can give is text, so "I am done" is a reply with no tool call. But that signal is a sample (fact 5): the model can stop too early or never stop. So the harness needs its own limits it does not delegate to the model: step limits, token budgets, cancellation, and stop hooks that check the world (for example "tests still fail") before accepting the stop.</li>
-  <li><strong>How to run several tool calls.</strong> A model can ask for five reads at once. Tools act on a stateful world (fact 6). Reads do not change it, so their order does not matter and running them in parallel only saves time. Writes do change it, so two writes to one file must run in order. The rule follows: parallel by default, sequential when tools share state.</li>
-  <li><strong>When new user input is seen.</strong> The model reads its input once, at the start of a call (fact 2). A message that arrives mid-call cannot reach it until the next call. So the only real choice is between cancelling the current step or queueing the message for the next step boundary.</li>
-  <li><strong>What happens between steps.</strong> The step boundary is the only moment the message list is complete and consistent, so it is the only safe moment to rewrite it. Compaction, model switches, context updates and checkpoints all happen here for that reason.</li>
-  <li><strong>Where state lives.</strong> All state is the message list plus side effects in the world. Processes crash (fact 6). If the list is only in memory, a crash erases the agent's entire mind, while the world keeps the half-finished changes. Writing it down after every step costs a little; not writing it down costs the whole turn.</li>
-  <li><strong>Who calls whom.</strong> If the loop owns the <code>while</code>, the process must stay alive until the turn ends. If an outside engine calls one step at a time and saves between calls, no single process has to live that long. This choice decides whether durability is easy later.</li>
-</ol>
+<h2 id="cycle">1. The one thing every loop does</h2>
+<p>Start from what the model is: a function from text to text that keeps nothing between calls. It cannot run a command (fact 1) and it cannot see what happened last time unless you show it (fact 2). Put those two facts together and the loop is forced on you. Something must send the model the whole story so far, read what it asks for, do it, write down the result, and send the longer story back. That something repeats until the model stops asking for actions.</p>
 
-<h2 id="shapes">3. Three loop shapes</h2>
 <figure>
-<div class="svgwrap"><svg viewBox="0 0 760 300" width="760" style="max-width:100%;height:auto" role="img" aria-label="Three loop shapes: nested in-memory loop, step function driven by a workflow engine, journaled runtime">
-  <defs><marker id="b1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
-  <text x="24" y="24" style="fill:var(--ink);font-size:13px;font-weight:600">A. Nested loop in memory</text>
-  <text x="24" y="40" style="fill:var(--ink2);font-size:11px">Pi, fx</text>
-  <rect x="24" y="52" width="220" height="200" rx="10" style="fill:var(--panel);stroke:var(--line)"/>
-  <text x="36" y="72" style="fill:var(--ink2);font-size:11px">outer: follow-ups</text>
-  <rect x="44" y="84" width="180" height="120" rx="8" style="fill:var(--kv-s);stroke:var(--kv)"/>
-  <text x="56" y="104" style="fill:var(--ink2);font-size:11px">inner: tool calls</text>
-  <text x="56" y="120" style="fill:var(--ink2);font-size:11px">or steering left</text>
-  <rect x="64" y="132" width="140" height="28" rx="6" style="fill:var(--pre-s);stroke:var(--pre)"/>
-  <text x="134" y="150" text-anchor="middle" style="fill:var(--ink);font-size:11px">model call</text>
-  <rect x="64" y="166" width="140" height="28" rx="6" style="fill:var(--dec-s);stroke:var(--dec)"/>
-  <text x="134" y="184" text-anchor="middle" style="fill:var(--ink);font-size:11px">tool batch</text>
-  <text x="36" y="236" style="fill:var(--bad);font-size:11px">crash: turn lost</text>
-
-  <text x="270" y="24" style="fill:var(--ink);font-size:13px;font-weight:600">B. Step function</text>
-  <text x="270" y="40" style="fill:var(--ink2);font-size:11px">eve</text>
-  <rect x="270" y="52" width="220" height="200" rx="10" style="fill:var(--panel);stroke:var(--line)"/>
-  <rect x="290" y="70" width="180" height="40" rx="8" style="fill:var(--panel2);stroke:var(--line)"/>
-  <text x="380" y="95" text-anchor="middle" style="fill:var(--ink);font-size:11px">workflow engine</text>
-  <rect x="290" y="150" width="180" height="56" rx="8" style="fill:var(--kv-s);stroke:var(--kv)"/>
-  <text x="380" y="172" text-anchor="middle" style="fill:var(--ink);font-size:11px">step(session)</text>
-  <text x="380" y="190" text-anchor="middle" style="fill:var(--ink2);font-size:11px">→ { session, next }</text>
-  <g style="fill:none;stroke:var(--ink2);stroke-width:1.3"><path d="M350 110V148" marker-end="url(#b1)"/><path d="M410 148V112" marker-end="url(#b1)"/></g>
-  <text x="300" y="134" style="fill:var(--ink2);font-size:10px">call</text>
-  <text x="416" y="134" style="fill:var(--ink2);font-size:10px">save</text>
-  <text x="282" y="236" style="fill:var(--good);font-size:11px">crash: replay last step</text>
-
-  <text x="516" y="24" style="fill:var(--ink);font-size:13px;font-weight:600">C. Journaled runtime</text>
-  <text x="516" y="40" style="fill:var(--ink2);font-size:11px">nanocode, Pi Durable</text>
-  <rect x="516" y="52" width="220" height="200" rx="10" style="fill:var(--panel);stroke:var(--line)"/>
-  <rect x="536" y="70" width="180" height="30" rx="6" style="fill:var(--panel2);stroke:var(--line)"/>
-  <text x="626" y="90" text-anchor="middle" style="fill:var(--ink);font-size:11px">turn inbox</text>
-  <rect x="536" y="110" width="180" height="56" rx="8" style="fill:var(--kv-s);stroke:var(--kv)"/>
-  <text x="626" y="134" text-anchor="middle" style="fill:var(--ink);font-size:11px">runtime loop</text>
-  <text x="626" y="152" text-anchor="middle" style="fill:var(--ink2);font-size:11px">every call journaled</text>
-  <rect x="536" y="176" width="180" height="30" rx="6" style="fill:var(--dec-s);stroke:var(--dec)"/>
-  <text x="626" y="196" text-anchor="middle" style="fill:var(--ink);font-size:11px">store: JSONL, SQL</text>
-  <text x="528" y="236" style="fill:var(--good);font-size:11px">crash: finish from journal</text>
+<div class="svgwrap"><svg viewBox="0 0 760 300" width="760" style="max-width:100%;height:auto" role="img" aria-label="The agent loop: the harness alternates between the model and the environment">
+  <defs><marker id="m1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="20" y="120" width="120" height="60" rx="7" style="fill:var(--panel2);stroke:var(--line)"/>
+  <text x="80.0" y="146.5" text-anchor="middle" style="fill:var(--ink);font-size:11px;font-weight:600">Person</text>
+  <text x="80.0" y="161.5" text-anchor="middle" style="fill:var(--ink2);font-size:11px">or caller</text>
+  <rect x="300" y="110" width="170" height="80" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="385.0" y="139.0" text-anchor="middle" style="fill:var(--ink);font-size:11px;font-weight:600">Harness</text>
+  <text x="385.0" y="154.0" text-anchor="middle" style="fill:var(--ink2);font-size:11px">keeps the history</text>
+  <text x="385.0" y="169.0" text-anchor="middle" style="fill:var(--ink2);font-size:11px">decides what runs</text>
+  <rect x="300" y="14" width="170" height="52" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="385.0" y="36.5" text-anchor="middle" style="fill:var(--ink);font-size:11px;font-weight:600">Model</text>
+  <text x="385.0" y="51.5" text-anchor="middle" style="fill:var(--ink2);font-size:11px">text in, text out</text>
+  <rect x="300" y="234" width="170" height="52" rx="7" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="385.0" y="256.5" text-anchor="middle" style="fill:var(--ink);font-size:11px;font-weight:600">Environment</text>
+  <text x="385.0" y="271.5" text-anchor="middle" style="fill:var(--ink2);font-size:11px">files, shell, network</text>
+  <rect x="600" y="120" width="140" height="60" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="670.0" y="146.5" text-anchor="middle" style="fill:var(--ink);font-size:11px;font-weight:600">Final answer</text>
+  <text x="670.0" y="161.5" text-anchor="middle" style="fill:var(--ink2);font-size:11px">turn ends</text>
+  <path d="M142 140H296" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m1)"/>
+  <text x="150" y="133" text-anchor="start" style="fill:var(--ink2);font-size:10px">message</text>
+  <path d="M355 108V70" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m1)"/>
+  <text x="250" y="92" text-anchor="start" style="fill:var(--ink2);font-size:10px">whole history + tool list</text>
+  <path d="M415 70V106" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m1)"/>
+  <text x="422" y="92" text-anchor="start" style="fill:var(--ink2);font-size:10px">text, or tool calls</text>
+  <path d="M355 192V230" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m1)"/>
+  <text x="255" y="216" text-anchor="start" style="fill:var(--ink2);font-size:10px">run the calls</text>
+  <path d="M415 230V194" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m1)"/>
+  <text x="422" y="216" text-anchor="start" style="fill:var(--ink2);font-size:10px">results, appended</text>
+  <path d="M472 150H596" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m1)"/>
+  <text x="480" y="143" text-anchor="start" style="fill:var(--ink2);font-size:10px">no more tool calls</text>
+  <text x="500" y="40" text-anchor="start" style="fill:var(--kv);font-size:10px">one step = one model call</text>
+  <text x="500" y="54" text-anchor="start" style="fill:var(--kv);font-size:10px">+ the tools it asked for</text>
 </svg></div>
-<figcaption>Three shapes, three answers to "where does the state live between steps". A keeps everything in memory and is the easiest to read. B hands control to an engine after every step. C keeps a loop but writes every call to storage before moving on.</figcaption>
+<figcaption>Figure 1. The cycle. Everything in this chapter is a decision about one of these arrows: when the message is absorbed, what is sent up, when the tools run, and when the right-hand arrow is allowed to fire.</figcaption>
 </figure>
 
-<h2 id="tour">4. Code tour</h2>
-<h3>Pi: two nested loops with queues</h3>
-<p>Open <code>packages/agent/src/agent-loop.ts</code> (952 lines) and find <code>runLoop()</code>. The outer <code>while (true)</code> exists only for follow-up messages: when the agent would stop, it asks <code>getFollowUpMessages()</code> and continues if any arrived. The inner loop runs <code>while (hasMoreToolCalls || pendingMessages.length > 0)</code>. Steering messages are polled at the start and after each turn preparation, and injected before the next model call, never in the middle of one.</p>
-<p>Between turns, two hooks run: <code>prepareNextTurn</code> (can return a new context, new model or thinking level, which is how compaction and model switching plug in) and <code>prepareRequest</code> (last change before the call). Tool calls run in parallel by default; <code>executeToolCalls()</code> switches to sequential if the config says so or if any tool in the batch declares <code>executionMode: "sequential"</code>. That per-tool flag is a nice detail: a file-mutation tool can force order without slowing down a batch of reads.</p>
-<h3>eve: no loop, a kernel</h3>
-<p>Open <code>packages/eve/src/harness/kernel.ts</code>. <code>createKernel()</code> returns <code>runStep(session, input)</code>. One call runs a fixed sequence of stages in <code>runStages()</code>: settle runtime results (finished tasks, subagents), admit human answers (approvals), prepare turn input, run hook effects, apply human decisions, then either <em>park</em> (wait for a human), settle the turn, or call <code>runModelStep</code>. It returns <code>{ session, next }</code>. The Workflow SDK calls <code>next</code> in a new durable step. A step is by default one model call plus its inline tool calls; the experimental <code>workflow.modelCallsPerStep</code> groups several cycles to cut checkpoint overhead, at the cost of a bigger replay unit.</p>
-<p>Look at how many stages are about humans and background work: approvals, parked work, queued input, running tasks. A durable loop spends most of its code on waiting correctly.</p>
-<h3>fx: a native orchestrator with a step limit</h3>
-<p>fx's loop lives in <code>src/core/agent/runtime/orchestrator.zig</code>, with <code>parallel_execution.zig</code> and <code>tool_batch.zig</code> for tool batches and <code>interruption.zig</code> for cancel. <code>config.zig</code> defines an <code>agent_step_limit</code> and the message the model receives when it is hit: "Agent step limit reached; continue with a follow-up prompt if needed." Subagents get their own, smaller limit (<code>src/core/subagent/agent_adapter.zig</code>). The loop also warms the provider cache (<code>cache_warmer.zig</code>), because a native binary that starts in microseconds should not then wait on a cold prompt cache.</p>
-<h3>nanocode: a runtime with an inbox and a log</h3>
-<p>In <code>crates/runtime/agent/src</code>, <code>turn_inbox.rs</code> receives prompts and steering, <code>turn_log.rs</code> and <code>session_log.rs</code> record every event, and <code>runtime.rs</code> drives turns. Steering has a receipt status, so the caller knows whether a message was accepted into the running turn. The design goal is stated in the README: every model call and tool call is journaled, so a turn finishes after its process dies.</p>
+<p>Two consequences follow before you write any code. First, the history only grows, and each step resends all of it, so total tokens grow roughly with the square of the number of steps. OpenAI's write-up of the Codex loop says exactly this: the loop is quadratic in the JSON it sends, which is why caching shapes the design (<a href="https://openai.com/index/unrolling-the-codex-agent-loop">Unrolling the Codex agent loop</a>). Second, the only moment the history is complete and consistent is between steps: after the model replied and every tool it asked for has a result. That moment, the <strong>step boundary</strong>, is where every harness does its housekeeping, and most of the decisions below are about what happens there.</p>
 
-<h3>Codex: one turn loop, steering drained at the step boundary</h3>
-<p>Codex's loop is <code>run_turn()</code> in <code>codex-rs/core/src/session/turn.rs</code> (about 4,000 lines). Its doc comment states the contract: each sampling request returns function calls or an assistant message; a call is executed and its output sent back on the next request; a message with no calls ends the turn. At the top of every iteration the loop drains <code>sess.input_queue</code>, so text the user typed while the model was working is recorded before the next request, never pushed into one already in flight (fact 2 in action). It then captures a <em>step context</em> once, with the comment "Capture once so context, advertised tools, and tool calls share one request view": the tools the model was offered and the tools that run cannot drift apart inside a step. After sampling it measures the context window and may start background compaction, tagged <code>MidTurn</code> if the model still needs a follow-up and <code>PostTurn</code> if not. Stop hooks run in <code>completion_hooks.finish()</code> before the turn returns.</p>
-<h3>Claude Code: an async generator shared by every surface</h3>
-<p>Claude Code's source is not public; the description here comes from the source-level study <em>Dive into Claude Code</em> (arXiv 2604.14228), which analysed v2.1.88. The loop, <code>queryLoop()</code>, is an <code>AsyncGenerator</code> that yields streaming events, and the CLI, the SDK and the IDE extensions all consume that one generator. The paper describes a nine-step pipeline per iteration (settings, state, context assembly, context management, model call, tool dispatch, permission gate, tool execution, stop check) and five stop conditions: no tool use, max turns, context overflow, hook intervention and explicit abort. A <code>StreamingToolExecutor</code> starts running tools while the reply is still streaming, a latency optimisation that only works because tool calls arrive as complete blocks before the reply ends.</p>
-<h3>Kimi Code: an event-sourced loop actor</h3>
-<p>Moonshot's Kimi Code CLI keeps its loop in <code>packages/core/src/loop/</code>. The loop is an actor (<code>loop-actor.ts</code>, about 1,750 lines) whose state is a <em>projection</em> of recorded events. <code>record.ts</code> lists what is persisted: <code>turn.started</code>, <code>step.started</code>, <code>message.appended</code>, <code>tool.started</code>, <code>tool.ended</code>, <code>llm.retry</code> and others, and a reducer rebuilds state from them. This is fact 2 taken literally: since the model holds nothing, the harness treats its own log as the agent's memory and derives everything else. <code>state.ts</code> decides whether an interrupted turn can continue: <code>isResumable()</code> finds the last assistant message and checks for tool calls with no result. Step limits are not built into the loop; <code>createMaxStepsHook()</code> is a blocking hook on the <code>step.continuing</code> point.</p>
-<h3>Qwen Code: named stop reasons and loop detection</h3>
-<p>Alibaba's Qwen Code keeps its loop in <code>packages/core/src/core/agent-loop.ts</code>. Its <code>AgentLoopStopReason</code> type names every way a loop can end, including <code>completed</code>, <code>cancelled</code>, <code>loop_detected</code>, <code>duplicate_provider_call</code>, <code>tool_ended_turn</code>, <code>max_session_turns</code>, <code>session_token_limit</code> and <code>user_prompt_blocked</code>. <code>client.ts</code> caps a turn at <code>MAX_TURNS = 100</code>. <code>services/loopDetectionService.ts</code> watches for a model stuck repeating itself: 5 identical tool calls in a row, a content chunk repeated 10 times, the same file read 8 times. The comment above the first threshold is first-principles reasoning in one line: repeating an identical call yields an identical result, so it is never productive.</p>
-<h3>Trae Agent: the research baseline</h3>
-<p>ByteDance's Trae Agent has the simplest loop in this book. <code>trae_agent/agent/base_agent.py</code> runs <code>while step_number &lt;= self._max_steps</code> (200 in the example config). A turn ends only when the model calls the <code>task_done</code> tool, whose description says it cannot be called before verification. With <code>must_patch</code> set, <code>trae_agent.py</code> also takes the git diff, removes changes to tests, and if nothing is left it rejects the stop with "ERROR! Your Patch is empty." That is fact 5 handled in the loop: the model's claim that it is finished is checked against the world before it is accepted.</p>
+<h2 id="vocab">2. Turn, step, run, session, and why the names do not match</h2>
+<p>Because the step boundary is the only consistent moment, the step is the natural unit of an agent, and every other unit is a group of steps. The concepts are the same in every harness. The words are not, and reading source without knowing that is the fastest way to get confused.</p>
 
-<h2 id="decisions">5. Design decisions compared</h2>
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 230" width="760" style="max-width:100%;height:auto" role="img" aria-label="Nesting: a session holds turns, a turn holds steps, a step is one model call plus its tool calls">
+  <defs><marker id="m2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="10" width="740" height="210" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="22" y="30" text-anchor="start" style="fill:var(--ink);font-size:12px;font-weight:600">Session: one conversation, possibly days long</text>
+  <rect x="22" y="42" width="470" height="166" rx="7" style="fill:none;stroke:var(--line);stroke-dasharray:4 3"/>
+  <text x="32" y="60" text-anchor="start" style="fill:var(--ink);font-size:11px">Turn 1: one user message and everything it triggers</text>
+  <rect x="508" y="42" width="230" height="166" rx="7" style="fill:none;stroke:var(--line);stroke-dasharray:4 3"/>
+  <text x="518" y="60" text-anchor="start" style="fill:var(--ink);font-size:11px">Turn 2</text>
+  <rect x="32" y="72" width="140" height="120" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="40" y="88" text-anchor="start" style="fill:var(--ink2);font-size:10px">Step 1</text>
+  <rect x="40" y="96" width="124" height="28" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="102.0" y="113.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">model call</text>
+  <rect x="40" y="132" width="60" height="26" rx="7" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="70.0" y="148.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">tool</text>
+  <rect x="104" y="132" width="60" height="26" rx="7" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="134.0" y="148.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">tool</text>
+  <rect x="184" y="72" width="140" height="120" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="192" y="88" text-anchor="start" style="fill:var(--ink2);font-size:10px">Step 2</text>
+  <rect x="192" y="96" width="124" height="28" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="254.0" y="113.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">model call</text>
+  <rect x="192" y="132" width="60" height="26" rx="7" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="222.0" y="148.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">tool</text>
+  <rect x="336" y="72" width="140" height="120" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="344" y="88" text-anchor="start" style="fill:var(--ink2);font-size:10px">Step 3</text>
+  <rect x="344" y="96" width="124" height="28" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="406.0" y="113.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">model call</text>
+  <rect x="344" y="132" width="124" height="26" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="406.0" y="148.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">answer, no tool call</text>
+  <rect x="518" y="72" width="210" height="120" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="526" y="88" text-anchor="start" style="fill:var(--ink2);font-size:10px">Step 1</text>
+  <rect x="526" y="96" width="194" height="28" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="623.0" y="113.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">model call</text>
+  <rect x="526" y="132" width="194" height="26" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="623.0" y="148.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">answer</text>
+  <path d="M178 70V196" style="fill:none;stroke:var(--kv);stroke-width:2"/>
+  <path d="M330 70V196" style="fill:none;stroke:var(--kv);stroke-width:2"/>
+  <text x="178" y="206" text-anchor="start" style="fill:var(--kv);font-size:10px">step boundary</text>
+  <text x="330" y="206" text-anchor="start" style="fill:var(--kv);font-size:10px">step boundary</text>
+</svg></div>
+<figcaption>Figure 2. The nesting every harness uses, whatever it calls the levels. The teal lines are step boundaries: the only places where the history is complete.</figcaption>
+</figure>
+
 <div class="tbl"><table>
-  <tr><th>Decision</th><th>Pi</th><th>eve</th><th>fx</th><th>nanocode</th></tr>
-  <tr><td>Loop shape</td><td>Nested in-memory loops</td><td>Step function called by a workflow engine</td><td>Native in-memory orchestrator</td><td>Journaled runtime</td></tr>
-  <tr><td>New input mid-turn</td><td>Steering queue, delivered at next step</td><td>Queued, delivered at a step boundary; can park</td><td>Interruption and follow-up</td><td>Turn inbox with receipts</td></tr>
-  <tr><td>Parallel tools</td><td>Parallel unless a tool is sequential</td><td>Inline calls per step</td><td>Tool batches in parallel</td><td>Parallel, also inside Code Mode cells</td></tr>
-  <tr><td>Stop control</td><td>No tool calls and no queued messages</td><td>Stages decide: settle, park, or next</td><td>Step limit plus notice</td><td>Turn control and budgets</td></tr>
-  <tr><td>Crash during a turn</td><td>Turn lost (Pi Durable fixes this)</td><td>Replays from last step</td><td>Turn lost; session on disk</td><td>Finishes from the journal</td></tr>
-  <tr><td>Main trade-off</td><td>Simple, hard to make durable</td><td>Durable, every step must be serializable</td><td>Fast, durability left to hosts</td><td>Durable everywhere, complex</td></tr>
+  <tr><th>Concept</th><th>Pi</th><th>Pi Durable</th><th>eve</th><th>Codex</th><th>Kimi Code</th><th>Qwen Code</th><th>Trae Agent</th></tr>
+  <tr><td>One model call + its tools</td><td>turn</td><td>turn</td><td>step</td><td>sampling request</td><td>step</td><td>round</td><td>step</td></tr>
+  <tr><td>One input until the answer</td><td>agent run</td><td>run</td><td>turn</td><td>turn</td><td>turn</td><td>turn</td><td>run of one task</td></tr>
+  <tr><td>Whole conversation</td><td>session</td><td>conversation</td><td>session</td><td>thread / session</td><td>session</td><td>session</td><td>none</td></tr>
 </table></div>
-<p>The same decisions in the five reference harnesses:</p>
-<div class="tbl"><table>
-  <tr><th>Decision</th><th>Codex</th><th>Claude Code</th><th>Kimi Code</th><th>Qwen Code</th><th>Trae Agent</th></tr>
-<tr><td>Loop shape</td><td>Async turn loop inside a session task</td><td><code>AsyncGenerator</code> yielding events</td><td>Actor whose state is a projection of an event log</td><td>Agent loop driving a tool scheduler</td><td>Plain <code>while</code> over steps</td></tr>
-<tr><td>New input mid-turn</td><td>Input queue drained at the next step</td><td>Not detailed in the paper</td><td>Inbox in loop state</td><td>Turn interruption service</td><td>Not supported (one task per run)</td></tr>
-<tr><td>Stop control</td><td>No tool call, then stop hooks; work budget</td><td>Five stop conditions</td><td>Max-steps hook; tools can set <code>stopTurn</code></td><td>Ten named stop reasons, 100-turn cap, loop detection</td><td><code>task_done</code> plus non-empty patch check; 200 steps</td></tr>
-<tr><td>Crash during a turn</td><td>Rollout file on disk; resume rebuilds history</td><td>Transcript on disk; <code>--resume</code></td><td>Resumes from the log when tool calls are unanswered</td><td>Recovery plan repairs the history (Chapter 11)</td><td>Lost; the trajectory file remains</td></tr>
-</table></div>
-<div class="box expert">
-  <span class="lbl">Why this matters later</span>
-  <p>From fact 2, the agent's true state is small: the message list and a few counters. Any state the loop holds outside that object (an open file handle, a half-streamed reply, a background process) is state the model never sees and a crash will lose. Making an in-memory loop durable after the fact is hard because you have to discover all of that hidden state one bug at a time. Writing the loop body as <code>step(state) → state</code> from the start forces all state into one object you can save. We do that now, and Chapter 11 adds the journal.</p>
-</div>
+<p>In this book: a <strong>step</strong> is one model call plus the tool calls it asked for; a <strong>turn</strong> is one input and every step until the answer; a <strong>session</strong> is the whole conversation. Two more words you need: a <strong>steering message</strong> arrives while a turn is running and should change its course; a <strong>follow-up message</strong> arrives while a turn is running but should wait until it ends.</p>
 
-<h2 id="research">6. Research and how Chinese teams see the loop</h2>
+<h2 id="anatomy">3. Anatomy of one step</h2>
+<p>Stretch one step out and the same stages appear in every harness that does real work. They differ in which stages exist, how much each does, and what may interrupt them. The Claude Code study lists nine stages for one iteration of its loop: settings resolution, state initialization, context assembly, the pre-model context shapers, the model call, tool dispatch, the permission gate, tool execution and the stop check (<a href="https://arxiv.org/html/2604.14228v1">Dive into Claude Code</a>). Generalised across the nine harnesses, it looks like this.</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 250" width="760" style="max-width:100%;height:auto" role="img" aria-label="Stages of one step, from the boundary to the stop check">
+  <defs><marker id="m3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="14" y="20" width="128" height="62" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="78.0" y="40.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">1. Absorb input</text>
+  <text x="78.0" y="54.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">queued messages,</text>
+  <text x="78.0" y="68.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">reminders</text>
+  <rect x="164" y="20" width="128" height="62" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="228.0" y="40.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">2. Shape context</text>
+  <text x="228.0" y="54.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">compact, trim,</text>
+  <text x="228.0" y="68.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">update notes</text>
+  <path d="M144 51.0H161" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m3)"/>
+  <rect x="314" y="20" width="128" height="62" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="378.0" y="40.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">3. Build request</text>
+  <text x="378.0" y="54.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">history + tools</text>
+  <text x="378.0" y="68.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">+ settings</text>
+  <path d="M294 51.0H311" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m3)"/>
+  <rect x="464" y="20" width="128" height="62" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="528.0" y="40.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">4. Call model</text>
+  <text x="528.0" y="54.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">stream the</text>
+  <text x="528.0" y="68.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">reply</text>
+  <path d="M444 51.0H461" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m3)"/>
+  <rect x="614" y="20" width="128" height="62" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="678.0" y="40.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">5. Check calls</text>
+  <text x="678.0" y="54.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">parse, validate</text>
+  <text x="678.0" y="68.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">arguments</text>
+  <path d="M594 51.0H611" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m3)"/>
+  <rect x="14" y="150" width="128" height="62" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="78.0" y="177.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">10. Stop check</text>
+  <text x="78.0" y="191.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">end, or loop</text>
+  <rect x="164" y="150" width="128" height="62" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="228.0" y="170.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">9. Boundary hooks</text>
+  <text x="228.0" y="184.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">gates, stop hooks,</text>
+  <text x="228.0" y="198.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">save</text>
+  <rect x="314" y="150" width="128" height="62" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="378.0" y="170.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">8. Append results</text>
+  <text x="378.0" y="184.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">in the order</text>
+  <text x="378.0" y="198.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">they were asked</text>
+  <rect x="464" y="150" width="128" height="62" rx="7" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="528.0" y="170.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">7. Run tools</text>
+  <text x="528.0" y="184.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">parallel or</text>
+  <text x="528.0" y="198.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">in order</text>
+  <rect x="614" y="150" width="128" height="62" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="678.0" y="170.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">6. Permission</text>
+  <text x="678.0" y="184.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">allow, ask,</text>
+  <text x="678.0" y="198.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">deny</text>
+  <path d="M162 181H145" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m3)"/>
+  <path d="M312 181H295" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m3)"/>
+  <path d="M462 181H445" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m3)"/>
+  <path d="M612 181H595" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m3)"/>
+  <path d="M686 84V146" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m3)"/>
+  <path d="M78 148V86" style="fill:none;stroke:var(--kv);stroke-width:1.3" marker-end="url(#m3)"/>
+  <text x="86" y="122" text-anchor="start" style="fill:var(--kv);font-size:10px">next step</text>
+  <text x="14" y="236" text-anchor="start" style="fill:var(--ink2);font-size:10px">Teal = harness work, indigo = model, amber = environment. Stages 1, 2 and 9 happen at the step boundary.</text>
+</svg></div>
+<figcaption>Figure 3. One step stretched out. Trae Agent has stages 3, 4, 7, 8 and 10 and little else; Claude Code, Codex and fx have all ten. Most of the code in a production harness lives in stages 1, 2, 5, 6 and 9, which is why the Claude Code study found that most of its code is operational infrastructure around the loop rather than decision logic.</figcaption>
+</figure>
+
+<p>Two stages deserve a first-principles note now, because they are easy to forget. <strong>Stage 5, checking calls,</strong> exists because a tool call is sampled text (fact 5): it can name a tool that does not exist, carry arguments that do not match the schema, or be cut off because the reply hit its output-token limit. Pi refuses to run any call from a reply that stopped for length, because a salvage parser can produce arguments that parse but are silently incomplete. Kimi Code validates every finished call against its schema and asks again without running a bad one. <strong>Stage 8, ordering,</strong> exists because providers expect results in the order the calls were made. Even harnesses that run tools in parallel buffer the results and append them in request order.</p>
+
+<h2 id="decisions">4. The decisions, one at a time</h2>
+<p>Each subsection below states the question, derives the reasonable answers from the facts, says what each answer costs, and shows who chose what. Section 5 then walks each harness as a whole, and section 6 puts everything in one table.</p>
+
+<h3 id="d-owner">Decision 1. Who owns the loop?</h3>
+<p>The loop has to live somewhere, and where it lives decides what a crash costs. There are four answers in the code we read.</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 300" width="760" style="max-width:100%;height:auto" role="img" aria-label="Four places the loop can live">
+  <defs><marker id="m4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <text x="10" y="20" text-anchor="start" style="fill:var(--ink);font-size:12px;font-weight:600">A. In-process loop</text>
+  <text x="10" y="34" text-anchor="start" style="fill:var(--ink2);font-size:10px">Pi, fx, Codex, Claude Code,</text>
+  <text x="10" y="46" text-anchor="start" style="fill:var(--ink2);font-size:10px">Qwen Code, Trae</text>
+  <rect x="10" y="50" width="176" height="192" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <rect x="22" y="60" width="152" height="38" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="98.0" y="82.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">while (more work)</text>
+  <rect x="22" y="116" width="152" height="38" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="98.0" y="138.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">call model</text>
+  <path d="M98 100V113" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m4)"/>
+  <rect x="22" y="172" width="152" height="38" rx="7" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="98.0" y="194.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">run tools</text>
+  <path d="M98 156V169" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m4)"/>
+  <rect x="10" y="252" width="176" height="34" rx="7" style="fill:var(--bad-s);stroke:var(--bad)"/>
+  <text x="98.0" y="265.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">after a crash:</text>
+  <text x="98.0" y="279.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">in-flight step is lost</text>
+  <text x="198" y="20" text-anchor="start" style="fill:var(--ink);font-size:12px;font-weight:600">B. Event-sourced actor</text>
+  <text x="198" y="34" text-anchor="start" style="fill:var(--ink2);font-size:10px">Kimi Code</text>
+  <rect x="198" y="50" width="176" height="192" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <rect x="210" y="60" width="152" height="38" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="286.0" y="82.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">inbox of commands</text>
+  <rect x="210" y="116" width="152" height="38" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="286.0" y="138.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">actor records events</text>
+  <path d="M286 100V113" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m4)"/>
+  <rect x="210" y="172" width="152" height="38" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="286.0" y="194.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">state = replay of log</text>
+  <path d="M286 156V169" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m4)"/>
+  <rect x="198" y="252" width="176" height="34" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="286.0" y="265.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">after a crash:</text>
+  <text x="286.0" y="279.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">rebuild from the log</text>
+  <text x="386" y="20" text-anchor="start" style="fill:var(--ink);font-size:12px;font-weight:600">C. Step function</text>
+  <text x="386" y="34" text-anchor="start" style="fill:var(--ink2);font-size:10px">eve</text>
+  <rect x="386" y="50" width="176" height="192" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <rect x="398" y="60" width="152" height="38" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="474.0" y="82.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">workflow engine</text>
+  <rect x="398" y="116" width="152" height="38" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="474.0" y="138.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">step(session)</text>
+  <path d="M474 100V113" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m4)"/>
+  <rect x="398" y="172" width="152" height="38" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="474.0" y="194.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">returns next step</text>
+  <path d="M474 156V169" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m4)"/>
+  <rect x="386" y="252" width="176" height="34" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="474.0" y="265.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">after a crash:</text>
+  <text x="474.0" y="279.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">replay the last step</text>
+  <text x="574" y="20" text-anchor="start" style="fill:var(--ink);font-size:12px;font-weight:600">D. Durable state machine</text>
+  <text x="574" y="34" text-anchor="start" style="fill:var(--ink2);font-size:10px">Pi Durable, nanocode</text>
+  <rect x="574" y="50" width="176" height="192" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <rect x="586" y="60" width="152" height="38" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="662.0" y="82.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">phase: prepare</text>
+  <rect x="586" y="116" width="152" height="38" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="662.0" y="138.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">phase: request</text>
+  <path d="M662 100V113" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m4)"/>
+  <rect x="586" y="172" width="152" height="38" rx="7" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="662.0" y="194.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">phase: tools</text>
+  <path d="M662 156V169" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m4)"/>
+  <rect x="574" y="252" width="176" height="34" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="662.0" y="265.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">after a crash:</text>
+  <text x="662.0" y="279.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">resume the phase</text>
+</svg></div>
+<figcaption>Figure 4. Four owners. A keeps the loop in the program's memory; B, C and D make the loop's progress a record that outlives the process, each in a different way.</figcaption>
+</figure>
+
 <ul>
-  <li><strong>ReAct (2022)</strong> introduced interleaving reasoning, action and observation. Every loop here is ReAct plus engineering.</li>
-  <li><strong>The Ralph loop</strong>: when the model tries to stop, a hook re-injects the original goal into a fresh context window; files carry state between iterations. LangChain describes it as a harness pattern for long goals.</li>
-  <li><strong>Loop engineering</strong> is the 2026 name for designing the outer loops that re-drive agents, one layer above harness engineering.</li>
-  <li><strong>Chinese view.</strong> Chinese analyses stress that the innermost loop can be about 200 lines and that the hard part is everything around it (<a href="https://eu.36kr.com/zh/p/3962917883805061">36Kr</a>). Practitioner write-ups describe the loop's job as mediating observation, action, feedback and completion (<a href="https://jimmysong.io/zh/book/ai-handbook/runtime/harness/">Jimmy Song</a>).</li>
+  <li><strong>A. An ordinary loop in the process.</strong> The program runs <em>while there are tool calls, call the model and run them</em>. Easiest to read, easiest to debug, fastest. A crash loses the step in flight and anything not yet written down. Pi, fx, Codex, Claude Code, Qwen Code and Trae Agent all start here; most of them then write finished messages to disk so a session can be resumed, which recovers the conversation but not the half-done step.</li>
+  <li><strong>B. An event-sourced actor.</strong> Kimi Code's loop is an actor: commands arrive in an inbox, the actor handles one at a time, and every change is recorded as an event (turn started, step started, message appended, tool started, tool ended, model retried). The loop's state is never stored directly; it is computed by replaying the events. Since the model holds nothing (fact 2), treating the log as the agent's real memory is the literal reading of the facts. After a crash the log is replayed and the harness can tell whether the last step ended with tool calls that never got results, and continue from there.</li>
+  <li><strong>C. A step function.</strong> eve has no loop of its own. Its kernel does one step and returns the new session plus what should run next. A workflow engine (Vercel's Workflow SDK) calls it, saves the result, and calls it again, possibly in another process, possibly days later. By default one step is one model call plus the inline tool calls that follow it; an experimental setting groups several model calls into one saved step to reduce checkpoint overhead, at the cost of a larger replay unit.</li>
+  <li><strong>D. A durable state machine.</strong> Pi Durable models a model response as a task with named phases: prepare, request, poll (for providers that answer later), retry, tools, and a few finishing phases. Each phase change is one atomic commit. nanocode does the same idea differently: every model call and every tool call is a journaled effect, so its README promises that a turn finishes after its process dies.</li>
+</ul>
+<div class="tbl"><table>
+  <tr><th>Owner</th><th>Buys you</th><th>Costs you</th></tr>
+  <tr><td>A. In-process loop</td><td>Simple code; any state you like; lowest latency</td><td>No durability; hidden state accumulates in variables and is hard to save later</td></tr>
+  <tr><td>B. Event-sourced actor</td><td>One source of truth; replay for debugging and resume; every change has a record</td><td>Every state change must be an event; reducers must stay compatible with old logs</td></tr>
+  <tr><td>C. Step function</td><td>Durability and long waits come from the engine; sessions can move between deployments</td><td>All state must be saveable and replay-safe; you depend on the engine and its version rules (eve documents "stranded" sessions after upgrades)</td></tr>
+  <tr><td>D. Durable state machine</td><td>Exact resume of an interrupted phase; external effects get intent and outcome records</td><td>The most design work: every phase, every effect, every migration of old records</td></tr>
+</table></div>
+<div class="box expert"><span class="lbl">Why this decision comes first</span><p>Moving from A to B, C or D later is hard, because an in-process loop quietly accumulates state that is not in the history: a retry counter, a half-streamed reply, a flag that says a reminder was already sent. Every one of those has to be found and made saveable. If you might ever need durability, keep the loop's state in one object you could write to disk, even while the loop is still shape A. That is what our build does.</p></div>
+
+<h3 id="d-stop">Decision 2. When is a turn allowed to end?</h3>
+<p>The model can only say "I am done" one way: by replying without a tool call. Every harness uses that as the main signal. None trusts it alone, because the signal is a sample (fact 5): a model stops early with work undone, stops with an empty reply, or never stops at all. So the real question is what the harness checks before it accepts a stop, and what limits it imposes when the model will not stop.</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 330" width="760" style="max-width:100%;height:auto" role="img" aria-label="How a turn ends: the decision after each reply">
+  <defs><marker id="m5" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  
+  <rect x="10" y="20" width="150" height="44" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="85.0" y="46.0" text-anchor="middle" style="fill:var(--ink);font-size:11px">Reply arrives</text>
+  <rect x="200" y="20" width="160" height="44" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="280.0" y="46.0" text-anchor="middle" style="fill:var(--ink);font-size:11px">Has tool calls?</text>
+  <path d="M162 42H196" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m5)"/>
+  <rect x="400" y="20" width="160" height="44" rx="7" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="480.0" y="38.5" text-anchor="middle" style="fill:var(--ink);font-size:11px">Run tools,</text>
+  <text x="480.0" y="53.5" text-anchor="middle" style="fill:var(--ink);font-size:11px">append results</text>
+  <path d="M362 42H396" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m5)"/>
+  <text x="368" y="36" text-anchor="start" style="fill:var(--ink2);font-size:10px">yes</text>
+  <rect x="590" y="20" width="160" height="44" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="670.0" y="38.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Guards: step limit,</text>
+  <text x="670.0" y="52.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">budget, loop detector</text>
+  <path d="M562 42H586" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m5)"/>
+  <path d="M670 66V96H90V68" style="fill:none;stroke:var(--kv);stroke-width:1.3" marker-end="url(#m5)"/>
+  <text x="300" y="90" text-anchor="start" style="fill:var(--kv);font-size:10px">next step, if no guard tripped</text>
+  <rect x="590" y="118" width="160" height="40" rx="7" style="fill:var(--bad-s);stroke:var(--bad)"/>
+  <text x="670.0" y="134.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Guard tripped:</text>
+  <text x="670.0" y="148.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">end, failed or paused</text>
+  <path d="M700 66V114" style="fill:none;stroke:var(--ink2);stroke-width:1.3;stroke-dasharray:4 3" marker-end="url(#m5)"/>
+  <rect x="200" y="130" width="160" height="44" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="280.0" y="148.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Degenerate reply?</text>
+  <text x="280.0" y="162.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">empty, cut off, malformed</text>
+  <path d="M280 66V126" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m5)"/>
+  <text x="286" y="104" text-anchor="start" style="fill:var(--ink2);font-size:10px">no</text>
+  <rect x="10" y="130" width="150" height="44" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="85.0" y="148.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Recover: nudge</text>
+  <text x="85.0" y="162.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">or ask again</text>
+  <path d="M198 152H164" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m5)"/>
+  <text x="168" y="146" text-anchor="start" style="fill:var(--ink2);font-size:10px">yes</text>
+  <path d="M10 152H4V42" style="fill:none;stroke:var(--ink2);stroke-width:1;stroke-dasharray:4 3"/>
+  <path d="M4 42H7" style="fill:none;stroke:var(--ink2);stroke-width:1.3;stroke-dasharray:4 3" marker-end="url(#m5)"/>
+  <rect x="200" y="214" width="160" height="44" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="280.0" y="232.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Completion checks:</text>
+  <text x="280.0" y="246.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">stop hooks, patch check</text>
+  <path d="M280 176V210" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m5)"/>
+  <rect x="10" y="214" width="150" height="44" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="85.0" y="232.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Blocked: add the</text>
+  <text x="85.0" y="246.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">reason, keep going</text>
+  <path d="M198 236H164" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m5)"/>
+  <text x="166" y="230" text-anchor="start" style="fill:var(--ink2);font-size:10px">block</text>
+  <path d="M10 236H4V150" style="fill:none;stroke:var(--ink2);stroke-width:1;stroke-dasharray:4 3"/>
+  <rect x="400" y="214" width="160" height="44" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="480.0" y="240.0" text-anchor="middle" style="fill:var(--ink);font-size:11px">Follow-up queued?</text>
+  <path d="M362 236H396" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m5)"/>
+  <text x="366" y="230" text-anchor="start" style="fill:var(--ink2);font-size:10px">pass</text>
+  <rect x="590" y="214" width="160" height="44" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="670.0" y="240.0" text-anchor="middle" style="fill:var(--ink);font-size:11px">Turn ends</text>
+  <path d="M562 236H586" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m5)"/>
+  <text x="566" y="230" text-anchor="start" style="fill:var(--ink2);font-size:10px">no</text>
+  <path d="M480 260V300H4V234" style="fill:none;stroke:var(--ink2);stroke-width:1;stroke-dasharray:4 3"/>
+  <text x="150" y="294" text-anchor="start" style="fill:var(--ink2);font-size:10px">yes: the queued message starts another step of the same run</text>
+  <text x="12" y="322" text-anchor="start" style="fill:var(--ink2);font-size:10px">Dashed paths on the left all lead back to another model call.</text>
+</svg></div>
+<figcaption>Figure 5. The decision after every reply. The happy path is the top row and the bottom right; everything else is a harness refusing to take the model's word for it.</figcaption>
+</figure>
+
+<p>Four mechanisms appear, each answering a different way the stop signal goes wrong.</p>
+<ul>
+  <li><strong>Limits for a model that will not stop.</strong> A step count, a token budget, or both. The surprising finding is how many harnesses ship <em>without</em> a step limit by default. fx's default is zero, meaning unlimited; Kimi Code's per-turn step limit is off unless configured; Pi's loop has none; Codex has none by default and an optional token budget behind a feature flag. eve uses money instead of steps: before every model call it checks a usage budget (by default 40 million new input tokens per window) and, when it is crossed, pauses the turn and asks the person whether to continue. Qwen Code caps a turn at 100 rounds; Trae Agent at 200 steps; Claude Code has a configurable maximum. The reasoning behind "no default limit" is that a step count is a bad proxy for cost or progress, and a coding task can legitimately need hundreds of tool calls; the reasoning behind a limit is that an unattended run with no ceiling is a blank cheque.</li>
+  <li><strong>Detectors for a model that is stuck.</strong> A model that repeats an identical tool call gets an identical result, so repeating it cannot help. Qwen Code ends a turn after 5 identical tool calls in a row, a content chunk repeated 10 times, or the same file read 8 times. fx ends a turn when the same shell command fails in three consecutive steps with no file changed in between, and resets the count after any edit, because rerunning a command after an edit is a new attempt, not a repeat.</li>
+  <li><strong>Recovery for a reply that is not really a stop.</strong> Some replies have no tool call but are not answers either. fx asks the model once to continue when a reply has no text and no tool call (some providers return that when a tool call fails to form), and ends the turn as failed if it happens twice in a row. Trae Agent never accepts a text-only reply: it answers "It seems that you have not completed the task" and continues.</li>
+  <li><strong>Checks for a stop that is premature.</strong> The model says it is done; the harness checks the world. Trae Agent's turn can only end through its <code>task_done</code> tool, and in benchmark mode the harness rejects it if the change, minus test files, is empty. Codex and Claude Code run Stop hooks: user code that can block the stop and hand the model a reason to keep going. Codex treats a block as a new message in the same turn; the Claude Code study lists hook intervention as one of its five stop conditions.</li>
+</ul>
+<div class="box watch"><span class="lbl">The design tension</span><p>Every check you add is a place where the harness overrides the model. Too few and an unattended agent stops early or loops forever. Too many and the harness fights a model that was right, or burns tokens on a forced continuation. The pattern the stronger harnesses share: limits and detectors that end the turn with a clear reason, and a small number of completion checks that look at the world (tests, a diff), never at the model's own claim.</p></div>
+
+<h3 id="d-tools">Decision 3. When do tools start, and how many at once?</h3>
+<p>A model can ask for several tool calls in one reply. Two independent questions follow: do you wait for the whole reply before starting any tool, and once you start, which calls may run at the same time?</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 270" width="760" style="max-width:100%;height:auto" role="img" aria-label="Three timelines for running the tool calls of one reply">
+  <defs><marker id="m6" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <text x="10" y="28" text-anchor="start" style="fill:var(--ink);font-size:11px;font-weight:600">Wait, then one at a time</text>
+  <text x="10" y="44" text-anchor="start" style="fill:var(--ink2);font-size:10px">Trae (parallel off), Pi sequential mode</text>
+  <rect x="190" y="14" width="260" height="18" rx="4" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="320.0" y="26.2" text-anchor="middle" style="fill:var(--ink);font-size:9px">reply streams</text>
+  <rect x="454" y="36" width="90" height="18" rx="4" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="499.0" y="48.2" text-anchor="middle" style="fill:var(--ink);font-size:9px">read A</text>
+  <rect x="548" y="36" width="90" height="18" rx="4" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="593.0" y="48.2" text-anchor="middle" style="fill:var(--ink);font-size:9px">read B</text>
+  <rect x="642" y="36" width="110" height="18" rx="4" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="697.0" y="48.2" text-anchor="middle" style="fill:var(--ink);font-size:9px">edit C</text>
+  <path d="M190 86H750" style="fill:none;stroke:var(--line);stroke-width:1"/>
+  <text x="10" y="112" text-anchor="start" style="fill:var(--ink);font-size:11px;font-weight:600">Wait, then in groups</text>
+  <text x="10" y="128" text-anchor="start" style="fill:var(--ink2);font-size:10px">Pi, fx, Qwen, Kimi</text>
+  <rect x="190" y="98" width="260" height="18" rx="4" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="320.0" y="110.2" text-anchor="middle" style="fill:var(--ink);font-size:9px">reply streams</text>
+  <rect x="454" y="120" width="90" height="18" rx="4" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="499.0" y="132.2" text-anchor="middle" style="fill:var(--ink);font-size:9px">read A</text>
+  <rect x="454" y="142" width="90" height="18" rx="4" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="499.0" y="154.2" text-anchor="middle" style="fill:var(--ink);font-size:9px">read B</text>
+  <rect x="548" y="120" width="110" height="18" rx="4" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="603.0" y="132.2" text-anchor="middle" style="fill:var(--ink);font-size:9px">edit C</text>
+  <path d="M190 170H750" style="fill:none;stroke:var(--line);stroke-width:1"/>
+  <text x="10" y="196" text-anchor="start" style="fill:var(--ink);font-size:11px;font-weight:600">Start while streaming</text>
+  <text x="10" y="212" text-anchor="start" style="fill:var(--ink2);font-size:10px">Claude Code, Codex</text>
+  <rect x="190" y="182" width="260" height="18" rx="4" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="320.0" y="194.2" text-anchor="middle" style="fill:var(--ink);font-size:9px">reply streams</text>
+  <rect x="260" y="204" width="90" height="18" rx="4" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="305.0" y="216.2" text-anchor="middle" style="fill:var(--ink);font-size:9px">read A</text>
+  <rect x="340" y="226" width="90" height="18" rx="4" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="385.0" y="238.2" text-anchor="middle" style="fill:var(--ink);font-size:9px">read B</text>
+  <rect x="454" y="204" width="110" height="18" rx="4" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="509.0" y="216.2" text-anchor="middle" style="fill:var(--ink);font-size:9px">edit C</text>
+  <path d="M190 254H750" style="fill:none;stroke:var(--line);stroke-width:1"/>
+  <text x="190" y="262" text-anchor="start" style="fill:var(--ink2);font-size:10px">time →</text>
+</svg></div>
+<figcaption>Figure 6. Same reply, three schedules. Grouping saves the time of the reads; starting during the stream also overlaps them with the model's own output.</figcaption>
+</figure>
+
+<p>Derive the grouping rule from fact 6. A read does not change the world, so two reads in any order give the same results: running them together only saves time. A write changes the world, so a write and anything that touches the same thing must keep their order. Every harness that runs tools in parallel encodes some version of "reads together, writes alone". They differ in how they know which is which.</p>
+<div class="tbl"><table>
+  <tr><th>Harness</th><th>Rule</th><th>Trade-off</th></tr>
+  <tr><td>Pi</td><td>Calls are checked in order, then run in parallel. If any tool in the batch declares itself sequential, the whole batch runs in order.</td><td>One flag per tool is easy to get right; a single sequential tool slows the whole batch.</td></tr>
+  <tr><td>Codex</td><td>One read-write lock: a tool that supports parallel calls takes the shared side, any other takes the exclusive side. Calls start as soon as each one is complete in the stream; results are kept in request order.</td><td>Very little code, and correct by construction; the classification is per tool, not per call, so a read-only use of a writing tool still waits.</td></tr>
+  <tr><td>Claude Code</td><td>Tools are classified concurrency-safe or exclusive; reads run in parallel, shell commands and other state changes are serialised; a streaming executor starts tools during the reply; if a shell command fails, its in-flight siblings are aborted. Results are buffered and emitted in the order the calls were made.</td><td>Lowest latency; the most moving parts (streaming, partitioning, sibling abort, reordering).</td></tr>
+  <tr><td>Qwen Code</td><td>Only three tool kinds count as safe to run together: read, search and fetch. Everything else, and any tool it cannot identify, runs one at a time.</td><td>Conservative and simple; its design notes record that before the loop was unified, one surface parallelised only consecutive subagent calls while another parallelised every safe call.</td></tr>
+  <tr><td>fx</td><td>Host tool calls run together up to the first writer; calls to the same subagent keep their written order.</td><td>Order-aware grouping keeps more parallelism than "any writer makes the batch sequential".</td></tr>
+  <tr><td>Kimi Code</td><td>Every call in the batch starts at once. A running tool can be moved to the background by the user; the model receives an acknowledgement as the result and the turn goes on.</td><td>Fast and simple; tools themselves must be safe to overlap.</td></tr>
+  <tr><td>Trae Agent</td><td>One configuration flag: all calls in parallel or all in order.</td><td>Fine for a research harness with five tools; too coarse for a large tool set.</td></tr>
+</table></div>
+<p>Starting tools during the stream is a latency trade. It overlaps tool time with model time, which matters most when the model writes a long explanation after its tool calls. It also means a tool can be running while the rest of the reply is still arriving, so cancellation, permission prompts and ordering all have to handle a reply that is not finished yet. The Claude Code study places this design between serial dispatch and fully speculative execution.</p>
+
+<h3 id="d-input">Decision 4. What happens to a message typed mid-turn?</h3>
+<p>People do not wait. They see the agent heading the wrong way and type a correction, or think of the next task and type it early. The model reads its input once, at the start of a call (fact 2), so a message that arrives mid-call cannot reach it until some later call. The design space is which later call, and whether to throw away work to get there sooner.</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 300" width="760" style="max-width:100%;height:auto" role="img" aria-label="Where a mid-turn message lands under four policies">
+  <defs><marker id="m7" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <text x="10" y="18" text-anchor="start" style="fill:var(--ink);font-size:11px;font-weight:600">One turn, and a message that arrives early in step 2's model call, before any output</text>
+  <rect x="150" y="30" width="110" height="24" rx="4" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="205.0" y="45.2" text-anchor="middle" style="fill:var(--ink);font-size:9px">step 1: model</text>
+  <rect x="264" y="30" width="110" height="24" rx="4" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="319.0" y="45.2" text-anchor="middle" style="fill:var(--ink);font-size:9px">step 1: tools</text>
+  <rect x="378" y="30" width="110" height="24" rx="4" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="433.0" y="45.2" text-anchor="middle" style="fill:var(--ink);font-size:9px">step 2: model</text>
+  <rect x="492" y="30" width="90" height="24" rx="4" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="537.0" y="45.2" text-anchor="middle" style="fill:var(--ink);font-size:9px">step 2: tools</text>
+  <rect x="586" y="30" width="110" height="24" rx="4" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="641.0" y="45.2" text-anchor="middle" style="fill:var(--ink);font-size:9px">step 3: answer</text>
+  <circle cx="400" cy="66" r="5" style="fill:var(--bad)"/>
+  <text x="408" y="70" text-anchor="start" style="fill:var(--bad);font-size:10px">message arrives</text>
+  <text x="10" y="108" text-anchor="start" style="fill:var(--ink);font-size:11px;font-weight:600">Next step boundary</text>
+  <text x="10" y="123" text-anchor="start" style="fill:var(--ink2);font-size:10px">Pi steering, Codex, fx, Kimi notify</text>
+  <path d="M150 114H750" style="fill:none;stroke:var(--line);stroke-width:1;stroke-dasharray:4 3"/>
+  <circle cx="586" cy="114" r="6" style="fill:var(--kv)"/>
+  <text x="598" y="118" text-anchor="start" style="fill:var(--kv);font-size:10px">joins before step 3</text>
+  <text x="10" y="158" text-anchor="start" style="fill:var(--ink);font-size:11px;font-weight:600">Cancel output not yet seen</text>
+  <text x="10" y="173" text-anchor="start" style="fill:var(--ink2);font-size:10px">eve steer (default), nanocode option</text>
+  <path d="M150 164H750" style="fill:none;stroke:var(--line);stroke-width:1;stroke-dasharray:4 3"/>
+  <circle cx="400" cy="164" r="6" style="fill:var(--kv)"/>
+  <text x="412" y="168" text-anchor="start" style="fill:var(--kv);font-size:10px">restart step 2's call with it now</text>
+  <text x="10" y="208" text-anchor="start" style="fill:var(--ink);font-size:11px;font-weight:600">After the turn</text>
+  <text x="10" y="223" text-anchor="start" style="fill:var(--ink2);font-size:10px">Pi follow-up, eve queue, fx handoff</text>
+  <path d="M150 214H750" style="fill:none;stroke:var(--line);stroke-width:1;stroke-dasharray:4 3"/>
+  <circle cx="712" cy="214" r="6" style="fill:var(--kv)"/>
+  <text x="700" y="218" text-anchor="end" style="fill:var(--kv);font-size:10px">starts the next turn</text>
+  <text x="10" y="258" text-anchor="start" style="fill:var(--ink);font-size:11px;font-weight:600">Not supported</text>
+  <text x="10" y="273" text-anchor="start" style="fill:var(--ink2);font-size:10px">Trae Agent</text>
+  <path d="M150 264H750" style="fill:none;stroke:var(--line);stroke-width:1;stroke-dasharray:4 3"/>
+  <text x="400" y="268" text-anchor="start" style="fill:var(--bad);font-size:10px">one task per run</text>
+</svg></div>
+<figcaption>Figure 7. Four policies for the same message. If the message had arrived during step 1's tools instead, the first two policies would land in the same place, because running tools always finish. Most harnesses offer two policies and let the sender choose: steer this turn, or queue for the next.</figcaption>
+</figure>
+
+<p>The details matter more here than anywhere else in the loop, because they decide whether the person feels in control.</p>
+<ul>
+  <li><strong>Pi</strong> has two queues. Steering messages are checked after each step's tools finish and join before the next model call; the tool calls already made are not skipped. Follow-up messages are checked only when the agent would otherwise stop. Each queue drains either one message at a time (the default) or all at once. Pi's outer loop exists to serve the follow-up queue, and to honour a finish-turn hook that asks for one more request.</li>
+  <li><strong>eve</strong> lets the sender choose per message. The default, <code>steer</code>, is the most aggressive of all nine harnesses: if the model has not started producing visible output, eve stops the pending model call and restarts it with the new message in the same turn; once output has started, the message waits for the next step boundary so streamed text is not thrown away. Running tools always finish and keep their results. The other policy, <code>queue</code>, holds the message until the turn ends. Only the turn's own caller can steer it; anyone else's message waits.</li>
+  <li><strong>Codex</strong> drains its input queue at the top of every iteration, so typed input joins before the next sampling request. Messages from other agents arrive through a mailbox and can cut a sampling request short.</li>
+  <li><strong>fx</strong> frames each boundary message by who wrote it: the user's as a live update, a parent agent's as that agent's feedback, and a subagent's as an untrusted report, never as the user's words. A message can also be a <em>handoff</em>, which ends the current turn so the queued prompt runs as its own turn.</li>
+  <li><strong>Kimi Code</strong> has three inbox lanes: normal prompts (the next turn), notify (messages that join the current turn at the next step, which is what steering moves a prompt into) and remind (system reminders attached to the next request).</li>
+  <li><strong>nanocode</strong> stores steering messages durably, each with the model-call index after which it was accepted, so a resumed turn knows exactly where each one belongs. It can optionally let a steer preempt a model call in progress.</li>
+</ul>
+<p>The trade-off is responsiveness against waste and confusion. Cancelling a model call responds fastest but throws away tokens already paid for, and if output was already visible it rewrites what the person saw. Waiting for the boundary never wastes work but can feel slow when a step runs a long command. Waiting for the end of the turn is right for "do this next" and wrong for "stop, that is the wrong file". Offering both a steer and a queue, as Pi, eve and Kimi Code do, lets the person say which they mean.</p>
+
+<h3 id="d-errors">Decision 5. Where do failures and retries live?</h3>
+<p>Two kinds of failure reach the loop, and the first-principles answer for each is different.</p>
+<p><strong>Tool failures are information.</strong> A failing test or a missing file is exactly what the model needs to see to change course, so every harness returns a tool error to the model as the tool's result instead of stopping. Trae Agent goes one step further: after a step with failed tools it adds a message saying the tool failed and suggesting a different approach or different parameters. Permission denials work the same way; the Claude Code study notes that a denial is returned with its reason so the model can try a safer action.</p>
+<p><strong>Model-call failures are not information</strong> the model can use: a rate limit, an overloaded server, a dropped stream. The model never sees them; the harness retries. The question is at which layer, and the nine harnesses spread across three.</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 250" width="760" style="max-width:100%;height:auto" role="img" aria-label="Three layers where retries live">
+  <defs><marker id="m8" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="10" width="740" height="230" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="22" y="30" text-anchor="start" style="fill:var(--ink);font-size:11px;font-weight:600">Session layer: retry the whole step from outside the loop</text>
+  <text x="22" y="46" text-anchor="start" style="fill:var(--ink2);font-size:10px">Pi: 3 retries with exponential backoff from 2 s; the failed attempt stays in the raw history but is hidden from the model</text>
+  <rect x="30" y="58" width="700" height="170" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="42" y="78" text-anchor="start" style="fill:var(--ink);font-size:11px;font-weight:600">Loop layer: a recovery ladder for errors that need a changed request</text>
+  <text x="42" y="94" text-anchor="start" style="fill:var(--ink2);font-size:10px">Claude Code: raise the output limit (up to 3 times), compact once, fall back to another model</text>
+  <text x="42" y="108" text-anchor="start" style="fill:var(--ink2);font-size:10px">nanocode: retry with thinking stripped, a plainer summary, fresh tools, or a smaller request</text>
+  <text x="42" y="122" text-anchor="start" style="fill:var(--ink2);font-size:10px">fx: capped waits (30 s), up to 3 resends after a content-filter block, then ask the user</text>
+  <rect x="50" y="136" width="660" height="80" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="62" y="156" text-anchor="start" style="fill:var(--ink);font-size:11px;font-weight:600">Transport layer: retry the same request</text>
+  <text x="62" y="172" text-anchor="start" style="fill:var(--ink2);font-size:10px">Codex: 5 stream retries, 4 request retries by default</text>
+  <text x="62" y="186" text-anchor="start" style="fill:var(--ink2);font-size:10px">Trae Agent: client retries (10 in its example configuration); any other exception ends the run</text>
+  <text x="62" y="200" text-anchor="start" style="fill:var(--ink2);font-size:10px">Qwen Code: retries, model fallback and output-limit escalation inside its chat layer</text>
+</svg></div>
+<figcaption>Figure 8. Retries at three layers. Most production harnesses use the inner two; Pi deliberately keeps its loop free of retry logic and retries from the session around it.</figcaption>
+</figure>
+
+<p>Why spread them out? Each layer can only fix what it can see. The transport layer can resend the same bytes, which fixes a dropped connection and nothing else. The loop layer can change the request: if the reply was cut off, ask for more output tokens; if the prompt is too long, compact and try again. Only the session layer can decide that a whole step should be redone, and it has to be careful about history: Pi keeps the failed attempt in its raw record but leaves it out of what the model sees, so the retry is clean without lying about what happened.</p>
+<p>One rule is shared by the careful harnesses: a retry must not leak half a reply. Qwen Code's design notes record a bug class from before its loop was unified: two of its surfaces dropped the tool calls collected before a retry or a model fallback and a third did not, so the same failure produced different behaviour depending on where you ran it.</p>
+
+<h3 id="d-hooks">Decision 6. Where can other code change the loop?</h3>
+<p>Everything a harness does beyond the bare cycle (compaction, permissions, reminders, stop checks, telemetry) needs a place to attach. Hard-coding it into the loop makes the loop unreadable; exposing named points keeps the loop small and puts the policies outside it. Pi and Kimi Code are the clearest examples, and they place their hooks almost identically.</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 220" width="760" style="max-width:100%;height:auto" role="img" aria-label="Hook points along one step in Pi and Kimi Code">
+  <defs><marker id="m9" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="20" y="104" width="92" height="34" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="66.0" y="124.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">boundary</text>
+  <rect x="124" y="104" width="92" height="34" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="170.0" y="124.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">request</text>
+  <path d="M114 121H121" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m9)"/>
+  <rect x="228" y="104" width="92" height="34" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="274.0" y="124.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">model call</text>
+  <path d="M218 121H225" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m9)"/>
+  <rect x="332" y="104" width="92" height="34" rx="7" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="378.0" y="124.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">tool calls</text>
+  <path d="M322 121H329" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m9)"/>
+  <rect x="436" y="104" width="92" height="34" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="482.0" y="124.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">results</text>
+  <path d="M426 121H433" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m9)"/>
+  <rect x="540" y="104" width="92" height="34" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="586.0" y="124.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">step end</text>
+  <path d="M530 121H537" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m9)"/>
+  <rect x="644" y="104" width="92" height="34" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="690.0" y="124.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">would stop</text>
+  <path d="M634 121H641" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m9)"/>
+  <text x="66" y="66" text-anchor="middle" style="fill:var(--kv);font-size:9px">steering queue</text>
+  <text x="66" y="79" text-anchor="middle" style="fill:var(--kv);font-size:9px">prepare next turn</text>
+  <text x="170" y="66" text-anchor="middle" style="fill:var(--kv);font-size:9px">prepare request</text>
+  <text x="170" y="79" text-anchor="middle" style="fill:var(--kv);font-size:9px">transform context</text>
+  <text x="378" y="66" text-anchor="middle" style="fill:var(--kv);font-size:9px">before tool call</text>
+  <text x="482" y="66" text-anchor="middle" style="fill:var(--kv);font-size:9px">after tool call</text>
+  <text x="586" y="66" text-anchor="middle" style="fill:var(--kv);font-size:9px">finish turn</text>
+  <text x="690" y="66" text-anchor="middle" style="fill:var(--kv);font-size:9px">follow-up queue</text>
+  <text x="20" y="36" text-anchor="start" style="fill:var(--ink);font-size:12px;font-weight:600">Pi (hooks above the step)</text>
+  <text x="66" y="160" text-anchor="middle" style="fill:var(--pre);font-size:9px">turn.starting</text>
+  <text x="66" y="173" text-anchor="middle" style="fill:var(--pre);font-size:9px">message.appending</text>
+  <text x="170" y="160" text-anchor="middle" style="fill:var(--pre);font-size:9px">step.starting</text>
+  <text x="378" y="160" text-anchor="middle" style="fill:var(--pre);font-size:9px">tool.batch-starting</text>
+  <text x="586" y="160" text-anchor="middle" style="fill:var(--pre);font-size:9px">step.stopping</text>
+  <text x="586" y="173" text-anchor="middle" style="fill:var(--pre);font-size:9px">step.continuing</text>
+  <text x="20" y="206" text-anchor="start" style="fill:var(--ink);font-size:12px;font-weight:600">Kimi Code (hooks below the step; every hook can block, with a recorded cause)</text>
+</svg></div>
+<figcaption>Figure 9. Hooks along the step. Pi's hooks return replacements (a new context, a new model, a block); Kimi Code's return verdicts, and each verdict is recorded as an event with its cause.</figcaption>
+</figure>
+
+<p>Two properties make a hook system safe to build on. First, a defined failure policy: Pi's contract says its queue and context hooks must never throw and must return a safe fallback; Kimi Code's hooks declare what happens if they fail, and a hook that blocks records why. Second, one path for every call: Pi exposes a function that runs a tool call through the same validation and before and after hooks as a model-issued call, so a tool that calls other tools cannot bypass a permission check. Chapter 8 covers hooks in depth; for the loop, the decision is only where the points are.</p>
+
+<h3 id="d-one">Decision 7. One loop, or one per surface?</h3>
+<p>A harness grows front doors: a terminal UI, a headless mode, an editor protocol, an SDK, a server, subagents. The tempting shortcut is to give each its own loop. Qwen Code's design notes are the best case study in this book of what that costs. Before its unification work it had <strong>seven</strong> implementations of the loop, one or more per surface. The copies drifted: the session turn cap was computed three different ways and one surface had none, the duplicate-tool-call suppression was written four times, one surface ran a cut-off edit that the others refused, and several bugs were found only by comparing copies. The fix was one shared loop in the core with surfaces as thin hosts, rolled out surface by surface behind a setting, each move gated on a parity suite. The next step, in progress, re-expresses that loop as an event-driven state machine with ten named events, one owner per piece of state, round identifiers so late events from an abandoned round are dropped, and a cap on how long cancellation may take.</p>
+<p>The others reached the same conclusion from the start. The Claude Code study reports one loop for the interactive CLI, headless mode, the SDK and the IDE. Kimi Code's terminal, web, desktop and editor surfaces are all clients of one server and one core loop, and its end-to-end tests run the same scenario on all four. The lesson is cheap to state and expensive to learn: the loop is policy, and policy must have exactly one copy.</p>
+
+<h3 id="d-verify">Decision 8. How do you know the loop is right?</h3>
+<p>Loops fail at the edges: a second empty reply, a steer that arrives during compaction, a crash between a tool's effect and its record. Ordinary tests rarely reach those orders of events. fx takes the most rigorous approach in this book: it writes formal models of its loop's rules in TLA+ and checks them with a model checker. Its agent-runtime model covers the empty-reply nudge (asked once, a second empty reply in a row ends the turn as failed, the step limit always holds) and the malformed-tool-call feedback (a third malformed reply ends the turn). Each model comes with deliberately planted bugs that the checker must catch, and a driver that runs the real binary against a local fake model and has the checker validate every recorded run. Its saved-turn model checks that the next request always starts with the previous request's exact messages, which is what keeps the provider's prompt cache valid.</p>
+<p>You do not need TLA+ for your first harness. You need the habit behind it: write down the loop's rules as statements ("a turn never ends with an unanswered tool call", "a steering message is delivered exactly once"), then test those statements, including in odd orders. Kimi Code's fake model and Pi's separate loop package make exactly that kind of test cheap.</p>
+
+<h2 id="harnesses">5. The nine loops, harness by harness</h2>
+<p>Each subsection describes one loop as a design: what flows where, what is decided at each point, and the reasoning the harness gives or that its design implies. Section 4 already compared the decisions; here you see how they fit together inside one system.</p>
+
+<h3 id="h-pi">Pi: two nested loops and two queues</h3>
+<p>Pi keeps its loop in a small package of its own, separate from the coding agent built on it, and works with its own message type until the very last moment, when it converts to the provider's format. The inner loop runs while there are tool calls to answer or steering messages waiting. The outer loop exists for one reason: when the inner loop would end, it checks the follow-up queue, and if anything is there it goes around again.</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 150" width="760" style="max-width:100%;height:auto" role="img" aria-label="Pi's loop">
+  <defs><marker id="m10" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="24" width="104" height="46" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="62.0" y="43.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">steering</text>
+  <text x="62.0" y="57.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">queue</text>
+  <rect x="134" y="24" width="104" height="46" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="186.0" y="43.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">prepare next</text>
+  <text x="186.0" y="57.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">turn</text>
+  <path d="M116 47.0H131" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m10)"/>
+  <rect x="258" y="24" width="104" height="46" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="310.0" y="43.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">prepare</text>
+  <text x="310.0" y="57.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">request</text>
+  <path d="M240 47.0H255" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m10)"/>
+  <rect x="382" y="24" width="104" height="46" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="434.0" y="50.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">stream reply</text>
+  <path d="M364 47.0H379" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m10)"/>
+  <rect x="506" y="24" width="104" height="46" rx="7" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="558.0" y="43.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">check calls,</text>
+  <text x="558.0" y="57.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">run together</text>
+  <path d="M488 47.0H503" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m10)"/>
+  <path d="M558.0 72V100H62.0V74" style="fill:none;stroke:var(--kv);stroke-width:1.3" marker-end="url(#m10)"/>
+  <text x="310.0" y="95" text-anchor="middle" style="fill:var(--ink2);font-size:10px">inner loop: more tool calls or steering</text>
+  <rect x="630" y="24" width="120" height="46" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="690.0" y="43.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">follow-up</text>
+  <text x="690.0" y="57.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">queue?</text>
+  <path d="M612 47H626" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m10)"/>
+</svg></div>
+<figcaption>Figure 10. Pi. The inner loop serves tool calls and steering; the follow-up check on the right feeds the outer loop.</figcaption>
+</figure>
+
+<p>Decisions worth copying. The hooks are the policy: <em>prepare next turn</em> can swap the context, the model or the thinking level between steps (compaction runs here), and <em>finish turn</em> can end the run or force one more request. A reply cut off by its output limit has all its tool calls failed rather than run, with a message telling the model to reissue them complete. Changes to the available tools are declared to the model as a system message in the transcript, so replaying the transcript always reproduces exactly which tools were offered. Errors end the loop; retries live in the session around it.</p>
+<p>What it leaves out on purpose: no step limit, no loop detection, no durability. Pi's position is a small core you can read in an afternoon, with everything else added by extensions.</p>
+
+<h3 id="h-pidurable">Pi Durable: the same loop as a state machine</h3>
+<p>Pi Durable is a specification and implementation of the same agent as durable records. A model response is a task, and its progress is a named phase stored with it: <em>prepare</em>, <em>request</em>, <em>poll</em> (for providers that answer later through a handle), <em>retry</em> (with the time to wait until), <em>tools</em> (waiting on one task per tool call), and finishing phases for hooks that run after tools, after the answer, or when the run yields. Each phase change is one atomic commit, and only committed state is ever visible.</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 170" width="760" style="max-width:100%;height:auto" role="img" aria-label="Pi Durable generation phases">
+  <defs><marker id="m11" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="30" width="128" height="46" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="74.0" y="56.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">prepare</text>
+  <rect x="162" y="30" width="128" height="46" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="226.0" y="56.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">request</text>
+  <path d="M140 53.0H159" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m11)"/>
+  <rect x="314" y="30" width="128" height="46" rx="7" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="378.0" y="49.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">tools</text>
+  <text x="378.0" y="63.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">one task per call</text>
+  <path d="M292 53.0H311" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m11)"/>
+  <rect x="466" y="30" width="128" height="46" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="530.0" y="56.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">after tools</text>
+  <path d="M444 53.0H463" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m11)"/>
+  <rect x="618" y="30" width="128" height="46" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="682.0" y="49.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">finish</text>
+  <text x="682.0" y="63.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">or next generation</text>
+  <path d="M596 53.0H615" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m11)"/>
+  <rect x="100" y="110" width="128" height="36" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="164.0" y="131.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">retry until a time</text>
+  <rect x="240" y="110" width="128" height="36" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="304.0" y="131.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">poll a handle</text>
+  <path d="M190 78V106" style="fill:none;stroke:var(--ink2);stroke-width:1.3;stroke-dasharray:4 3" marker-end="url(#m11)"/>
+  <path d="M270 78V106" style="fill:none;stroke:var(--ink2);stroke-width:1.3;stroke-dasharray:4 3" marker-end="url(#m11)"/>
+  <text x="10" y="18" text-anchor="start" style="fill:var(--kv);font-size:10px">each arrow is one atomic commit; a crash resumes in the stored phase</text>
+</svg></div>
+<figcaption>Figure 11. Pi Durable. The loop is a sequence of stored phases; the next generation is a new task that receives the run.</figcaption>
+</figure>
+
+<p>Two design choices carry the weight. The <strong>effect sandwich</strong>: commit the intent, perform the external effect, commit the outcome. If the process dies in the middle, reopening finds a stored intent and must retry safely, poll, or record that the effect was interrupted (Chapter 11 builds this). And <strong>turn limits as failed runs</strong>: when a run reaches its agent's maximum number of turns, its inputs are settled as unanswered with a <code>turn_limit</code> reason rather than silently stopping, so the caller always learns how the run ended. Its inbox has the same steer and follow-up lanes as Pi, plus display-only writes that never reach the model.</p>
+
+<h3 id="h-eve">eve: no loop, a kernel and an engine</h3>
+<p>eve's harness does one step per call and returns the new session plus what should run next; the Workflow SDK drives it and saves a checkpoint at every step boundary. Before it ever calls the model, the step settles anything that happened outside the turn: results from background work, answers to questions and approvals, newly delivered messages. If the turn is waiting for a person to approve something, the step <em>parks</em>: it returns with nothing scheduled and no compute held, and a later delivery wakes it. If the turn would end while background tasks are still working, it returns <em>held</em> on those tasks instead of ending.</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 180" width="760" style="max-width:100%;height:auto" role="img" aria-label="eve's step">
+  <defs><marker id="m12" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="24" width="104" height="46" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="62.0" y="43.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">settle</text>
+  <text x="62.0" y="57.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">background work</text>
+  <rect x="134" y="24" width="104" height="46" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="186.0" y="43.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">admit messages,</text>
+  <text x="186.0" y="57.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">answers</text>
+  <path d="M116 47.0H131" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m12)"/>
+  <rect x="258" y="24" width="104" height="46" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="310.0" y="43.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">approvals</text>
+  <text x="310.0" y="57.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">pending?</text>
+  <path d="M240 47.0H255" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m12)"/>
+  <rect x="382" y="24" width="104" height="46" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="434.0" y="43.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">model call +</text>
+  <text x="434.0" y="57.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">inline tools</text>
+  <path d="M364 47.0H379" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m12)"/>
+  <rect x="506" y="24" width="104" height="46" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="558.0" y="43.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">end turn, or</text>
+  <text x="558.0" y="57.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">held on tasks</text>
+  <path d="M488 47.0H503" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m12)"/>
+  <path d="M558.0 72V132H62.0V74" style="fill:none;stroke:var(--kv);stroke-width:1.3" marker-end="url(#m12)"/>
+  <text x="310.0" y="127" text-anchor="middle" style="fill:var(--ink2);font-size:10px">engine calls the next step, possibly in another process</text>
+  <rect x="630" y="24" width="120" height="46" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="690.0" y="43.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">save step,</text>
+  <text x="690.0" y="57.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">schedule next</text>
+  <path d="M612 47H626" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m12)"/>
+  <rect x="250" y="86" width="120" height="26" rx="7" style="fill:var(--panel2);stroke:var(--line)"/>
+  <text x="310.0" y="102.2" text-anchor="middle" style="fill:var(--ink);font-size:9px">park: wait for a person</text>
+  <path d="M310 72V84" style="fill:none;stroke:var(--ink2);stroke-width:1.3;stroke-dasharray:4 3" marker-end="url(#m12)"/>
+</svg></div>
+<figcaption>Figure 12. eve. Each box runs inside one durable step; parking and holding let a turn wait for people or tasks without a running process.</figcaption>
+</figure>
+
+<p>Why build it this way: eve sessions are meant to live for days in Slack threads and on servers that redeploy. A step function lets the engine move an idle session to a new deployment and recover after crashes without any loop code knowing. The costs are documented with unusual honesty: every piece of state must be saveable; only the eve version that started a workflow run can replay it, so an upgrade can strand sessions; and grouping several model calls into one step trades checkpoint overhead for a larger replay unit. Limits are money, not steps: a usage budget checked before every model call, which pauses the turn and asks the person to continue or stop. A tool can also end the turn by itself when its success is the whole answer, such as posting a reaction.</p>
+
+<h3 id="h-fx">fx: a careful in-process loop with formal rules</h3>
+<p>fx is a native binary with one loop over steps. What makes it distinctive is how much happens at the step boundary and how carefully the order is fixed: notes queued by the previous step's gate, then a changed runtime context (a branch switch, for example), then any steering, each framed by who wrote it. The order is not cosmetic. A provider's prompt cache only reuses a request up to the first message that differs, so fx guarantees that each request starts with the previous request's exact messages, and it checks that guarantee with a formal model.</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 150" width="760" style="max-width:100%;height:auto" role="img" aria-label="fx's loop">
+  <defs><marker id="m13" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="24" width="104" height="46" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="62.0" y="43.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">boundary notes,</text>
+  <text x="62.0" y="57.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">steering</text>
+  <rect x="134" y="24" width="104" height="46" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="186.0" y="43.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">build prompt</text>
+  <text x="186.0" y="57.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">(stable prefix)</text>
+  <path d="M116 47.0H131" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m13)"/>
+  <rect x="258" y="24" width="104" height="46" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="310.0" y="50.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">model call</text>
+  <path d="M240 47.0H255" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m13)"/>
+  <rect x="382" y="24" width="104" height="46" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="434.0" y="50.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">admit calls</text>
+  <path d="M364 47.0H379" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m13)"/>
+  <rect x="506" y="24" width="104" height="46" rx="7" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="558.0" y="43.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">reads together,</text>
+  <text x="558.0" y="57.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">up to a writer</text>
+  <path d="M488 47.0H503" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m13)"/>
+  <path d="M558.0 72V100H62.0V74" style="fill:none;stroke:var(--kv);stroke-width:1.3" marker-end="url(#m13)"/>
+  <text x="310.0" y="95" text-anchor="middle" style="fill:var(--ink2);font-size:10px">next step (unlimited by default)</text>
+  <rect x="630" y="24" width="120" height="46" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="690.0" y="43.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">gate: repeat</text>
+  <text x="690.0" y="57.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">guards, review</text>
+  <path d="M612 47H626" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m13)"/>
+</svg></div>
+<figcaption>Figure 13. fx. The gate after each step can stop a blind retry loop or ask the model to review files it just wrote.</figcaption>
+</figure>
+
+<p>Its guards are each a response to a failure seen in practice: one nudge for an empty reply, at most two rounds of feedback for malformed tool calls, an end to the turn after three steps of the same failing shell command with nothing edited in between, and an optional review prompt after any step that wrote files. Recovery for model calls lives in its own module with capped waits, content-filter resends and a guard against crash loops that asks before resuming after two crashes. Every one of these rules has a TLA+ model with planted bugs (section 4, decision 8).</p>
+
+<h3 id="h-nano">nanocode: a journaled runtime that hosts other harnesses</h3>
+<p>nanocode is an SDK that runs the Codex and Claude harnesses with their own prompts and tools, so its loop lives in each vendor driver while the runtime around it provides durability, steering, subagents and Code Mode. In the Claude driver, a turn is a sequence of numbered model calls resumed from a stored cursor. At each index it consumes any durable steering due at that boundary, compacts inside the turn if the context passed its threshold, and makes the model call as a journaled effect; tool calls are journaled too.</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 150" width="760" style="max-width:100%;height:auto" role="img" aria-label="nanocode's turn">
+  <defs><marker id="m14" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="24" width="128" height="46" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="74.0" y="43.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">resume cursor</text>
+  <text x="74.0" y="57.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">from journal</text>
+  <rect x="160" y="24" width="128" height="46" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="224.0" y="43.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">consume durable</text>
+  <text x="224.0" y="57.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">steers</text>
+  <path d="M140 47.0H157" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m14)"/>
+  <rect x="310" y="24" width="128" height="46" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="374.0" y="43.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">compact if</text>
+  <text x="374.0" y="57.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">over threshold</text>
+  <path d="M290 47.0H307" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m14)"/>
+  <rect x="460" y="24" width="128" height="46" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="524.0" y="43.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">model call</text>
+  <text x="524.0" y="57.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">(journaled)</text>
+  <path d="M440 47.0H457" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m14)"/>
+  <rect x="610" y="24" width="128" height="46" rx="7" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="674.0" y="43.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">tool calls</text>
+  <text x="674.0" y="57.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">(journaled)</text>
+  <path d="M590 47.0H607" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m14)"/>
+  <path d="M674.0 72V100H74.0V74" style="fill:none;stroke:var(--kv);stroke-width:1.3" marker-end="url(#m14)"/>
+  <text x="374.0" y="95" text-anchor="middle" style="fill:var(--ink2);font-size:10px">next model-call index</text>
+</svg></div>
+<figcaption>Figure 14. nanocode. Every effect is journaled with its index, so a turn that started in one process can finish in another.</figcaption>
+</figure>
+
+<p>When a model call fails, the driver retries with a changed request and records which change it tried: dropping unsigned thinking, using a plainer summary, refreshing tools, or shrinking a request that was too large. A steer can optionally preempt a model call in progress. The design bet is that the vendor harnesses are already tuned for their models, so the most valuable thing a runtime can add is making them durable and embeddable, not replacing their loop.</p>
+
+<h3 id="h-codex">Codex: a stateless loop built around the cache</h3>
+<p>OpenAI's own description is the simplest statement of the loop in this book: send the prompt, stream the reply, run any requested tool, append its output, query again, and end the turn when the model emits an assistant message instead of a tool call. Codex deliberately does not ask the server to remember earlier responses; every request carries the full history, to keep requests stateless and to support zero-data-retention customers. That makes the cache central: changing tools, the model, the sandbox, the approval mode or the working directory mid-conversation breaks the cached prefix, so Codex appends a new message describing the change instead of editing earlier content (<a href="https://openai.com/index/unrolling-the-codex-agent-loop">OpenAI</a>).</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 150" width="760" style="max-width:100%;height:auto" role="img" aria-label="Codex's turn loop">
+  <defs><marker id="m15" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="24" width="104" height="46" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="62.0" y="43.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">drain input</text>
+  <text x="62.0" y="57.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">queue</text>
+  <rect x="134" y="24" width="104" height="46" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="186.0" y="43.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">capture step</text>
+  <text x="186.0" y="57.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">context once</text>
+  <path d="M116 47.0H131" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m15)"/>
+  <rect x="258" y="24" width="104" height="46" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="310.0" y="43.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">compact if</text>
+  <text x="310.0" y="57.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">needed</text>
+  <path d="M240 47.0H255" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m15)"/>
+  <rect x="382" y="24" width="104" height="46" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="434.0" y="43.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">stream the</text>
+  <text x="434.0" y="57.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">reply</text>
+  <path d="M364 47.0H379" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m15)"/>
+  <rect x="506" y="24" width="104" height="46" rx="7" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="558.0" y="43.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">tools start as</text>
+  <text x="558.0" y="57.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">each completes</text>
+  <path d="M488 47.0H503" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m15)"/>
+  <path d="M558.0 72V100H62.0V74" style="fill:none;stroke:var(--kv);stroke-width:1.3" marker-end="url(#m15)"/>
+  <text x="310.0" y="95" text-anchor="middle" style="fill:var(--ink2);font-size:10px">follow-up needed: model asked for tools, or input is pending</text>
+  <rect x="630" y="24" width="120" height="46" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="690.0" y="43.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Stop hook:</text>
+  <text x="690.0" y="57.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">allow or block</text>
+  <path d="M612 47H626" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m15)"/>
+</svg></div>
+<figcaption>Figure 15. Codex. A Stop hook that blocks adds its message and the loop continues inside the same turn.</figcaption>
+</figure>
+
+<p>Three details show the care. The step context (settings, the tools offered, the tools that will run) is captured once per step, so what the model was offered and what can execute never drift apart inside a step. Tools start as soon as each call is complete in the stream and their results are kept in request order. An experimental option starts compaction in the background at a lower threshold so it is ready when needed, and it is tagged as mid-turn or post-turn depending on whether the model still has work to do. Retries for the stream and the request live inside the sampling call, invisible to the loop.</p>
+
+<h3 id="h-cc">Claude Code: a simple loop and heavy infrastructure</h3>
+<p>The Claude Code study describes its core as a simple while-loop that calls the model, runs tools and repeats, and argues that the system invests in deterministic infrastructure rather than decision scaffolding such as explicit planners or state graphs. Its reactive ReAct design trades search completeness for simplicity and latency: each turn commits to one action sequence without backtracking (<a href="https://arxiv.org/html/2604.14228v1">Dive into Claude Code</a>).</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 150" width="760" style="max-width:100%;height:auto" role="img" aria-label="Claude Code's iteration">
+  <defs><marker id="m16" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="24" width="128" height="46" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="74.0" y="43.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">settings,</text>
+  <text x="74.0" y="57.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">state</text>
+  <rect x="160" y="24" width="128" height="46" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="224.0" y="43.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">assemble</text>
+  <text x="224.0" y="57.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">context</text>
+  <path d="M140 47.0H157" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m16)"/>
+  <rect x="310" y="24" width="128" height="46" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="374.0" y="43.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">five context</text>
+  <text x="374.0" y="57.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">shapers</text>
+  <path d="M290 47.0H307" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m16)"/>
+  <rect x="460" y="24" width="128" height="46" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="524.0" y="43.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">model call</text>
+  <text x="524.0" y="57.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">(streaming)</text>
+  <path d="M440 47.0H457" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m16)"/>
+  <rect x="610" y="24" width="128" height="46" rx="7" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="674.0" y="43.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">permission gate,</text>
+  <text x="674.0" y="57.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">run tools</text>
+  <path d="M590 47.0H607" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m16)"/>
+  <path d="M674.0 72V100H74.0V74" style="fill:none;stroke:var(--kv);stroke-width:1.3" marker-end="url(#m16)"/>
+  <text x="374.0" y="95" text-anchor="middle" style="fill:var(--ink2);font-size:10px">stop check: five conditions</text>
+</svg></div>
+<figcaption>Figure 16. Claude Code, per the source-level study of v2.1.88. The loop is an async generator that every surface consumes.</figcaption>
+</figure>
+
+<p>The loop yields a stream of events, so the CLI, the SDK and the IDE all consume the same loop. Its state between iterations lives in one object, and the study counts seven places where the loop continues, each replacing that object in one whole assignment rather than mutating fields, which keeps every iteration's state consistent. It stops on five conditions: no tool use, the maximum number of turns, a prompt that is too long after recovery failed, a hook that stops continuation, or an abort. Recovery is a ladder: raise the output limit up to three times per turn, compact reactively at most once, then end with a prompt-too-long reason; a streaming fallback and a fallback model sit beside it.</p>
+
+<h3 id="h-kimi">Kimi Code: the loop as a log</h3>
+<p>Kimi Code's loop is an actor that owns three inbox lanes (normal prompts, notify messages that join the current turn, and system reminders) and records every change as an event. Six hook points (turn starting, message appending, step starting, tool batch starting, step stopping, step continuing) can each block with a recorded cause; even the step limit is just one blocking hook. A step's tool calls all start together, and the user can move a long-running tool to the background, at which point the model receives an acknowledgement and the turn continues.</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 150" width="760" style="max-width:100%;height:auto" role="img" aria-label="Kimi Code's loop">
+  <defs><marker id="m17" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="24" width="104" height="46" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="62.0" y="43.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">inbox: normal,</text>
+  <text x="62.0" y="57.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">notify, remind</text>
+  <rect x="134" y="24" width="104" height="46" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="186.0" y="43.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">turn.starting,</text>
+  <text x="186.0" y="57.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">step.starting</text>
+  <path d="M116 47.0H131" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m17)"/>
+  <rect x="258" y="24" width="104" height="46" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="310.0" y="50.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">model call</text>
+  <path d="M240 47.0H255" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m17)"/>
+  <rect x="382" y="24" width="104" height="46" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="434.0" y="43.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">tool.batch-</text>
+  <text x="434.0" y="57.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">starting</text>
+  <path d="M364 47.0H379" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m17)"/>
+  <rect x="506" y="24" width="104" height="46" rx="7" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="558.0" y="43.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">tools start</text>
+  <text x="558.0" y="57.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">together</text>
+  <path d="M488 47.0H503" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m17)"/>
+  <path d="M558.0 72V100H62.0V74" style="fill:none;stroke:var(--kv);stroke-width:1.3" marker-end="url(#m17)"/>
+  <rect x="630" y="24" width="120" height="46" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="690.0" y="43.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">step.stopping /</text>
+  <text x="690.0" y="57.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">step.continuing</text>
+  <path d="M612 47H626" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m17)"/>
+  <rect x="10" y="104" width="740" height="30" rx="7" style="fill:var(--panel);stroke:var(--line)"/>
+  <text x="380.0" y="122.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">every box above appends events to one log; the loop's state is computed from that log</text>
+</svg></div>
+<figcaption>Figure 17. Kimi Code. Hooks give verdicts; the log gives resumability and replay for free.</figcaption>
+</figure>
+
+<p>The reasoning is the same as section 4's decision 1: if all state is a projection of a log, then debugging is replaying the log, resuming is replaying the log, and a crash halfway through a write shows up as a truncated last line that the reader can report instead of failing the whole session. The cost is discipline: nothing may change state except by recording an event.</p>
+
+<h3 id="h-qwen">Qwen Code: from seven loops to one</h3>
+<p>Qwen Code's loop today has three layers. A chat layer owns the provider request, retries, model fallback, output-limit escalation, auto-compaction and history. A client layer owns one interaction step: prompt-submit hooks, reminders, loop detection, the turn cap, and the continuations that run after the model stops (the Stop hook and steering). The shared loop on top sends a request, streams the reply, runs the requested tools as one batch with read, search and fetch calls in parallel, sends results back, and repeats.</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 150" width="760" style="max-width:100%;height:auto" role="img" aria-label="Qwen Code's loop">
+  <defs><marker id="m18" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="24" width="128" height="46" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="74.0" y="43.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">hooks,</text>
+  <text x="74.0" y="57.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">reminders</text>
+  <rect x="160" y="24" width="128" height="46" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="224.0" y="43.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">loop</text>
+  <text x="224.0" y="57.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">detection</text>
+  <path d="M140 47.0H157" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m18)"/>
+  <rect x="310" y="24" width="128" height="46" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="374.0" y="43.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">model round</text>
+  <text x="374.0" y="57.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">(chat layer)</text>
+  <path d="M290 47.0H307" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m18)"/>
+  <rect x="460" y="24" width="128" height="46" rx="7" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="524.0" y="43.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">tool batch:</text>
+  <text x="524.0" y="57.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">safe kinds parallel</text>
+  <path d="M440 47.0H457" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m18)"/>
+  <rect x="610" y="24" width="128" height="46" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="674.0" y="43.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">named stop</text>
+  <text x="674.0" y="57.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">reason</text>
+  <path d="M590 47.0H607" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m18)"/>
+  <path d="M674.0 72V100H74.0V74" style="fill:none;stroke:var(--kv);stroke-width:1.3" marker-end="url(#m18)"/>
+  <text x="374.0" y="95" text-anchor="middle" style="fill:var(--ink2);font-size:10px">up to 100 rounds per prompt</text>
+</svg></div>
+<figcaption>Figure 18. Qwen Code. Every way out of the loop has a name, so a caller always knows why it stopped.</figcaption>
+</figure>
+
+<p>Two choices stand out. Every exit has a named reason (completed, cancelled, loop detected, duplicate provider call, a tool ended the turn, the session turn cap, the token limit, a blocked prompt), which makes the loop's behaviour testable and visible. And the next-speaker check inherited from Gemini CLI, a second model call that reads the last reply and decides whether the model or the user should speak next, is now off by default: an extra model call on every stop is expensive, and the decision it makes is one the stop signal and the completion checks already cover. The unification story in decision 7 is the most useful part of Qwen Code for anyone designing a harness.</p>
+
+<h3 id="h-trae">Trae Agent: the minimum that works for research</h3>
+<p>Trae Agent's loop counts steps up to a maximum (200 in its example configuration). Each step makes one blocking model call. If the reply calls <code>task_done</code>, the harness checks completion (in benchmark mode, that the change minus tests is not empty) and either ends or tells the model its patch is empty. If the reply has no tool calls, the harness says the task does not look complete. Otherwise it runs the calls, in parallel or in order by one setting, adds a reflection message for any failed tool, and records the whole step to a trajectory file.</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 150" width="760" style="max-width:100%;height:auto" role="img" aria-label="Trae Agent's loop">
+  <defs><marker id="m19" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="24" width="128" height="46" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="74.0" y="50.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">step ≤ 200</text>
+  <rect x="160" y="24" width="128" height="46" rx="7" style="fill:var(--pre-s);stroke:var(--pre)"/>
+  <text x="224.0" y="43.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">model call</text>
+  <text x="224.0" y="57.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">(blocking)</text>
+  <path d="M140 47.0H157" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m19)"/>
+  <rect x="310" y="24" width="128" height="46" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="374.0" y="43.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">task_done?</text>
+  <text x="374.0" y="57.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">patch empty?</text>
+  <path d="M290 47.0H307" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m19)"/>
+  <rect x="460" y="24" width="128" height="46" rx="7" style="fill:var(--dec-s);stroke:var(--dec)"/>
+  <text x="524.0" y="43.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">run tools</text>
+  <text x="524.0" y="57.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">(flag: parallel)</text>
+  <path d="M440 47.0H457" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m19)"/>
+  <rect x="610" y="24" width="128" height="46" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="674.0" y="43.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">reflect on</text>
+  <text x="674.0" y="57.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">failures, record</text>
+  <path d="M590 47.0H607" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m19)"/>
+  <path d="M674.0 72V100H74.0V74" style="fill:none;stroke:var(--kv);stroke-width:1.3" marker-end="url(#m19)"/>
+  <text x="374.0" y="95" text-anchor="middle" style="fill:var(--ink2);font-size:10px">next step</text>
+</svg></div>
+<figcaption>Figure 19. Trae Agent. No streaming, no steering, no compaction; every step is recorded, which is what a benchmark harness needs.</figcaption>
+</figure>
+
+<p>The simplicity is a feature for its purpose. A small, stable loop means a change to one tool or one prompt is the only thing that changed between two experiments, and a full trajectory per step makes failures analysable. Its weaknesses for interactive use follow from the same choices: one exception ends the run, there is no way to steer, and a long task eventually fills the window.</p>
+
+<h2 id="compare">6. All nine in one table</h2>
+<div class="tbl"><table>
+  <tr><th>Harness</th><th>Loop owner</th><th>Default limit</th><th>Extra stop checks</th><th>Tools start</th><th>Parallel rule</th><th>Mid-turn input</th><th>Model-call retries</th><th>After a crash</th></tr>
+  <tr><td>Pi</td><td>In-process, nested loops</td><td>None</td><td>Finish-turn hook</td><td>After reply</td><td>Parallel unless a sequential tool is in the batch</td><td>Steering at boundary; follow-up at end</td><td>Session layer: 3, from 2 s</td><td>In-flight step lost</td></tr>
+  <tr><td>Pi Durable</td><td>Durable phases</td><td>Per-agent max turns (failed run)</td><td>After-tools and after-run hooks</td><td>After reply</td><td>One task per call; sequential rounds one at a time</td><td>Inbox: steer, follow-up, write</td><td>Stored retry phase</td><td>Resume the stored phase</td></tr>
+  <tr><td>eve</td><td>Step function + workflow engine</td><td>Usage budget (40M new input tokens), then ask</td><td>Tools that end the turn</td><td>After reply</td><td>Inline tool calls within the step</td><td>Steer (cancel if no output yet) or queue</td><td>Inside the step</td><td>Replay from last saved step</td></tr>
+  <tr><td>fx</td><td>In-process step loop</td><td>Unlimited (0)</td><td>Empty-reply nudge, repeat-failure guard, Stop hook, optional review</td><td>After reply</td><td>Reads together up to the first writer</td><td>Boundary, framed by author; or handoff</td><td>Recovery module: capped waits, filter resends</td><td>Saved turn; asks after two crashes</td></tr>
+  <tr><td>nanocode</td><td>Journaled runtime, vendor drivers</td><td>No step cap found</td><td>Per vendor driver</td><td>After reply</td><td>Per vendor driver</td><td>Durable steers by model-call index; optional preempt</td><td>Retries by changed request</td><td>Turn finishes in a new process</td></tr>
+  <tr><td>Codex</td><td>In-process turn loop</td><td>None; optional token budget</td><td>Stop hook can block</td><td>During the stream</td><td>Read-write lock</td><td>Queue drained each iteration; agent mail can preempt</td><td>Transport: 5 stream, 4 request</td><td>Resume from rollout file</td></tr>
+  <tr><td>Claude Code</td><td>In-process async generator</td><td>Configurable max turns</td><td>Hook can stop continuation</td><td>During the stream</td><td>Concurrency-safe vs exclusive; shell error aborts siblings</td><td>Not described in the study</td><td>Ladder: output ×3, compact ×1, fallback model</td><td>Resume from transcript</td></tr>
+  <tr><td>Kimi Code</td><td>Event-sourced actor</td><td>Off unless configured</td><td>Six blocking hook points</td><td>After reply</td><td>All start together; detachable</td><td>Inbox: normal, notify, remind</td><td>Recorded as events</td><td>Replay log; continue unanswered calls</td></tr>
+  <tr><td>Qwen Code</td><td>In-process, unified (moving to event bus)</td><td>100 rounds per prompt</td><td>Loop detection, named stop reasons</td><td>After reply</td><td>Read, search, fetch in parallel</td><td>Steering at the model boundary</td><td>Chat layer: retry, fallback, escalation</td><td>Recovery repairs history (Ch. 11)</td></tr>
+  <tr><td>Trae Agent</td><td>Plain bounded loop</td><td>200 steps</td><td><code>task_done</code> + non-empty patch</td><td>After reply</td><td>One flag: all or none</td><td>None</td><td>Client retries; other errors end the run</td><td>Lost; trajectory kept</td></tr>
+</table></div>
+
+<h2 id="choose">7. Choosing a loop for what you want to build</h2>
+<p>You do not have to pick a harness; you have to pick answers. The questions below are ordered by how hard each is to change later.</p>
+
+<figure>
+<div class="svgwrap"><svg viewBox="0 0 760 370" width="760" style="max-width:100%;height:auto" role="img" aria-label="Choosing a loop design">
+  <defs><marker id="m20" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink2)"/></marker></defs>
+  <rect x="10" y="14" width="230" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="125.0" y="35.5" text-anchor="middle" style="fill:var(--ink);font-size:11px;font-weight:600">Must a turn outlive</text>
+  <text x="125.0" y="50.5" text-anchor="middle" style="fill:var(--ink2);font-size:11px">the process?</text>
+  <rect x="280" y="14" width="220" height="50" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="390.0" y="35.5" text-anchor="middle" style="fill:var(--ink);font-size:11px">A. In-process loop,</text>
+  <text x="390.0" y="50.5" text-anchor="middle" style="fill:var(--ink);font-size:11px">state in one saveable object</text>
+  <path d="M242 39H276" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m20)"/>
+  <text x="248" y="33" text-anchor="start" style="fill:var(--ink2);font-size:10px">no</text>
+  <rect x="10" y="96" width="230" height="50" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="125.0" y="117.5" text-anchor="middle" style="fill:var(--ink);font-size:11px;font-weight:600">Can you run on a</text>
+  <text x="125.0" y="132.5" text-anchor="middle" style="fill:var(--ink2);font-size:11px">workflow engine?</text>
+  <path d="M125 66V92" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m20)"/>
+  <text x="131" y="84" text-anchor="start" style="fill:var(--ink2);font-size:10px">yes</text>
+  <rect x="280" y="96" width="220" height="50" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="390.0" y="117.5" text-anchor="middle" style="fill:var(--ink);font-size:11px">C. Step function</text>
+  <text x="390.0" y="132.5" text-anchor="middle" style="fill:var(--ink);font-size:11px">(eve's shape)</text>
+  <path d="M242 121H276" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m20)"/>
+  <text x="248" y="115" text-anchor="start" style="fill:var(--ink2);font-size:10px">yes</text>
+  <rect x="530" y="96" width="220" height="50" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="640.0" y="117.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">B. Event log or D. journal</text>
+  <text x="640.0" y="131.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">(Kimi Code, nanocode, Pi Durable)</text>
+  <path d="M125 148V166H640V150" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m20)"/>
+  <text x="380" y="162" text-anchor="start" style="fill:var(--ink2);font-size:10px">no</text>
+  <text x="10" y="196" text-anchor="start" style="fill:var(--ink);font-size:11px;font-weight:600">Then, whatever the owner:</text>
+  <rect x="10" y="206" width="230" height="44" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="125.0" y="224.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Will people type</text>
+  <text x="125.0" y="238.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">while it works?</text>
+  <rect x="280" y="206" width="260" height="44" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="410.0" y="224.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Steer at the boundary</text>
+  <text x="410.0" y="238.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">+ a follow-up queue</text>
+  <path d="M242 228H276" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m20)"/>
+  <text x="248" y="222" text-anchor="start" style="fill:var(--ink2);font-size:10px">yes</text>
+  <rect x="10" y="260" width="230" height="44" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="125.0" y="278.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Can tools change</text>
+  <text x="125.0" y="292.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">the world?</text>
+  <rect x="280" y="260" width="260" height="44" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="410.0" y="278.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Classify read vs write;</text>
+  <text x="410.0" y="292.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">reads together, writes alone</text>
+  <path d="M242 282H276" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m20)"/>
+  <text x="248" y="276" text-anchor="start" style="fill:var(--ink2);font-size:10px">yes</text>
+  <rect x="10" y="314" width="230" height="44" rx="7" style="fill:var(--kv-s);stroke:var(--kv)"/>
+  <text x="125.0" y="332.6" text-anchor="middle" style="fill:var(--ink);font-size:10px;font-weight:600">Will it run</text>
+  <text x="125.0" y="346.6" text-anchor="middle" style="fill:var(--ink2);font-size:10px">unattended?</text>
+  <rect x="280" y="314" width="260" height="44" rx="7" style="fill:var(--good-s);stroke:var(--good)"/>
+  <text x="410.0" y="332.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">Budget + loop detection</text>
+  <text x="410.0" y="346.6" text-anchor="middle" style="fill:var(--ink);font-size:10px">+ a stop that checks the world</text>
+  <path d="M242 336H276" style="fill:none;stroke:var(--ink2);stroke-width:1.3" marker-end="url(#m20)"/>
+  <text x="248" y="330" text-anchor="start" style="fill:var(--ink2);font-size:10px">yes</text>
+</svg></div>
+<figcaption>Figure 20. A decision path. The first two questions decide the loop's owner and are expensive to change; the last three add policies that any owner can carry.</figcaption>
+</figure>
+
+<p>For the harness you build in this book: shape A first, with all loop state in one object and the loop body written as a function that takes the state and returns the next state. That keeps Chapter 11's move to durability a matter of saving the object at each boundary, not a rewrite. Steering and a follow-up queue come in the exercises; limits and a loop detector before you ever run unattended.</p>
+
+<h2 id="research">8. Research and how Chinese teams see the loop</h2>
+<ul>
+  <li><strong>ReAct (2022)</strong> introduced interleaving reasoning, action and observation. Every loop here is ReAct plus engineering; the Claude Code study names it explicitly and contrasts it with graph-based orchestration, where control flow is a state machine with typed edges, and with tree search, which explores several trajectories before committing.</li>
+  <li><strong>The Ralph loop</strong>: when the model tries to stop, a hook re-injects the original goal into a fresh context window, and files carry state between iterations. LangChain describes it as a harness pattern for long goals. It is an outer loop around the loop in this chapter, and the Stop hooks in Codex and Claude Code are the mechanism it needs.</li>
+  <li><strong>Chinese practice.</strong> Chinese analyses stress that the innermost loop can be about 200 lines and that the hard part is everything around it (<a href="https://eu.36kr.com/zh/p/3962917883805061">36Kr</a>); practitioner write-ups describe the loop's job as mediating observation, action, feedback and completion (<a href="https://jimmysong.io/zh/book/ai-handbook/runtime/harness/">Jimmy Song</a>). The two Chinese production harnesses in this chapter bear that out from opposite directions: Kimi Code rebuilt its loop around an event log, and Qwen Code spent a release cycle consolidating seven loop copies into one and is now turning it into an event-driven state machine. Both arrived at "one loop, explicit events" from different starting points.</li>
 </ul>
 
-<h2 id="build">7. Build: a 120-line agent with a step function</h2>
+<h2 id="build">9. Build: a 120-line agent with a step function</h2>
 <p>We use the <code>openai</code> Python SDK because almost every provider (OpenAI, OpenRouter, Ollama, vLLM, most Chinese labs) offers an OpenAI-compatible endpoint. Chapter 2 replaces it with our own provider layer.</p>
 <pre>pip install openai
 export BASE_URL=...   # any OpenAI-compatible endpoint; leave unset for OpenAI
@@ -252,30 +1082,41 @@ if __name__ == &quot;__main__&quot;:
 </ol>
 <p>Run all 10, reset the repo with <code>git checkout .</code> between tasks, and record: tasks passed, total steps, total tokens. That is your baseline. Every later chapter reports against it.</p>
 
-<h2 id="exercises">8. Exercises</h2>
+
+<h2 id="exercises">10. Exercises</h2>
 <ol>
-  <li>Make tool calls run in parallel with a thread pool, but force <code>write</code> and <code>edit</code> to run in order, like Pi's per-tool <code>executionMode</code>.</li>
-  <li>Add a follow-up queue: when the model stops, check for queued input before returning, like Pi's outer loop.</li>
-  <li>Save <code>state</code> to a JSON file after every step. Kill the process mid-task and restart from the file. What breaks? (You will meet this again in Chapter 11.)</li>
+  <li><strong>Parallel reads, ordered writes.</strong> Run tool calls in a thread pool, but make <code>write</code> and <code>edit</code> take an exclusive lock, Codex-style. Then try Pi's rule (any sequential tool makes the batch sequential) and fx's rule (group up to the first writer). Measure the time on a task that reads ten files and edits two.</li>
+  <li><strong>Steering and follow-ups.</strong> Add two queues. Steering messages join at the next step boundary; follow-up messages are checked only when the model stops. Type a correction while a long command runs and confirm the model sees it before its next call, not mid-command.</li>
+  <li><strong>A stop the model cannot fake.</strong> Before accepting a stop, run the task's check script. If it fails, add a message with the failure and continue, at most twice. Compare pass rates with and without it on your ten tasks.</li>
+  <li><strong>A loop detector.</strong> End the turn when the same tool call with the same arguments fails three steps in a row with no file changed in between. Write a task that triggers it.</li>
+  <li><strong>Crash and resume.</strong> Save <code>state</code> to a JSON file at every step boundary. Kill the process mid-task and restart from the file. Then kill it during a tool call that writes a file. What is wrong after the restart? (Chapter 11 fixes it.)</li>
+  <li><strong>Write the rules down.</strong> List five statements your loop must always satisfy (for example, "every tool call in the history has exactly one result"). Write a test for each that feeds the loop a scripted fake model.</li>
 </ol>
 
-<h2 id="quiz">9. Check yourself</h2>
+<h2 id="quiz">11. Check yourself</h2>
 <div class="widget quiz" data-quiz="qz1"></div>
 <script type="application/json" id="qz1">[
-{"q":"In Pi's loop, why is there an outer while(true) loop?","o":["To retry failed model calls","To continue when follow-up messages arrive just as the agent would stop","To run tools in parallel","To compact the context"],"a":1,"e":"The inner loop handles tool calls and steering. The outer loop checks getFollowUpMessages() when the agent is about to finish."},
-{"q":"What does eve's kernel return after one step?","o":["The final answer","{ session, next }","A list of tool calls","Nothing; it loops internally"],"a":1,"e":"The workflow engine saves the session and calls next as a new durable step."},
-{"q":"Pi runs a tool batch sequentially when:","o":["Always","The config says sequential, or any tool in the batch declares executionMode sequential","The batch has more than five calls","A tool fails"],"a":1,"e":"A per-tool flag lets mutating tools force order without slowing every batch."},
-{"q":"Why return tool errors as text instead of raising exceptions?","o":["Exceptions are slow","The model can read the error and try another approach","Python cannot catch tool errors","It saves tokens"],"a":1,"e":"An error in context is evidence. Hiding it removes the model's chance to recover."},
-{"q":"What is the main cost of eve's step-function design?","o":["It cannot call tools","Every step's state must be serializable and replay-safe","It only works with one model","It cannot stream"],"a":1,"e":"Durability needs all state in a saveable form, and side effects must be safe to replay."}
+{"q":"Why does every harness do its housekeeping (compaction, context updates, steering) at the step boundary?","o":["It is the fastest point in the loop","It is the only moment the history is complete: every tool call has its result","Providers require it","The model asks for it"],"a":1,"e":"Between a reply and its tool results the history is incomplete. After the results are appended, it is consistent and safe to rewrite."},
+{"q":"Which harness has no loop of its own and returns the next step to a workflow engine?","o":["Pi","Codex","eve","Trae Agent"],"a":2,"e":"eve's kernel does one step and returns the new session plus what runs next; the Workflow SDK saves it and calls again."},
+{"q":"What does eve's default steer policy do when a message arrives before the model has produced any visible output?","o":["Queues it until the turn ends","Stops the pending model call and restarts it with the new message in the same turn","Drops the message","Starts a second turn in parallel"],"a":1,"e":"Before output starts, eve cancels and restarts the call; after output has started, it waits for the next step boundary so streamed text is kept."},
+{"q":"Codex lets parallel-capable tools share one side of a read-write lock. What does any other tool do?","o":["Runs in a separate process","Takes the exclusive side, so it waits for everything else and blocks others","Is skipped","Runs after the turn ends"],"a":1,"e":"The shared side lets reads overlap; the exclusive side gives writes the world to themselves."},
+{"q":"Why does Pi refuse to run tool calls from a reply that stopped because it hit the output-token limit?","o":["They are too slow","Their arguments may be truncated yet still parse, so running them could do something incomplete","Pi does not support long replies","The provider forbids it"],"a":1,"e":"A salvage parser can produce arguments that validate but are silently incomplete. Pi fails them all and asks the model to reissue them."},
+{"q":"What problem did Qwen Code's loop unification fix?","o":["Slow tool calls","Seven separate loop implementations that had drifted and produced different behaviour per surface","Missing compaction","A bug in the model"],"a":1,"e":"Turn caps, duplicate-call suppression, concurrency and partial-edit handling differed between copies. One shared loop gave one behaviour."},
+{"q":"Which statement about default step limits is true?","o":["Every harness has a 100-step default","fx defaults to unlimited, Qwen Code caps a turn at 100 rounds, Trae Agent at 200 steps, and eve limits usage tokens instead","Only Pi has a limit","Limits are set by the provider"],"a":1,"e":"Defaults differ widely; eve uses a usage budget instead of a step count."},
+{"q":"Why is a model's reply without a tool call not enough, on its own, to end a turn?","o":["It is too short","It is a sample: the model can stop early, stop with an empty reply, or never stop, so harnesses add limits, detectors and completion checks","Providers always add a tool call","It costs too much"],"a":1,"e":"Fact 5. The stronger harnesses check the world (tests, a diff, a stop hook) before accepting the stop."}
 ]</script>
 
-<h2 id="refs">10. References</h2>
+<h2 id="refs">12. References</h2>
 <ul>
-  <li>Pi: <code>packages/agent/src/agent-loop.ts</code>, <code>packages/agent/src/types.ts</code> (<a href="https://github.com/earendil-works/pi">earendil-works/pi</a>).</li>
-  <li>eve: <code>packages/eve/src/harness/kernel.ts</code>; <code>docs/concepts/execution-model-and-durability.mdx</code> (<a href="https://github.com/vercel/eve">vercel/eve</a>).</li>
-  <li>fx: <code>src/core/agent/runtime/orchestrator.zig</code>, <code>config.zig</code> (<a href="https://github.com/vercel-labs/fx">vercel-labs/fx</a>).</li>
-  <li>nanocode: <code>crates/runtime/agent/src/turn_inbox.rs</code>, <code>runtime.rs</code> (<a href="https://github.com/gakonst/nanocode">gakonst/nanocode</a>).</li>
-  <li><a href="https://openai.com/index/unrolling-the-codex-agent-loop">Unrolling the Codex agent loop</a>, OpenAI, Jan 2026.</li>
+  <li>Pi and Pi Durable, Earendil Works: <a href="https://github.com/earendil-works/pi">github.com/earendil-works/pi</a> (read at fb248c7), including the Pi Durable specification.</li>
+  <li>eve, Vercel: <a href="https://github.com/vercel/eve">github.com/vercel/eve</a> (read at 5c52fbf), including its execution-model and session documentation.</li>
+  <li>fx, Vercel Labs: <a href="https://github.com/vercel-labs/fx">github.com/vercel-labs/fx</a> (read at cbe7daf), including its TLA+ models.</li>
+  <li>nanocode: <a href="https://github.com/gakonst/nanocode">github.com/gakonst/nanocode</a> (read at 015cbfa).</li>
+  <li>Codex CLI, OpenAI: <a href="https://github.com/openai/codex">github.com/openai/codex</a> (read at 50aeac2); <a href="https://openai.com/index/unrolling-the-codex-agent-loop">Unrolling the Codex agent loop</a>, OpenAI, Jan 2026.</li>
+  <li>Claude Code: <a href="https://arxiv.org/abs/2604.14228">Dive into Claude Code: The Design Space of Today's and Future AI Agent Systems</a>, 2026 (analysis of v2.1.88).</li>
+  <li>Kimi Code CLI, Moonshot AI: <a href="https://github.com/MoonshotAI/kimi-code">github.com/MoonshotAI/kimi-code</a> (read at 111aae2).</li>
+  <li>Qwen Code, Alibaba Qwen team: <a href="https://github.com/QwenLM/qwen-code">github.com/QwenLM/qwen-code</a> (read at c56424fc), including its design notes on the unified agent loop and the event-bus loop.</li>
+  <li>Trae Agent, ByteDance: <a href="https://github.com/bytedance/trae-agent">github.com/bytedance/trae-agent</a> (read at e839e55).</li>
   <li><a href="https://www.langchain.com/blog/the-anatomy-of-an-agent-harness">The Anatomy of an Agent Harness</a> (Ralph loop), LangChain, Mar 2026.</li>
   <li>Yao et al., ReAct: Synergizing Reasoning and Acting in Language Models, 2022.</li>
 </ul>
